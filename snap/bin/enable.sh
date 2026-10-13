@@ -1,6 +1,6 @@
 #!/bin/sh
-# First-run setup after `snap install focus-control`.
-# Run once as each user who wants it:  focus-control.enable
+# First-run setup after `snap install focus-reminder`.
+# Run once as each user who wants it:  focus-reminder.enable
 # Installs persistent per-user services (reminder + tray) using the snap's code.
 set -e
 UNITDIR="$HOME/.config/systemd/user"
@@ -14,7 +14,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/snap/bin/focus-control
+ExecStart=/snap/bin/focus-reminder
 Restart=always
 RestartSec=5
 TimeoutStopSec=10
@@ -30,7 +30,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/snap/bin/focus-control.tray
+ExecStart=/snap/bin/focus-reminder.tray
 Restart=always
 RestartSec=5
 TimeoutStopSec=10

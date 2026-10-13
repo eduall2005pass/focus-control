@@ -1,4 +1,4 @@
-name: focus-control
+name: focus-reminder
 version: '1.0'
 summary: Whole-device focus protection for Ubuntu
 description: |
@@ -13,7 +13,7 @@ platforms:
   amd64: {}
 
 apps:
-  focus-control:
+  focus-reminder:
     command: usr/bin/python3 $SNAP/focus-reminder-ubuntu.py --show-now
     desktop: usr/share/applications/focus-reminder.desktop
     common-id: focus-reminder

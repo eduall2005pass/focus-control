@@ -2,7 +2,7 @@
 Type=Application
 Name=Focus Reminder
 Comment=Stay focused: reminders, goals, waste tracking, device suspend
-Exec=focus-control
+Exec=focus-reminder
 Icon=${SNAP}/usr/share/icons/hicolor/48x48/apps/focus-reminder.png
 Terminal=false
 Categories=Utility;Productivity;
