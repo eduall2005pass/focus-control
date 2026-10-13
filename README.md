@@ -33,6 +33,22 @@ Alternative (script, same contents): `sudo bash install-systemwide.sh`
 
 Rebuild the package after code changes: `./build-deb.sh`
 
+## Snap Store (Ubuntu App Center)
+
+The `snap/` directory holds `snapcraft.yaml` (classic confinement — required:
+the app reads running processes, browser histories and controls the session).
+
+Publish path (no local toolchain needed):
+
+1. https://dashboard.snapcraft.io → Snaps → **Register** name `focus-control`
+2. Link the GitHub repo for automated builds, or locally:
+   `sudo snap install snapcraft --classic && snapcraft` then
+   `snapcraft login`, `snapcraft upload *.snap --release=stable`
+3. After `snap install focus-control`, each user runs once:
+   `focus-control.enable` (installs persistent reminder + tray services)
+4. Note: classic confinement needs manual store review (justification: whole-device
+   activity tracking, session lock/suspend, per-user background services).
+
 ## Files
 
 | File | Purpose |

@@ -1,0 +1,51 @@
+name: focus-control
+version: '1.0'
+summary: Whole-device focus protection for Ubuntu
+description: |
+  Fullscreen focus reminders, goal manager with dates, typing practice,
+  waste-time ledger, emergency suspend (minutes/hours/days) with
+  reboot-proof lockout, and a persistent system tray.
+  Runs automatically for every user after one setup command.
+confinement: classic
+grade: stable
+base: core24
+platforms:
+  amd64: {}
+
+apps:
+  focus-control:
+    command: usr/bin/python3 $SNAP/focus-reminder-ubuntu.py --show-now
+    desktop: usr/share/applications/focus-reminder.desktop
+    common-id: focus-reminder
+    extensions: [gnome]
+  tray:
+    command: usr/bin/python3 $SNAP/focus-reminder-ubuntu.py --tray
+    extensions: [gnome]
+  enable:
+    command: bin/enable.sh
+
+parts:
+  app:
+    plugin: dump
+    source: .
+    stage:
+      - focus-reminder-ubuntu.py
+    prime:
+      - focus-reminder-ubuntu.py
+    stage-packages:
+      - python3
+      - python3-gi
+      - gir1.2-gtk-3.0
+      - gir1.2-ayatanaappindicator3-0.1
+      - fonts-inter
+  scripts:
+    plugin: dump
+    source: snap/bin
+    organize:
+      enable.sh: bin/enable.sh
+  desktop:
+    plugin: dump
+    source: snap/gui
+    organize:
+      focus-reminder.desktop: usr/share/applications/focus-reminder.desktop
+      icon.png: usr/share/icons/hicolor/48x48/apps/focus-reminder.png
