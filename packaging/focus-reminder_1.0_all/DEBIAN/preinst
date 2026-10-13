@@ -1,0 +1,8 @@
+#!/bin/sh
+# Allow upgrades, prepare files (drop immutability so upgrade can replace them).
+if [ "$1" = "upgrade" ]; then
+    chattr -i /opt/focus-reminder/focus-reminder.py 2>/dev/null || true
+    chattr -i /etc/systemd/user/focus-reminder.service /etc/systemd/user/focus-tray.service 2>/dev/null || true
+    chattr -i /usr/share/applications/focus-reminder.desktop 2>/dev/null || true
+fi
+exit 0

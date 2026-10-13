@@ -1,0 +1,13 @@
+Package: focus-reminder
+Version: 1.0
+Section: utils
+Priority: optional
+Architecture: all
+Depends: python3, gir1.2-gtk-3.0
+Recommends: gir1.2-ayatanaappindicator3-0.1, fonts-inter
+Maintainer: Focus Reminder <local>
+Description: Whole-device focus reminder with goals, waste tracking and suspend lockout
+ Fullscreen 10-minute focus reminders, goal manager with dates, typing
+ practice, per-day waste ledger, emergency suspend (minutes/hours/days)
+ with reboot-proof lockout, and a persistent system tray.
+ Runs automatically for every user via systemd user services.

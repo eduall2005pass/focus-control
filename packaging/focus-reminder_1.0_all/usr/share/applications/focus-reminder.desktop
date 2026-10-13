@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Focus Reminder
+Comment=Stay focused: reminders, goals, waste tracking, device suspend
+Exec=/usr/bin/python3 /opt/focus-reminder/focus-reminder.py --show-now
+Icon=focus-reminder
+Terminal=false
+Categories=Utility;Productivity;
+NoDisplay=false

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Refuse removal (upgrades are allowed). Even with sudo, plain
+# `apt remove / dpkg --purge` aborts here.
+if [ "$1" = "upgrade" ]; then
+    exit 0
+fi
+echo "Focus Reminder is a protected system component and cannot be removed." >&2
+echo "It protects study focus for all users. Uninstall is blocked by design." >&2
+exit 1

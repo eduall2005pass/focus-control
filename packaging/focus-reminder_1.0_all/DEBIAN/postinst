@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+fc-cache -f >/dev/null 2>&1 || true
+update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+gtk-update-icon-cache -f -q /usr/share/icons/hicolor >/dev/null 2>&1 || true
+# Extra persistence: hold against upgrades/removal + immutable files.
+apt-mark hold focus-reminder >/dev/null 2>&1 || true
+chattr +i /opt/focus-reminder/focus-reminder.py 2>/dev/null || true
+chattr +i /etc/systemd/user/focus-reminder.service /etc/systemd/user/focus-tray.service 2>/dev/null || true
+chattr +i /usr/share/applications/focus-reminder.desktop 2>/dev/null || true
+exit 0

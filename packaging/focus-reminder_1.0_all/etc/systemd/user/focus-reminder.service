@@ -1,0 +1,14 @@
+[Unit]
+Description=Focus Reminder - fullscreen alert (all users)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/focus-reminder/focus-reminder.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
