@@ -10,7 +10,9 @@ confinement: classic
 grade: stable
 base: core24
 platforms:
-  amd64: {}
+  amd64:
+    build-on: [amd64]
+    build-for: [amd64]
 
 apps:
   focus-reminder:
