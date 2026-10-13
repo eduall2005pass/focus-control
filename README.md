@@ -49,6 +49,24 @@ Publish path (no local toolchain needed):
 4. Note: classic confinement needs manual store review (justification: whole-device
    activity tracking, session lock/suspend, per-user background services).
 
+## Flathub (Flatpak)
+
+`flatpak/` holds the manifest (`com.github.eduall2005pass.FocusControl.json`).
+The app detects Flatpak (`FLATPAK_ID`) and runs host commands
+(process scan, idle/lock checks, suspend, notifications) via
+`flatpak-spawn --host`, so tracking keeps working in the sandbox.
+
+Submit path (Flathub requires a PR from you):
+
+1. Fork https://github.com/flathub/flathub, add directory
+   `com.github.eduall2005pass.FocusControl/` with the manifest
+2. Open a PR titled `Add com.github.eduall2005pass.FocusControl`
+3. Add real screenshots before/after review asks (mock renders don't qualify)
+4. Known sandbox trade-offs: autostart needs the Background portal
+   (not yet implemented — use the .deb/snap for auto-start), and the
+   `home` filesystem permission needs reviewer approval with justification
+   (browser-history tracking + typing saves + ledger).
+
 ## Files
 
 | File | Purpose |

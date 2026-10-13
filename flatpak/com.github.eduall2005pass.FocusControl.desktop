@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Focus Reminder
+Comment=Stay focused: reminders, goals, waste tracking, device suspend
+Exec=focus-control --show-now
+Icon=com.github.eduall2005pass.FocusControl
+Terminal=false
+Categories=Utility;Productivity;
+NoDisplay=false

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.github.eduall2005pass.FocusControl</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <name>Focus Reminder</name>
+  <summary>Stay focused with reminders, goals and device suspend</summary>
+  <description>
+    <p>Whole-device focus protection: fullscreen reminders, goal manager,
+    typing practice, waste-time ledger, and reboot-proof suspend lockout.</p>
+  </description>
+  <launchable type="desktop-id">com.github.eduall2005pass.FocusControl.desktop</launchable>
+</component>

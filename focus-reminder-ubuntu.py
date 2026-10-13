@@ -251,16 +251,25 @@ def is_compact_screen():
 
 # ---------- helpers ----------
 
+_HOST = ["flatpak-spawn", "--host"] if os.environ.get("FLATPAK_ID") else []
+
+
+def _run(cmd, **kw):
+    """Run a system command; inside Flatpak, execute it on the host."""
+    if _HOST:
+        cmd = _HOST + list(cmd)
+    return subprocess.run(cmd, **kw)  # noqa: direct call intended (avoids recursion)
+
 def notify(msg):
     try:
-        subprocess.run(["notify-send", "Focus Reminder", msg], timeout=5)
+        _run(["notify-send", "Focus Reminder", msg], timeout=5)
     except Exception:
         pass
 
 
 def _proc_running(pattern):
     try:
-        out = subprocess.run(["pgrep", "-x", pattern],
+        out = _run(["pgrep", "-x", pattern],
                              capture_output=True, text=True, timeout=5).stdout
         return bool(out.strip())
     except Exception:
@@ -334,7 +343,7 @@ def study_site_recent():
 
 def lock_session():
     try:
-        subprocess.run(["loginctl", "lock-session"], timeout=10)
+        _run(["loginctl", "lock-session"], timeout=10)
     except Exception as e:
         print(f"lock-session failed: {e}", flush=True)
 
@@ -391,7 +400,7 @@ def do_suspend(minutes=SUSPEND_MINUTES):
     _save_suspend_state(suspend_until)
     notify(f"Device suspending for {_fmt_short(minutes * 60)}.")
     try:
-        r = subprocess.run(["systemctl", "suspend"],
+        r = _run(["systemctl", "suspend"],
                            capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
             print(f"systemctl suspend failed: {(r.stderr or r.stdout).strip()} "
@@ -414,7 +423,7 @@ def power_off():
     # Chain: session API (no extra perms) -> system poweroff (may ask password).
     notify("Shutting down...")
     try:
-        r = subprocess.run(
+        r = _run(
             ["gdbus", "call", "--session", "--dest", "org.gnome.SessionManager",
              "--object-path", "/org/gnome/SessionManager",
              "--method", "org.gnome.SessionManager.Shutdown"],
@@ -426,7 +435,7 @@ def power_off():
     except Exception as e:
         print(f"SessionManager.Shutdown error: {e}", flush=True)
     try:
-        r = subprocess.run(
+        r = _run(
             ["gdbus", "call", "--session", "--dest", "org.gnome.SessionManager",
              "--object-path", "/org/gnome/SessionManager",
              "--method", "org.gnome.SessionManager.RequestShutdown"],
@@ -438,7 +447,7 @@ def power_off():
     except Exception as e:
         print(f"RequestShutdown error: {e}", flush=True)
     try:
-        r = subprocess.run(["systemctl", "poweroff"],
+        r = _run(["systemctl", "poweroff"],
                            capture_output=True, text=True, timeout=15)
         if r.returncode == 0:
             print("poweroff via systemctl OK", flush=True)
@@ -467,7 +476,7 @@ def _has_display():
 
 def _idle_ms():
     try:
-        out = subprocess.run(
+        out = _run(
             ["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.IdleMonitor",
              "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
              "--method", "org.gnome.Mutter.IdleMonitor.GetIdletime"],
@@ -479,7 +488,7 @@ def _idle_ms():
 
 def _screen_locked():
     try:
-        out = subprocess.run(
+        out = _run(
             ["gdbus", "call", "--session", "--dest", "org.gnome.ScreenSaver",
              "--object-path", "/org/gnome/ScreenSaver",
              "--method", "org.gnome.ScreenSaver.GetActive"],
@@ -492,14 +501,14 @@ def _screen_locked():
 def _xwayland_active():
     """Best-effort active app via XWayland. None when unknown/unsupported."""
     try:
-        root = subprocess.run(["xprop", "-root", "_NET_ACTIVE_WINDOW"],
+        root = _run(["xprop", "-root", "_NET_ACTIVE_WINDOW"],
                               capture_output=True, text=True, timeout=5).stdout
         if "#" not in root:
             return None
         wid = root.split("#")[-1].strip().split(",")[0].strip()
         if not wid or wid == "0x0":
             return None
-        info = subprocess.run(["xprop", "-id", wid, "WM_CLASS"],
+        info = _run(["xprop", "-id", wid, "WM_CLASS"],
                               capture_output=True, text=True, timeout=5).stdout
         if "=" not in info or "not found" in info:
             return None
@@ -833,7 +842,7 @@ def _sudo_check(pw):
     try:
         if not pw:
             return False
-        r = subprocess.run(["sudo", "-S", "-v"], input=pw + "\n",
+        r = _run(["sudo", "-S", "-v"], input=pw + "\n",
                            capture_output=True, text=True, timeout=30)
         return r.returncode == 0
     except Exception as e:
