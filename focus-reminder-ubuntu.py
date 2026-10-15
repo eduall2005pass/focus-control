@@ -471,6 +471,24 @@ BROWSER_APP_SET = {s.lower() for s in BROWSER_PROCS.split("|")}
 
 
 def _has_display():
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return True
+    # Service may have started before graphical session — try importing
+    # DISPLAY / WAYLAND_DISPLAY from the systemd user environment manager.
+    try:
+        out = subprocess.check_output(
+            ["systemctl", "--user", "show-environment"],
+            timeout=5, text=True, stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            if line.startswith("DISPLAY="):
+                os.environ["DISPLAY"] = line.split("=", 1)[1]
+            elif line.startswith("WAYLAND_DISPLAY="):
+                os.environ["WAYLAND_DISPLAY"] = line.split("=", 1)[1]
+            elif line.startswith("XAUTHORITY="):
+                os.environ.setdefault("XAUTHORITY", line.split("=", 1)[1])
+    except Exception:
+        pass
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
@@ -807,6 +825,83 @@ def _new_fullscreen(title):
     return win
 
 
+# Keys GNOME steals at compositor level (overview/recent/app-switcher).
+# Disabled during lockout, restored verbatim afterwards.
+_LOCKDOWN_KEYS = [
+    ("org.gnome.mutter", "overlay-key", "''"),                       # Super -> overview
+    ("org.gnome.desktop.interface", "enable-hot-corners", "false"),  # hot corner
+    ("org.gnome.desktop.wm.keybindings", "switch-applications", "@as []"),  # Super+Tab / Alt+Tab
+    ("org.gnome.desktop.wm.keybindings", "switch-windows", "@as []"),        # Alt+Tab (windows)
+    ("org.gnome.desktop.notifications", "show-banners", "false"),  # banners can launch apps
+]
+
+
+def _gnome_lockdown():
+    """Disable shell-escape keys. Returns saved (schema, key, raw) list for restore."""
+    saved = []
+    for schema, key, locked_val in _LOCKDOWN_KEYS:
+        try:
+            r = _run(["gsettings", "get", schema, key],
+                     capture_output=True, text=True, timeout=10)
+            raw = r.stdout.strip() if r.returncode == 0 else None
+        except Exception as e:
+            print(f"lockdown get {schema} {key}: {e}", flush=True)
+            raw = None
+        if raw is None:
+            continue
+        saved.append((schema, key, raw))
+        try:
+            _run(["gsettings", "set", schema, key, locked_val], timeout=10)
+        except Exception as e:
+            print(f"lockdown set {schema} {key}: {e}", flush=True)
+    return saved
+
+
+def _gnome_restore(saved):
+    for schema, key, raw in saved:
+        try:
+            _run(["gsettings", "set", schema, key, raw], timeout=10)
+        except Exception as e:
+            print(f"lockdown restore {schema} {key}: {e}", flush=True)
+
+
+def _swallow_shell_keys(win):
+    """App-level backup: swallow Super / Alt+Tab if compositor passes them through."""
+    def _on_key(_w, ev):
+        try:
+            if ev.keyval in (Gdk.KEY_Super_L, Gdk.KEY_Super_R):
+                return True
+            mods = ev.state & Gtk.accelerator_get_default_mod_mask()
+            if mods & Gdk.ModifierType.MOD1_MASK and ev.keyval in (
+                    Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
+                return True
+        except Exception:
+            pass
+        return False
+    win.connect("key-press-event", _on_key)
+
+
+def _arm_focus_guard(win, is_lockout=False):
+    """Re-raise window if anything steals focus. Returns timeout id for cleanup."""
+    def _on_focus_out(*_):
+        try:
+            if win.get_visible() and (not is_lockout or _typing_win is None):
+                GLib.idle_add(win.present)
+        except Exception:
+            pass
+        return False
+    win.connect("focus-out-event", _on_focus_out)
+
+    def _guard():
+        try:
+            if win.get_visible() and (not is_lockout or _typing_win is None):
+                win.present()
+        except Exception:
+            pass
+        return True
+    return GLib.timeout_add(500, _guard)
+
+
 def _new_card(width=None):
     if width is None:
         width = 560 if is_compact_screen() else 880
@@ -1027,6 +1122,9 @@ def show_typing_test(parent=None):
             pass
     win = _new_fullscreen("Typing Test")
     _typing_win = win
+    win.set_modal(True)
+    _swallow_shell_keys(win)
+    _tguard = _arm_focus_guard(win)
     css = Gtk.CssProvider()
     css.load_from_data(b"""
     .typewin { background: #000000; }
@@ -1100,6 +1198,10 @@ def show_typing_test(parent=None):
 
     def _on_typing_destroy(*_):
         global _typing_win, _typing_view, _typing_parent
+        try:
+            GLib.source_remove(_tguard)
+        except Exception:
+            pass
         auto = _typing_auto_closing
         _typing_win = None
         _typing_view = None
@@ -1790,7 +1892,19 @@ def show_lockout_window(minutes):
         card.pack_start(_accent(), False, False, 0)
         card.pack_start(panes, True, True, 0)
     win.add(outer)
-    win.connect("destroy", lambda *_: Gtk.main_quit())
+    _shell_saved = _gnome_lockdown()
+    win.set_modal(True)
+    _swallow_shell_keys(win)
+    _guard_id = _arm_focus_guard(win, is_lockout=True)
+
+    def _on_lock_destroy(*_):
+        try:
+            GLib.source_remove(_guard_id)
+        except Exception:
+            pass
+        _gnome_restore(_shell_saved)
+        Gtk.main_quit()
+    win.connect("destroy", _on_lock_destroy)
     win.show_all()
     win.present()
     type_btn.grab_focus()

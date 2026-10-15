@@ -251,16 +251,25 @@ def is_compact_screen():
 
 # ---------- helpers ----------
 
+_HOST = ["flatpak-spawn", "--host"] if os.environ.get("FLATPAK_ID") else []
+
+
+def _run(cmd, **kw):
+    """Run a system command; inside Flatpak, execute it on the host."""
+    if _HOST:
+        cmd = _HOST + list(cmd)
+    return subprocess.run(cmd, **kw)  # noqa: direct call intended (avoids recursion)
+
 def notify(msg):
     try:
-        subprocess.run(["notify-send", "Focus Reminder", msg], timeout=5)
+        _run(["notify-send", "Focus Reminder", msg], timeout=5)
     except Exception:
         pass
 
 
 def _proc_running(pattern):
     try:
-        out = subprocess.run(["pgrep", "-x", pattern],
+        out = _run(["pgrep", "-x", pattern],
                              capture_output=True, text=True, timeout=5).stdout
         return bool(out.strip())
     except Exception:
@@ -334,7 +343,7 @@ def study_site_recent():
 
 def lock_session():
     try:
-        subprocess.run(["loginctl", "lock-session"], timeout=10)
+        _run(["loginctl", "lock-session"], timeout=10)
     except Exception as e:
         print(f"lock-session failed: {e}", flush=True)
 
@@ -391,7 +400,7 @@ def do_suspend(minutes=SUSPEND_MINUTES):
     _save_suspend_state(suspend_until)
     notify(f"Device suspending for {_fmt_short(minutes * 60)}.")
     try:
-        r = subprocess.run(["systemctl", "suspend"],
+        r = _run(["systemctl", "suspend"],
                            capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
             print(f"systemctl suspend failed: {(r.stderr or r.stdout).strip()} "
@@ -414,7 +423,7 @@ def power_off():
     # Chain: session API (no extra perms) -> system poweroff (may ask password).
     notify("Shutting down...")
     try:
-        r = subprocess.run(
+        r = _run(
             ["gdbus", "call", "--session", "--dest", "org.gnome.SessionManager",
              "--object-path", "/org/gnome/SessionManager",
              "--method", "org.gnome.SessionManager.Shutdown"],
@@ -426,7 +435,7 @@ def power_off():
     except Exception as e:
         print(f"SessionManager.Shutdown error: {e}", flush=True)
     try:
-        r = subprocess.run(
+        r = _run(
             ["gdbus", "call", "--session", "--dest", "org.gnome.SessionManager",
              "--object-path", "/org/gnome/SessionManager",
              "--method", "org.gnome.SessionManager.RequestShutdown"],
@@ -438,7 +447,7 @@ def power_off():
     except Exception as e:
         print(f"RequestShutdown error: {e}", flush=True)
     try:
-        r = subprocess.run(["systemctl", "poweroff"],
+        r = _run(["systemctl", "poweroff"],
                            capture_output=True, text=True, timeout=15)
         if r.returncode == 0:
             print("poweroff via systemctl OK", flush=True)
@@ -462,12 +471,30 @@ BROWSER_APP_SET = {s.lower() for s in BROWSER_PROCS.split("|")}
 
 
 def _has_display():
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return True
+    # Service may have started before graphical session — try importing
+    # DISPLAY / WAYLAND_DISPLAY from the systemd user environment manager.
+    try:
+        out = subprocess.check_output(
+            ["systemctl", "--user", "show-environment"],
+            timeout=5, text=True, stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            if line.startswith("DISPLAY="):
+                os.environ["DISPLAY"] = line.split("=", 1)[1]
+            elif line.startswith("WAYLAND_DISPLAY="):
+                os.environ["WAYLAND_DISPLAY"] = line.split("=", 1)[1]
+            elif line.startswith("XAUTHORITY="):
+                os.environ.setdefault("XAUTHORITY", line.split("=", 1)[1])
+    except Exception:
+        pass
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
 def _idle_ms():
     try:
-        out = subprocess.run(
+        out = _run(
             ["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.IdleMonitor",
              "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
              "--method", "org.gnome.Mutter.IdleMonitor.GetIdletime"],
@@ -479,7 +506,7 @@ def _idle_ms():
 
 def _screen_locked():
     try:
-        out = subprocess.run(
+        out = _run(
             ["gdbus", "call", "--session", "--dest", "org.gnome.ScreenSaver",
              "--object-path", "/org/gnome/ScreenSaver",
              "--method", "org.gnome.ScreenSaver.GetActive"],
@@ -492,14 +519,14 @@ def _screen_locked():
 def _xwayland_active():
     """Best-effort active app via XWayland. None when unknown/unsupported."""
     try:
-        root = subprocess.run(["xprop", "-root", "_NET_ACTIVE_WINDOW"],
+        root = _run(["xprop", "-root", "_NET_ACTIVE_WINDOW"],
                               capture_output=True, text=True, timeout=5).stdout
         if "#" not in root:
             return None
         wid = root.split("#")[-1].strip().split(",")[0].strip()
         if not wid or wid == "0x0":
             return None
-        info = subprocess.run(["xprop", "-id", wid, "WM_CLASS"],
+        info = _run(["xprop", "-id", wid, "WM_CLASS"],
                               capture_output=True, text=True, timeout=5).stdout
         if "=" not in info or "not found" in info:
             return None
@@ -798,6 +825,83 @@ def _new_fullscreen(title):
     return win
 
 
+# Keys GNOME steals at compositor level (overview/recent/app-switcher).
+# Disabled during lockout, restored verbatim afterwards.
+_LOCKDOWN_KEYS = [
+    ("org.gnome.mutter", "overlay-key", "''"),                       # Super -> overview
+    ("org.gnome.desktop.interface", "enable-hot-corners", "false"),  # hot corner
+    ("org.gnome.desktop.wm.keybindings", "switch-applications", "@as []"),  # Super+Tab / Alt+Tab
+    ("org.gnome.desktop.wm.keybindings", "switch-windows", "@as []"),        # Alt+Tab (windows)
+    ("org.gnome.desktop.notifications", "show-banners", "false"),  # banners can launch apps
+]
+
+
+def _gnome_lockdown():
+    """Disable shell-escape keys. Returns saved (schema, key, raw) list for restore."""
+    saved = []
+    for schema, key, locked_val in _LOCKDOWN_KEYS:
+        try:
+            r = _run(["gsettings", "get", schema, key],
+                     capture_output=True, text=True, timeout=10)
+            raw = r.stdout.strip() if r.returncode == 0 else None
+        except Exception as e:
+            print(f"lockdown get {schema} {key}: {e}", flush=True)
+            raw = None
+        if raw is None:
+            continue
+        saved.append((schema, key, raw))
+        try:
+            _run(["gsettings", "set", schema, key, locked_val], timeout=10)
+        except Exception as e:
+            print(f"lockdown set {schema} {key}: {e}", flush=True)
+    return saved
+
+
+def _gnome_restore(saved):
+    for schema, key, raw in saved:
+        try:
+            _run(["gsettings", "set", schema, key, raw], timeout=10)
+        except Exception as e:
+            print(f"lockdown restore {schema} {key}: {e}", flush=True)
+
+
+def _swallow_shell_keys(win):
+    """App-level backup: swallow Super / Alt+Tab if compositor passes them through."""
+    def _on_key(_w, ev):
+        try:
+            if ev.keyval in (Gdk.KEY_Super_L, Gdk.KEY_Super_R):
+                return True
+            mods = ev.state & Gtk.accelerator_get_default_mod_mask()
+            if mods & Gdk.ModifierType.MOD1_MASK and ev.keyval in (
+                    Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
+                return True
+        except Exception:
+            pass
+        return False
+    win.connect("key-press-event", _on_key)
+
+
+def _arm_focus_guard(win, is_lockout=False):
+    """Re-raise window if anything steals focus. Returns timeout id for cleanup."""
+    def _on_focus_out(*_):
+        try:
+            if win.get_visible() and (not is_lockout or _typing_win is None):
+                GLib.idle_add(win.present)
+        except Exception:
+            pass
+        return False
+    win.connect("focus-out-event", _on_focus_out)
+
+    def _guard():
+        try:
+            if win.get_visible() and (not is_lockout or _typing_win is None):
+                win.present()
+        except Exception:
+            pass
+        return True
+    return GLib.timeout_add(500, _guard)
+
+
 def _new_card(width=None):
     if width is None:
         width = 560 if is_compact_screen() else 880
@@ -833,7 +937,7 @@ def _sudo_check(pw):
     try:
         if not pw:
             return False
-        r = subprocess.run(["sudo", "-S", "-v"], input=pw + "\n",
+        r = _run(["sudo", "-S", "-v"], input=pw + "\n",
                            capture_output=True, text=True, timeout=30)
         return r.returncode == 0
     except Exception as e:
@@ -1018,6 +1122,9 @@ def show_typing_test(parent=None):
             pass
     win = _new_fullscreen("Typing Test")
     _typing_win = win
+    win.set_modal(True)
+    _swallow_shell_keys(win)
+    _tguard = _arm_focus_guard(win)
     css = Gtk.CssProvider()
     css.load_from_data(b"""
     .typewin { background: #000000; }
@@ -1091,6 +1198,10 @@ def show_typing_test(parent=None):
 
     def _on_typing_destroy(*_):
         global _typing_win, _typing_view, _typing_parent
+        try:
+            GLib.source_remove(_tguard)
+        except Exception:
+            pass
         auto = _typing_auto_closing
         _typing_win = None
         _typing_view = None
@@ -1781,7 +1892,19 @@ def show_lockout_window(minutes):
         card.pack_start(_accent(), False, False, 0)
         card.pack_start(panes, True, True, 0)
     win.add(outer)
-    win.connect("destroy", lambda *_: Gtk.main_quit())
+    _shell_saved = _gnome_lockdown()
+    win.set_modal(True)
+    _swallow_shell_keys(win)
+    _guard_id = _arm_focus_guard(win, is_lockout=True)
+
+    def _on_lock_destroy(*_):
+        try:
+            GLib.source_remove(_guard_id)
+        except Exception:
+            pass
+        _gnome_restore(_shell_saved)
+        Gtk.main_quit()
+    win.connect("destroy", _on_lock_destroy)
     win.show_all()
     win.present()
     type_btn.grab_focus()
