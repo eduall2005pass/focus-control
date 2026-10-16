@@ -865,6 +865,41 @@ def _gnome_restore(saved):
             print(f"lockdown restore {schema} {key}: {e}", flush=True)
 
 
+# Binaries that must not run while the device is suspended (browsers, which can
+# open anything incl. AI agents; terminals/VT-launched shells; AI CLIs).
+# Matched by exact basename of argv[0] — never by substring, never self.
+LOCKOUT_PROC_DENY = frozenset({
+    "chrome", "chromium", "chromium-browser", "firefox", "brave",
+    "brave-browser", "msedge", "opera", "vivaldi",
+    "gnome-terminal", "gnome-terminal-server", "xterm", "konsole",
+    "alacritty", "kitty", "tilix", "terminator", "wezterm",
+    "opencode", "claude", "gemini", "aichat", "tgpt", "sgpt",
+    "codex", "cursor-agent", "aider", "ollama",
+    "kilo", "cline", "cursor", "copilot", "agy",
+})
+
+
+def _lockout_proc_sweep():
+    """SIGKILL denylisted processes. Best-effort; skips self and unowned PIDs."""
+    me = os.getpid()
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except Exception:
+        return
+    for pid in pids:
+        try:
+            if int(pid) == me:
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read().decode("utf-8", "ignore")
+            if not raw:
+                continue
+            if os.path.basename(raw.split("\x00")[0]) in LOCKOUT_PROC_DENY:
+                os.kill(int(pid), signal.SIGKILL)
+        except Exception:
+            pass
+
+
 def _swallow_shell_keys(win):
     """App-level backup: swallow Super / Alt+Tab if compositor passes them through."""
     def _on_key(_w, ev):
@@ -1414,7 +1449,7 @@ def build_tray_menu():
     menu.connect("show", lambda *_: _refresh_waste())  # refresh on every open
     GLib.timeout_add_seconds(30, _refresh_waste)  # + live refresh every 30s
     _item("Show Reminder Now", _tray_show_reminder)
-    # NOTE: no Quit item by design — the tray stays persistent (see focus-tray.service).
+    # NOTE: no Quit item by design — the tray stays persistent (see xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service).
     menu.show_all()
     return menu
 
@@ -1896,12 +1931,15 @@ def show_lockout_window(minutes):
     win.set_modal(True)
     _swallow_shell_keys(win)
     _guard_id = _arm_focus_guard(win, is_lockout=True)
+    _lockout_proc_sweep()  # immediate: nothing usable survives into suspension
+    _sweep_id = GLib.timeout_add_seconds(3, lambda: (_lockout_proc_sweep(), True)[1])
 
     def _on_lock_destroy(*_):
-        try:
-            GLib.source_remove(_guard_id)
-        except Exception:
-            pass
+        for _sid in (_guard_id, _sweep_id):
+            try:
+                GLib.source_remove(_sid)
+            except Exception:
+                pass
         _gnome_restore(_shell_saved)
         Gtk.main_quit()
     win.connect("destroy", _on_lock_destroy)

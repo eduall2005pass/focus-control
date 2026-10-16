@@ -30,7 +30,7 @@ install -Dm644 "$SRC_DIR/assets/focus-reminder.png" /usr/share/icons/hicolor/48x
 gtk-update-icon-cache -f -q /usr/share/icons/hicolor 2>/dev/null || true
 
 echo "[4/6] Installing user units for ALL users"
-cat > /etc/systemd/user/focus-reminder.service <<'EOF'
+cat > /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service <<'EOF'
 [Unit]
 Description=Focus Reminder - fullscreen alert (all users)
 PartOf=graphical-session.target
@@ -46,7 +46,7 @@ TimeoutStopSec=10
 [Install]
 WantedBy=default.target
 EOF
-cat > /etc/systemd/user/focus-tray.service <<'EOF'
+cat > /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service <<'EOF'
 [Unit]
 Description=Focus Reminder Tray - persistent, no quit (all users)
 PartOf=graphical-session.target
@@ -63,8 +63,8 @@ TimeoutStopSec=10
 WantedBy=default.target
 EOF
 mkdir -p /etc/systemd/user/default.target.wants
-ln -sf /etc/systemd/user/focus-reminder.service /etc/systemd/user/default.target.wants/focus-reminder.service
-ln -sf /etc/systemd/user/focus-tray.service /etc/systemd/user/default.target.wants/focus-tray.service
+ln -sf /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service /etc/systemd/user/default.target.wants/xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service
+ln -sf /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service /etc/systemd/user/default.target.wants/xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service
 
 echo "[5/6] Installing XDG autostart (display environment import)"
 cat > /etc/xdg/autostart/focus-reminder-env.desktop <<'EOF'
@@ -96,5 +96,5 @@ fc-match "Inter" | head -1
 
 echo "DONE. Every user gets Focus Reminder + Tray from their next login."
 echo "NOTE: if user 'prof21' still has old per-user units, disable them:"
-echo "  systemctl --user disable --now focus-reminder.service focus-tray.service"
+echo "  systemctl --user disable --now xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service"
 echo "  rm ~/.config/autostart/focus-reminder.desktop"

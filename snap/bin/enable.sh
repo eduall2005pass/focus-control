@@ -6,7 +6,7 @@ set -e
 UNITDIR="$HOME/.config/systemd/user"
 AUTODIR="$HOME/.config/autostart"
 mkdir -p "$UNITDIR" "$AUTODIR"
-cat > "$UNITDIR/focus-reminder.service" <<'EOF'
+cat > "$UNITDIR/xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service" <<'EOF'
 [Unit]
 Description=Focus Reminder - fullscreen alert (snap)
 PartOf=graphical-session.target
@@ -22,7 +22,7 @@ TimeoutStopSec=10
 [Install]
 WantedBy=default.target
 EOF
-cat > "$UNITDIR/focus-tray.service" <<'EOF'
+cat > "$UNITDIR/xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service" <<'EOF'
 [Unit]
 Description=Focus Reminder Tray - persistent, no quit (snap)
 PartOf=graphical-session.target
@@ -40,5 +40,5 @@ WantedBy=default.target
 EOF
 systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR XDG_SESSION_TYPE 2>/dev/null || true
 systemctl --user daemon-reload
-systemctl --user enable --now focus-reminder.service focus-tray.service
+systemctl --user enable --now xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service
 echo "Focus Control enabled: reminder + tray will start on every login."

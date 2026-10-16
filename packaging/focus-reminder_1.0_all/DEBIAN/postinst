@@ -6,6 +6,6 @@ gtk-update-icon-cache -f -q /usr/share/icons/hicolor >/dev/null 2>&1 || true
 # Extra persistence: hold against upgrades/removal + immutable files.
 apt-mark hold focus-reminder >/dev/null 2>&1 || true
 chattr +i /opt/focus-reminder/focus-reminder.py 2>/dev/null || true
-chattr +i /etc/systemd/user/focus-reminder.service /etc/systemd/user/focus-tray.service 2>/dev/null || true
+chattr +i /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service 2>/dev/null || true
 chattr +i /usr/share/applications/focus-reminder.desktop 2>/dev/null || true
 exit 0
