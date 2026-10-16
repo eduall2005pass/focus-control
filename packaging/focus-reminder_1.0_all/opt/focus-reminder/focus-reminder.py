@@ -11,11 +11,13 @@
 import atexit
 import fcntl
 import glob
+import hashlib
 import json
 import os
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import threading
@@ -879,8 +881,64 @@ LOCKOUT_PROC_DENY = frozenset({
 })
 
 
-def _lockout_proc_sweep():
-    """SIGKILL denylisted processes. Best-effort; skips self and unowned PIDs."""
+def _lockout_exe_signatures():
+    """One-time fingerprint of denylisted binaries: basenames, (dev, ino)
+    pairs (catches renames/hardlinks), and size->sha256 (catches copies).
+    Built once per lockout so renames/copies/spoofs can't dodge the sweep."""
+    names, inos, hashes = set(), set(), {}
+    dirs = (os.environ.get("PATH", "").split(":")
+            + [os.path.expanduser("~/.local/bin"),
+               os.path.expanduser("~/.opencode/bin")])
+    seen = set()
+    for name in LOCKOUT_PROC_DENY:
+        names.add(name)
+        for d in dirs:
+            # real binary by PATH name (often our shim) + shadowed-aside real binary
+            for p in (os.path.join(d, name),
+                      os.path.join(d, "." + name + ".focus-real")):
+                if p in seen:
+                    continue
+                seen.add(p)
+                try:
+                    if not os.path.exists(p):
+                        continue
+                    st = os.stat(p)
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    inos.add((st.st_dev, st.st_ino))
+                    h = hashlib.sha256()
+                    with open(p, "rb") as f:
+                        for chunk in iter(lambda: f.read(65536), b""):
+                            h.update(chunk)
+                    hashes.setdefault(st.st_size, set()).add(h.hexdigest())
+                except Exception:
+                    pass
+    return {"inos": inos, "hashes": hashes}
+
+
+def _exe_matches(exe, st, sigs):
+    """True if a /proc/PID/exe target is a denylisted binary in any disguise."""
+    try:
+        if os.path.basename(exe.split(" (deleted)")[0]) in LOCKOUT_PROC_DENY:
+            return True
+        if (st.st_dev, st.st_ino) in sigs["inos"]:
+            return True
+        cands = sigs["hashes"].get(st.st_size)
+        if cands:
+            h = hashlib.sha256()
+            with open(exe, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            if h.hexdigest() in cands:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _lockout_proc_sweep(sigs=None):
+    """SIGKILL denylisted processes, however disguised. Best-effort;
+    skips self and unowned PIDs."""
     me = os.getpid()
     try:
         pids = [p for p in os.listdir("/proc") if p.isdigit()]
@@ -890,11 +948,9 @@ def _lockout_proc_sweep():
         try:
             if int(pid) == me:
                 continue
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                raw = f.read().decode("utf-8", "ignore")
-            if not raw:
-                continue
-            if os.path.basename(raw.split("\x00")[0]) in LOCKOUT_PROC_DENY:
+            exe = os.readlink(f"/proc/{pid}/exe")
+            st = os.stat(exe)
+            if _exe_matches(exe, st, sigs or {"inos": set(), "hashes": {}}):
                 os.kill(int(pid), signal.SIGKILL)
         except Exception:
             pass
@@ -1931,8 +1987,10 @@ def show_lockout_window(minutes):
     win.set_modal(True)
     _swallow_shell_keys(win)
     _guard_id = _arm_focus_guard(win, is_lockout=True)
-    _lockout_proc_sweep()  # immediate: nothing usable survives into suspension
-    _sweep_id = GLib.timeout_add_seconds(3, lambda: (_lockout_proc_sweep(), True)[1])
+    _lockout_sigs = _lockout_exe_signatures()
+    _lockout_proc_sweep(_lockout_sigs)  # immediate: nothing usable survives
+    _sweep_id = GLib.timeout_add_seconds(
+        3, lambda: (_lockout_proc_sweep(_lockout_sigs), True)[1])
 
     def _on_lock_destroy(*_):
         for _sid in (_guard_id, _sweep_id):
