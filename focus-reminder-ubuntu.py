@@ -1410,7 +1410,7 @@ def pick_suspend_duration(parent):
         if v and confirm_suspend(parent, f"for {v} hour{'s' if v > 1 else ''}"):
             return v * 60
     elif choice == "days":
-        v = _suspend_value_dialog("Suspend Days", "Suspend for how many days? (max 3)", 1, 3, is_combo=True)
+        v = _suspend_value_dialog("Suspend Days", "Suspend for how many days? (max 7)", 1, 7, is_combo=True)
         if not v:
             return None
         label = f"for {v} day{'s' if v > 1 else ''}"
@@ -1435,7 +1435,7 @@ def tray_suspend_hours():
 
 
 def tray_suspend_days(parent=None):
-    v = _suspend_value_dialog("Suspend Days", "Suspend for how many days? (max 3)", 1, 3, is_combo=True)
+    v = _suspend_value_dialog("Suspend Days", "Suspend for how many days? (max 7)", 1, 7, is_combo=True)
     if not v:
         return
     label = f"for {v} day{'s' if v > 1 else ''}"
@@ -1477,7 +1477,7 @@ def build_tray_menu():
     sub = Gtk.Menu()
     for label, cb in (("Minutes\u2026 (max 60)", tray_suspend_minutes),
                       ("Hours\u2026 (max 24)", tray_suspend_hours),
-                      ("Days\u2026 (max 3, double confirm)", lambda: tray_suspend_days())):
+                      ("Days\u2026 (max 7, double confirm)", lambda: tray_suspend_days())):
         mi = Gtk.MenuItem(label=label)
         mi.connect("activate", lambda *_w, f=cb: f())
         sub.append(mi)
