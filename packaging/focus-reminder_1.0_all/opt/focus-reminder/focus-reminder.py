@@ -22,10 +22,17 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
 from urllib.parse import urlparse
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, Gdk, GLib
+from gi.repository import Gtk, Gdk, GLib, GdkPixbuf
+
+try:
+    gi.require_version("WebKit2", "4.1")
+    from gi.repository import WebKit2
+except Exception:  # WebKit not available -> study view disabled, app still runs
+    WebKit2 = None
 
 FOCUS_VERSION = "1.0"
 
@@ -1188,6 +1195,10 @@ _typing_view = None
 _typing_parent = None
 _typing_auto_closing = False
 
+_study_win = None
+_study_parent = None
+_study_auto_closing = False
+
 
 def _save_typing_text(text):
     """Save typing content. Returns path or None. Visible errors via notify."""
@@ -1934,6 +1945,11 @@ def show_lockout_window(minutes):
 
     lockrow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
     lockrow.set_halign(Gtk.Align.CENTER)
+    study_btn = Gtk.Button(label="\U0001F4DA  Study")
+    study_btn.get_style_context().add_class("btn-primary")
+    study_btn.set_size_request(160, 48)
+    study_btn.set_tooltip_text("Study links, PDF library and typing (suspension continues).")
+    study_btn.connect("clicked", lambda *_: show_study_window(parent=win, end_ts=end))
     type_btn = Gtk.Button(label="Typing Test")
     type_btn.get_style_context().add_class("btn-ghost")
     type_btn.set_size_request(160, 48)
@@ -1944,6 +1960,7 @@ def show_lockout_window(minutes):
     power_btn.set_size_request(160, 48)
     power_btn.set_halign(Gtk.Align.CENTER)
     power_btn.set_tooltip_text("Shut down this machine. Requires confirmation.")
+    lockrow.pack_start(study_btn, False, False, 0)
     lockrow.pack_start(type_btn, False, False, 0)
     lockrow.pack_start(power_btn, False, False, 0)
 
@@ -1982,6 +1999,13 @@ def show_lockout_window(minutes):
                 # then finish lockout on the next tick in our own loop
                 ending["phase"] = 1
                 _close_typing_autosave()
+                return True
+            if _study_win is not None and ending["phase"] == 0:
+                # study open: close it (its own nested loop), then lockout
+                ending["phase"] = 1
+                global _study_auto_closing
+                _study_auto_closing = True
+                _study_win.destroy()
                 return True
             win.destroy()  # destroy, NOT close (delete-event is blocked)
             return False
@@ -2032,6 +2056,636 @@ def show_lockout_window(minutes):
     type_btn.grab_focus()
     GLib.timeout_add_seconds(1, tick)
     Gtk.main()
+
+# ---------- study container ----------
+
+STUDY_INBOX = os.path.expanduser("~/Documents/study-inbox")
+STUDY_CONFIG_PATH = os.path.join(LEDGER_DIR, "study-config.json")
+MEDIA_EXTS = {".pdf", ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+_SCAN_SKIP = {
+    "node_modules", ".git", ".cache", "__pycache__", "snap", "venv", ".venv",
+    "site-packages", "proc", "sys", "dev", "Trash", ".Trash-1000", "flatpak",
+    "Steam", "steamapps", ".npm", ".cargo", ".rustup", ".local/share/Trash",
+}
+
+_STUDY_DEFAULTS = {
+    "links": [
+        {"title": "Boimate AI", "url": "https://boimate.com/ai"},
+        {"title": "NotebookLM", "url": "https://notebooklm.google.com"},
+        {"title": "Gemini", "url": "https://gemini.google.com"},
+        {"title": "MuslimBangla", "url": "https://muslimbangla.com"},
+        {"title": "iHadis", "url": "https://ihadis.com/en"},
+        {"title": "LiveMCQ", "url": "https://web.livemcq.com/"},
+        {"title": "Translate", "url": "https://translate.google.com"},
+        {"title": "WhatsApp (read-only)", "url": "https://web.whatsapp.com"},
+    ],
+    "allow_hosts": [
+        "boimate.com", "www.boimate.com",
+        "notebooklm.google.com", "gemini.google.com", "bard.google.com",
+        "accounts.google.com", "accounts.youtube.com", "myaccount.google.com",
+        "translate.google.com", "translate.googleapis.com", "clients6.google.com",
+        "www.google.com", "google.com", "apis.google.com", "content.googleapis.com",
+        "www.gstatic.com", "ssl.gstatic.com", "fonts.gstatic.com", "gstatic.com",
+        "fonts.googleapis.com", "font.gstatic.com", "googleusercontent.com",
+        "*.googleusercontent.com", "*.gstatic.com", "*.googleapis.com",
+        "muslimbangla.com", "www.muslimbangla.com",
+        "ihadis.com", "www.ihadis.com",
+        "livemcq.com", "www.livemcq.com", "web.livemcq.com",
+        "web.whatsapp.com", "*.whatsapp.com", "*.whatsapp.net",
+        "static.whatsapp.net", "mmg.whatsapp.net",
+        "cdn.jsdelivr.net", "cdnjs.cloudflare.com", "unpkg.com",
+        "*.cloudfront.net", "*.amazonaws.com", "*.b-cdn.net",
+        "*.digitaloceanspaces.com", "*.supabase.co", "*.firebaseapp.com",
+    ],
+    "scan_roots": ["~", "/media", "/mnt", "/run/media"],
+    "download_exts": sorted(MEDIA_EXTS),
+}
+
+
+def _study_config():
+    """Load study config, writing defaults on first run."""
+    try:
+        with open(STUDY_CONFIG_PATH) as f:
+            cfg = json.load(f)
+        if isinstance(cfg, dict) and cfg.get("links") and cfg.get("allow_hosts"):
+            return cfg
+    except Exception:
+        pass
+    try:
+        os.makedirs(LEDGER_DIR, exist_ok=True)
+        with open(STUDY_CONFIG_PATH, "w") as f:
+            json.dump(_STUDY_DEFAULTS, f, indent=2)
+    except Exception as e:
+        print(f"study config write error: {e}", flush=True)
+    return dict(_STUDY_DEFAULTS)
+
+
+def _host_allowed(host, patterns):
+    host = (host or "").lower().split(":")[0]
+    if not host:
+        return False
+    for p in patterns:
+        p = str(p).lower().strip()
+        if not p:
+            continue
+        if p.startswith("*."):
+            base = p[1:]  # /.example.com
+            if host.endswith(base) or host == p[2:]:
+                return True
+        elif host == p:
+            return True
+    return False
+
+
+def _scan_media(roots, limit=6000):
+    """All PDFs/images under roots (whole laptop). Newest first."""
+    found = []
+    exts = MEDIA_EXTS
+    for root in roots:
+        root = os.path.expanduser(root)
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+            dirnames[:] = [d for d in dirnames
+                           if not d.startswith(".") and d not in _SCAN_SKIP]
+            for fn in filenames:
+                if os.path.splitext(fn)[1].lower() in exts:
+                    p = os.path.join(dirpath, fn)
+                    try:
+                        found.append((os.path.getmtime(p), p))
+                    except Exception:
+                        found.append((0, p))
+                    if len(found) >= limit:
+                        found.sort(reverse=True)
+                        return found
+    found.sort(reverse=True)
+    return found
+
+
+def _copy_into_inbox(paths, exts):
+    """Copy allowed media files into the study inbox. Returns copied count."""
+    copied = 0
+    try:
+        os.makedirs(STUDY_INBOX, exist_ok=True)
+    except Exception as e:
+        print(f"inbox create error: {e}", flush=True)
+        return 0
+    for src in paths:
+        try:
+            if not os.path.isfile(src):
+                continue
+            ext = os.path.splitext(src)[1].lower()
+            if ext not in exts:
+                continue
+            dst = os.path.join(STUDY_INBOX, os.path.basename(src))
+            if os.path.abspath(src) != os.path.abspath(dst):
+                if os.path.exists(dst):
+                    stem, e = os.path.splitext(dst)
+                    dst = f"{stem}-{int(time.time())}{e}"
+                shutil.copy2(src, dst)
+            copied += 1
+        except Exception as e:
+            print(f"inbox copy error: {e}", flush=True)
+    return copied
+
+
+def _pdf_pages(path):
+    try:
+        r = _run(["pdfinfo", path], capture_output=True, text=True, timeout=20)
+        for line in (r.stdout or "").splitlines():
+            if line.lower().startswith("pages:"):
+                return max(1, int(line.split(":")[1].strip()))
+    except Exception:
+        pass
+    return 1
+
+
+def _render_pdf_page(path, page, zoom=1.0):
+    """Render one PDF page to a PNG (poppler) and return a pixbuf."""
+    try:
+        out = os.path.join(tempfile.gettempdir(),
+                           f"focus-pdf-{os.getpid()}-{page}-{int(zoom * 100)}")
+        r = _run(["pdftoppm", "-png", "-r", str(int(110 * zoom)), "-f", str(page),
+                  "-l", str(page), "-singlefile", path, out],
+                 capture_output=True, text=True, timeout=45)
+        png = out + ".png"
+        if r.returncode == 0 and os.path.exists(png):
+            return GdkPixbuf.Pixbuf.new_from_file(png)
+    except Exception as e:
+        print(f"pdf render error: {e}", flush=True)
+    return None
+
+
+def show_study_window(parent=None, end_ts=None):
+    """Study container inside lockout: whitelisted links, PDF/image library,
+    read-only WhatsApp, media intake. Suspension keeps running."""
+    global _study_win, _study_parent
+
+    if WebKit2 is None:
+        print("WebKit2 unavailable — study view disabled", flush=True)
+        return
+
+    cfg = _study_config()
+    allow = cfg.get("allow_hosts") or _STUDY_DEFAULTS["allow_hosts"]
+    dl_exts = set(x.lower() for x in (cfg.get("download_exts") or MEDIA_EXTS))
+
+    if parent is not None:
+        _study_parent = parent
+        try:
+            parent.hide()
+        except Exception:
+            pass
+
+    win = _new_fullscreen("Study")
+    _study_win = win
+    win.set_modal(True)
+    _swallow_shell_keys(win)
+    guard_id = _arm_focus_guard(win)
+
+    css = Gtk.CssProvider()
+    css.load_from_data(b"""
+    .studywin { background: #0b1220; }
+    .studybar { background: #10264a; padding: 10px 18px; }
+    .studyhead { font-family: Inter, sans-serif; font-size: 13px; color: #dbeafe;
+                 letter-spacing: 2px; font-weight: bold; }
+    .studytime { font-family: Inter, sans-serif; font-size: 13px; color: #9ca3af; }
+    .sidehead { font-family: Inter, sans-serif; font-size: 11px; color: #9ca3af;
+                letter-spacing: 1.6px; font-weight: bold; padding: 8px 4px 4px 4px; }
+    .sidebtn { background: transparent; border: none; box-shadow: none;
+               padding: 7px 8px; border-radius: 8px; }
+    .sidebtn:hover { background: rgba(37, 99, 235, 0.18); }
+    .sidebtn label { font-family: Inter, sans-serif; font-size: 13px; color: #e5e7eb; }
+    .sidebtn:active { background: rgba(37, 99, 235, 0.30); }
+    .panel { background: #f8fafc; }
+    .studytip { font-family: Inter, sans-serif; font-size: 12px; color: #9ca3af; }
+    """)
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    win.get_style_context().add_class("studywin")
+    win.connect("delete-event", lambda *_: True)  # Alt+F4 blocked
+
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+    bar.get_style_context().add_class("studybar")
+    head = Gtk.Label(label="STUDY MODE \u2014 LOCKED (SUSPENSION CONTINUES)")
+    head.get_style_context().add_class("studyhead")
+    head.set_halign(Gtk.Align.START)
+    time_lbl = Gtk.Label(label="")
+    time_lbl.get_style_context().add_class("studytime")
+    time_lbl.set_halign(Gtk.Align.END)
+    time_lbl.set_hexpand(True)
+    bar.pack_start(head, False, False, 0)
+    bar.pack_start(time_lbl, True, True, 0)
+
+    body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+    side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    side.set_size_request(250, -1)
+    side.set_margin_top(6); side.set_margin_bottom(6)
+    side.set_margin_start(10); side.set_margin_end(10)
+
+    links_head = Gtk.Label(label="LINKS")
+    links_head.get_style_context().add_class("sidehead")
+    links_head.set_halign(Gtk.Align.START)
+    links_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+
+    lib_head = Gtk.Label(label="LIBRARY")
+    lib_head.get_style_context().add_class("sidehead")
+    lib_head.set_halign(Gtk.Align.START)
+    lib_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+    lib_scroll = Gtk.ScrolledWindow()
+    lib_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    lib_scroll.set_vexpand(True)
+    lib_scroll.add(lib_box)
+
+    side.pack_start(links_head, False, False, 0)
+    side.pack_start(links_box, False, False, 0)
+    side.pack_start(lib_head, False, False, 0)
+    side.pack_start(lib_scroll, True, True, 0)
+
+    stack = Gtk.Stack()
+    stack.set_hexpand(True)
+    stack.set_vexpand(True)
+
+    web = WebKit2.WebView()
+    try:
+        st = web.get_settings()
+        st.set_enable_developer_extras(False)
+        st.set_enable_html5_local_storage(True)
+        st.set_enable_html5_database(True)
+        st.set_enable_javascript(True)
+        st.set_enable_page_cache(False)
+    except Exception:
+        pass
+    web.set_hexpand(True)
+    web.set_vexpand(True)
+    web_scroll = Gtk.ScrolledWindow()
+    web_scroll.add(web)
+
+    def _toast(msg):
+        try:
+            tip_lbl.set_text(msg)
+        except Exception:
+            pass
+
+    def _on_decide_policy(_view, decision, dtype):
+        try:
+            if dtype == WebKit2.PolicyDecisionType.NAVIGATION_ACTION:
+                uri = decision.get_navigation_action().get_request().get_uri()
+                if uri and uri.startswith(("file://", "blob:", "data:", "about:")):
+                    return False  # in-page PDF/blob from an already-allowed page
+                host = ""
+                try:
+                    host = (decision.get_navigation_action().get_request().get_uri()
+                            .split("://", 1)[1].split("/", 1)[0])
+                except Exception:
+                    host = ""
+                if _host_allowed(host, allow):
+                    if uri.lower().split("?")[0].endswith(".pdf"):
+                        # fetch into inbox and open in the built-in reader
+                        decision.ignore()
+                        try:
+                            web.download_uri(uri)
+                        except Exception as e:
+                            print(f"pdf download error: {e}", flush=True)
+                        return True
+                    return False
+                decision.ignore()
+                _toast(f"Blocked: {host or uri} \u2014 not in study list")
+                return True
+            if dtype == WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION:
+                decision.ignore()
+                return True
+        except Exception as e:
+            print(f"policy error: {e}", flush=True)
+        return False
+
+    def _on_create(*_a):
+        _toast("Popup blocked")
+        return None
+
+    def _on_context_menu(*_a):
+        return True
+
+    def _on_download(download):
+        try:
+            name = download.get_suggested_filename() or "download"
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in dl_exts:
+                download.cancel()
+                _toast(f"Download blocked: {name} (only PDF/image allowed)")
+                return
+            os.makedirs(STUDY_INBOX, exist_ok=True)
+            dst = os.path.join(STUDY_INBOX, name)
+            if os.path.exists(dst):
+                stem, e = os.path.splitext(dst)
+                dst = f"{stem}-{int(time.time())}{e}"
+            download.set_destination("file://" + dst)
+
+            def _done(*_a):
+                _toast(f"Saved {os.path.basename(dst)}")
+                refresh_library()
+                if dst.lower().endswith(".pdf"):
+                    _open_media(dst)  # boimate-style PDF: readable right away
+            download.connect("finished", _done)
+        except Exception as e:
+            print(f"download error: {e}", flush=True)
+
+    web.connect("decide-policy", _on_decide_policy)
+    web.connect("create", _on_create)
+    web.connect("context-menu", _on_context_menu)
+    for _target in (web,):
+        try:
+            _target.connect("download-started", lambda _v, d: _on_download(d))
+        except Exception:
+            pass
+    try:
+        web.get_context().connect("download-started", lambda _c, d: _on_download(d))
+    except Exception:
+        pass
+
+    # read-only WhatsApp: hide composer/attachment UI, keep media accessible
+    try:
+        ro_css = """
+        footer, [data-testid="conversation-compose-box-input"],
+        [data-testid="compose-box"], [data-testid="chat-attachment-menu"],
+        [data-testid="attach-menu"], [data-testid="emoji-panel"] { display: none !important; }
+        """
+        sheet = WebKit2.UserStyleSheet(ro_css, WebKit2.UserContentInjectedFrames.TOP_FRAME,
+                                       WebKit2.UserStyleLevel.USER, None, None)
+        web.get_user_content_manager().add_style_sheet(sheet)
+    except Exception as e:
+        print(f"whatsapp readonly css skipped: {e}", flush=True)
+
+    # ---- PDF / image reader ----
+    reader = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    reader.set_margin_top(8); reader.set_margin_bottom(8)
+    reader.set_margin_start(10); reader.set_margin_end(10)
+    img = Gtk.Image()
+    img_scroll = Gtk.ScrolledWindow()
+    img_scroll.add(img)
+    img_scroll.set_vexpand(True)
+    nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+    nav.set_halign(Gtk.Align.CENTER)
+    prev_btn = Gtk.Button(label="\u2190 Prev")
+    next_btn = Gtk.Button(label="Next \u2192")
+    for b in (prev_btn, next_btn):
+        b.get_style_context().add_class("btn-ghost")
+        b.set_size_request(110, 40)
+    page_lbl = Gtk.Label(label="")
+    page_lbl.get_style_context().add_class("caption")
+    zoom_out = Gtk.Button(label="\u2212")
+    zoom_in = Gtk.Button(label="+")
+    for b in (zoom_out, zoom_in):
+        b.get_style_context().add_class("btn-ghost")
+        b.set_size_request(52, 40)
+    nav.pack_start(prev_btn, False, False, 0)
+    nav.pack_start(page_lbl, False, False, 0)
+    nav.pack_start(next_btn, False, False, 0)
+    nav.pack_start(zoom_out, False, False, 0)
+    nav.pack_start(zoom_in, False, False, 0)
+    reader.pack_start(img_scroll, True, True, 0)
+    reader.pack_start(nav, False, False, 0)
+    stack.add_named(web_scroll, "web")
+    stack.add_named(reader, "reader")
+
+    state = {"path": None, "page": 1, "pages": 1, "zoom": 1.0}
+
+    def _show_page():
+        p = state["path"]
+        if not p:
+            return
+        pb = _render_pdf_page(p, state["page"], state["zoom"])
+        if pb is not None:
+            img.set_from_pixbuf(pb)
+            page_lbl.set_text(f"{state['page']} / {state['pages']}")
+        else:
+            _toast("Could not render this PDF page")
+
+    def _open_media(path):
+        try:
+            h = min(Gdk.Screen.get_default().get_height() - 220, 900)
+        except Exception:
+            h = 700
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".pdf":
+            state.update(path=path, page=1, pages=_pdf_pages(path))
+            stack.set_visible_child_name("reader")
+            _show_page()
+        else:
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, -1, h, True)
+                img.set_from_pixbuf(pb)
+                page_lbl.set_text("image")
+                stack.set_visible_child_name("reader")
+            except Exception as e:
+                _toast(f"Cannot open image: {e}")
+
+    prev_btn.connect("clicked", lambda *_: (
+        state.update(page=max(1, state["page"] - 1)), _show_page()))
+    next_btn.connect("clicked", lambda *_: (
+        state.update(page=min(state["pages"], state["page"] + 1)), _show_page()))
+    zoom_in.connect("clicked", lambda *_: (
+        state.update(zoom=min(3.0, state["zoom"] + 0.25)), _show_page()))
+    zoom_out.connect("clicked", lambda *_: (
+        state.update(zoom=max(0.5, state["zoom"] - 0.25)), _show_page()))
+
+    def _load_link(url):
+        if url.startswith("file://") or _host_allowed(
+                url.split("://", 1)[1].split("/", 1)[0], allow):
+            stack.set_visible_child_name("web")
+            web.load_uri(url)
+        else:
+            _toast("Blocked: not in study list")
+
+    for item in cfg.get("links", []):
+        b = Gtk.Button(label="\u2022  " + str(item.get("title", "Link")))
+        b.get_style_context().add_class("sidebtn")
+        b.set_relief(Gtk.ReliefStyle.NONE)
+        b.set_halign(Gtk.Align.FILL)
+        b.set_tooltip_text(str(item.get("url", "")))
+        b.connect("clicked", lambda _b, u=item.get("url", ""): _load_link(u))
+        links_box.pack_start(b, False, False, 0)
+
+    lib_sig = {"n": 0}
+
+    def _fill_library(items):
+        for ch in lib_box.get_children():
+            lib_box.remove(ch)
+        shown = 0
+        for _mt, path in items:
+            icon = "\U0001F4C4" if path.lower().endswith(".pdf") else "\U0001F5BC"
+            label = os.path.basename(path)
+            if len(label) > 30:
+                label = label[:27] + "\u2026"
+            b = Gtk.Button(label=f"{icon} {label}")
+            b.get_style_context().add_class("sidebtn")
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            b.set_halign(Gtk.Align.FILL)
+            b.set_tooltip_text(path)
+            b.connect("clicked", lambda _b, p=path: _open_media(p))
+            lib_box.pack_start(b, False, False, 0)
+            shown += 1
+        lib_head.set_text(f"LIBRARY ({shown})")
+
+    scan_state = {"items": [], "done": False}
+
+    def refresh_library():
+        lib_sig["n"] += 1
+        token = lib_sig["n"]
+
+        def _work():
+            items = _scan_media(cfg.get("scan_roots") or _STUDY_DEFAULTS["scan_roots"])
+            GLib.idle_add(lambda: _apply(items, token))
+
+        def _apply(items, tok):
+            if tok != lib_sig["n"]:
+                return False
+            scan_state["items"] = items
+            scan_state["done"] = True
+            _fill_library(items)
+            return False
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    refresh_library()
+
+    tip_lbl = Gtk.Label(label="Esc = back to lockout  \u2022  PDF/image downloads only")
+    tip_lbl.get_style_context().add_class("studytip")
+
+    footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+    footer.set_margin_top(6); footer.set_margin_bottom(8)
+    footer.set_margin_start(14); footer.set_margin_end(14)
+    back_btn = Gtk.Button(label="\u2190 Back to Lockout")
+    back_btn.get_style_context().add_class("btn-ghost")
+    back_btn.set_size_request(190, 44)
+    type_btn = Gtk.Button(label="Typing Test")
+    type_btn.get_style_context().add_class("btn-ghost")
+    type_btn.set_size_request(150, 44)
+    intake_lbl = Gtk.Label(label="Drop PDF/image here \u2022 Ctrl+V to save clipboard image")
+    intake_lbl.get_style_context().add_class("studytip")
+    intake_lbl.set_hexpand(True)
+    intake_lbl.set_halign(Gtk.Align.END)
+    footer.pack_start(back_btn, False, False, 0)
+    footer.pack_start(type_btn, False, False, 0)
+    footer.pack_start(intake_lbl, True, True, 0)
+
+    body.pack_start(side, False, False, 0)
+    body.pack_start(stack, True, True, 0)
+    outer.pack_start(bar, False, False, 0)
+    outer.pack_start(tip_lbl, False, False, 0)
+    outer.pack_start(body, True, True, 0)
+    outer.pack_start(footer, False, False, 0)
+    win.add(outer)
+
+    # ---- intake: drag & drop / clipboard ----
+    try:
+        win.drag_dest_set(Gtk.DestDefaults.ALL, [Gtk.TargetEntry.new("text/uri-list", 0, 0)],
+                          Gdk.DragAction.COPY)
+    except Exception:
+        pass
+
+    def _on_drop(_w, _ctx, _x, _y, data, _info, _time):
+        try:
+            uris = data.get_uris()
+            paths = [urllib.parse.unquote(u[7:]) for u in uris if u.startswith("file://")]
+            n = _copy_into_inbox(paths, MEDIA_EXTS)
+            _toast(f"Saved {n} file(s) to study inbox" if n else
+                   "Only PDF/image files are accepted")
+            if n:
+                refresh_library()
+        except Exception as e:
+            print(f"drop error: {e}", flush=True)
+        return True
+
+    win.connect("drag-data-received", _on_drop)
+
+    def _paste_image():
+        try:
+            cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            pb = cb.wait_for_image()
+            if pb is None:
+                _toast("Clipboard has no image")
+                return
+            os.makedirs(STUDY_INBOX, exist_ok=True)
+            dst = os.path.join(STUDY_INBOX,
+                               time.strftime("clipboard-%Y%m%d-%H%M%S.png"))
+            pb.savev(dst, "png", [], [])
+            _toast(f"Saved {os.path.basename(dst)}")
+            refresh_library()
+        except Exception as e:
+            print(f"paste error: {e}", flush=True)
+
+    def _on_key(_w, ev):
+        try:
+            kv = ev.keyval
+            mods = ev.state & Gtk.accelerator_get_default_mod_mask()
+            ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
+            if kv == Gdk.KEY_Escape:
+                win.destroy()
+                return True
+            if ctrl and kv in (Gdk.KEY_l, Gdk.KEY_t, Gdk.KEY_n, Gdk.KEY_w,
+                               Gdk.KEY_p, Gdk.KEY_j, Gdk.KEY_u):
+                return True
+            if kv in (Gdk.KEY_F6, Gdk.KEY_F11, Gdk.KEY_F12):
+                return True
+            if ctrl and kv == Gdk.KEY_v and stack.get_visible_child_name() != "web":
+                _paste_image()
+                return True
+        except Exception:
+            pass
+        return False
+
+    win.connect("key-press-event", _on_key)
+
+    back_btn.connect("clicked", lambda *_: win.destroy())
+    type_btn.connect("clicked", lambda *_: show_typing_test(parent=win))
+
+    def _tick():
+        if end_ts:
+            left = max(0, int(end_ts - time.time()))
+            d, rem = divmod(left, 86400)
+            h, rem = divmod(rem, 3600)
+            m, s = divmod(rem, 60)
+            time_lbl.set_text(f"\u23f3 {d}d {h:02d}:{m:02d}:{s:02d} left" if d
+                              else f"\u23f3 {h:02d}:{m:02d}:{s:02d} left")
+            if left <= 0:
+                win.destroy()
+                return False
+        return True
+    GLib.timeout_add_seconds(1, _tick)
+
+    # first link auto-loads (study page ready immediately)
+    links = cfg.get("links") or []
+    if links:
+        _load_link(links[0].get("url", ""))
+
+    def _on_destroy(*_a):
+        global _study_win, _study_parent
+        try:
+            GLib.source_remove(guard_id)
+        except Exception:
+            pass
+        auto = _study_auto_closing
+        _study_win = None
+        if not auto and _study_parent is not None:
+            try:
+                _study_parent.show()
+                _study_parent.present()
+            except Exception:
+                pass
+        _study_parent = None
+        Gtk.main_quit()
+
+    win.connect("destroy", _on_destroy)
+    win.show_all()
+    win.present()
+    web.grab_focus()
+    Gtk.main()
+
+
+def show_study_or_typing(parent, end_ts):
+    show_study_window(parent=parent, end_ts=end_ts)
+
 
 # ---------- main loop ----------
 
