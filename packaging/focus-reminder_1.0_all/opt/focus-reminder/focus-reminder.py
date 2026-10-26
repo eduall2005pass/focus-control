@@ -2292,6 +2292,9 @@ def show_study_window(parent=None, end_ts=None):
     lib_head = Gtk.Label(label="LIBRARY")
     lib_head.get_style_context().add_class("sidehead")
     lib_head.set_halign(Gtk.Align.START)
+    lib_count = Gtk.Label(label="")
+    lib_count.get_style_context().add_class("studytip")
+    lib_count.set_halign(Gtk.Align.START)
     lib_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
     lib_scroll = Gtk.ScrolledWindow()
     lib_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -2301,6 +2304,7 @@ def show_study_window(parent=None, end_ts=None):
     side.pack_start(links_head, False, False, 0)
     side.pack_start(links_box, False, False, 0)
     side.pack_start(lib_head, False, False, 0)
+    side.pack_start(lib_count, False, False, 0)
     side.pack_start(lib_scroll, True, True, 0)
 
     stack = Gtk.Stack()
@@ -2508,16 +2512,85 @@ def show_study_window(parent=None, end_ts=None):
         links_box.pack_start(b, False, False, 0)
 
     lib_sig = {"n": 0}
+    lib_state = {
+        "cwd": os.path.expanduser("~"),
+        "home": os.path.expanduser("~"),
+        "dirs": {},          # dirpath -> [(mtime, path)]
+        "roots": [os.path.expanduser(r) for r in
+                  (cfg.get("scan_roots") or _STUDY_DEFAULTS["scan_roots"])],
+    }
+    MAX_ROWS = 400
 
-    def _fill_library(items):
+    def _crumb(path):
+        home = lib_state["home"]
+        return "~" if path == home else (
+            "~" + path[len(home):] if path.startswith(home + "/") else path)
+
+    def _subfolders(dirs, cwd):
+        """Immediate sub-folders under cwd with total media counts."""
+        prefix = cwd.rstrip("/") + "/"
+        counts = {}
+        for d, files in dirs.items():
+            if d == cwd or not d.startswith(prefix):
+                continue
+            top = d[len(prefix):].split("/")[0]
+            counts[top] = counts.get(top, 0) + len(files)
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower()))
+
+    def _render_library():
         for ch in lib_box.get_children():
             lib_box.remove(ch)
-        shown = 0
-        for _mt, path in items:
+        cwd = lib_state["cwd"]
+        dirs = lib_state["dirs"]
+        rows = 0
+
+        up = Gtk.Button(label="\u2191  Up")
+        up.get_style_context().add_class("sidebtn")
+        up.set_relief(Gtk.ReliefStyle.NONE)
+        up.set_halign(Gtk.Align.FILL)
+        parent = os.path.dirname(cwd.rstrip("/")) or "/"
+        at_root = cwd.rstrip("/") in [r.rstrip("/") for r in lib_state["roots"]]
+        up.set_sensitive((not at_root) and cwd.rstrip("/") != lib_state["home"].rstrip("/"))
+        up.connect("clicked", lambda *_: _goto(parent))
+        lib_box.pack_start(up, False, False, 0)
+        rows += 1
+
+        for name, count in _subfolders(dirs, cwd):
+            b = Gtk.Button(label=f"\U0001F4C1 {name}  ({count})")
+            b.get_style_context().add_class("sidebtn")
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            b.set_halign(Gtk.Align.FILL)
+            b.set_tooltip_text(os.path.join(cwd, name))
+            b.connect("clicked", lambda _b, n=name: _goto(os.path.join(cwd, n)))
+            lib_box.pack_start(b, False, False, 0)
+            rows += 1
+            if rows >= MAX_ROWS:
+                break
+
+        # other drive/volume roots reachable from home
+        if cwd.rstrip("/") == lib_state["home"].rstrip("/"):
+            for r in lib_state["roots"]:
+                r = os.path.abspath(r)
+                if r.rstrip("/") == cwd.rstrip("/") or not os.path.isdir(r):
+                    continue
+                cnt = sum(len(v) for d, v in dirs.items()
+                          if d == r or d.startswith(r.rstrip("/") + "/"))
+                if not cnt:
+                    continue
+                b = Gtk.Button(label=f"\U0001F5B4 {r}  ({cnt})")
+                b.get_style_context().add_class("sidebtn")
+                b.set_relief(Gtk.ReliefStyle.NONE)
+                b.set_halign(Gtk.Align.FILL)
+                b.connect("clicked", lambda _b, rr=r: _goto(rr))
+                lib_box.pack_start(b, False, False, 0)
+                rows += 1
+
+        files = dirs.get(cwd, [])
+        for _mt, path in files[:max(0, MAX_ROWS - rows)]:
             icon = "\U0001F4C4" if path.lower().endswith(".pdf") else "\U0001F5BC"
             label = os.path.basename(path)
-            if len(label) > 30:
-                label = label[:27] + "\u2026"
+            if len(label) > 28:
+                label = label[:25] + "\u2026"
             b = Gtk.Button(label=f"{icon} {label}")
             b.get_style_context().add_class("sidebtn")
             b.set_relief(Gtk.ReliefStyle.NONE)
@@ -2525,29 +2598,42 @@ def show_study_window(parent=None, end_ts=None):
             b.set_tooltip_text(path)
             b.connect("clicked", lambda _b, p=path: _open_media(p))
             lib_box.pack_start(b, False, False, 0)
-            shown += 1
-        lib_head.set_text(f"LIBRARY ({shown})")
+            rows += 1
+
+        total = sum(len(v) for v in dirs.values())
+        lib_head.set_text(f"LIBRARY \u2022 {_crumb(cwd)}")
+        lib_count.set_text(f"{total} files \u2022 {len(_subfolders(dirs, cwd))} folder(s) here")
         try:
-            lib_box.show_all()  # children added after window show need explicit show
+            lib_box.show_all()
         except Exception:
             pass
 
-    scan_state = {"items": [], "done": False}
+    def _goto(path):
+        path = os.path.abspath(path)
+        known = set(lib_state["dirs"].keys())
+        for d in known:
+            if d.startswith(path.rstrip("/") + "/"):
+                known.add(path)
+                break
+        if path in known or path == "/" or os.path.isdir(path):
+            lib_state["cwd"] = path
+            _render_library()
 
     def refresh_library():
         lib_sig["n"] += 1
         token = lib_sig["n"]
 
         def _work():
-            items = _scan_media(cfg.get("scan_roots") or _STUDY_DEFAULTS["scan_roots"])
-            GLib.idle_add(lambda: _apply(items, token))
+            dirs = {}
+            for _m, p in _scan_media(lib_state["roots"]):
+                dirs.setdefault(os.path.dirname(p), []).append((_m, p))
+            GLib.idle_add(lambda: _apply(dirs, token))
 
-        def _apply(items, tok):
+        def _apply(dirs, tok):
             if tok != lib_sig["n"]:
                 return False
-            scan_state["items"] = items
-            scan_state["done"] = True
-            _fill_library(items)
+            lib_state["dirs"] = dirs
+            _render_library()
             return False
 
         threading.Thread(target=_work, daemon=True).start()
