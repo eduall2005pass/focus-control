@@ -867,6 +867,32 @@ def _gnome_restore(saved):
             print(f"lockdown restore {schema} {key}: {e}", flush=True)
 
 
+def _gnome_heal():
+    """Self-heal stale lockdown (crash/reboot during lockout left keys off)."""
+    defaults = {
+        ("org.gnome.mutter", "overlay-key"): "'Super'",
+        ("org.gnome.desktop.wm.keybindings", "switch-applications"): "['<Super>Tab']",
+        ("org.gnome.desktop.wm.keybindings", "switch-windows"): "['<Alt>Tab']",
+        ("org.gnome.desktop.notifications", "show-banners"): "true",
+    }
+    for (schema, key), good in defaults.items():
+        try:
+            r = _run(["gsettings", "get", schema, key],
+                     capture_output=True, text=True, timeout=10)
+            cur = r.stdout.strip() if r.returncode == 0 else None
+        except Exception:
+            cur = None
+        if cur is None or cur == good:
+            continue
+        locked_look = cur in ("''", "@as []", "false")
+        if locked_look:
+            try:
+                _run(["gsettings", "set", schema, key, good], timeout=10)
+                print(f"self-heal: restored {schema} {key}", flush=True)
+            except Exception as e:
+                print(f"self-heal failed {schema} {key}: {e}", flush=True)
+
+
 # Binaries that must not run while the device is suspended (browsers, which can
 # open anything incl. AI agents; terminals/VT-launched shells; AI CLIs).
 # Matched by exact basename of argv[0] — never by substring, never self.
@@ -2039,6 +2065,7 @@ def main():
         enforce_suspension_until(pending)
     else:
         _clear_suspend_state()
+        _gnome_heal()  # no lockout active: undo any stale shell lockdown
     while True:
         while time.time() < suspend_until:
             time.sleep(20)
