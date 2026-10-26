@@ -2069,10 +2069,10 @@ _SCAN_SKIP = {
 }
 
 _STUDY_DEFAULTS = {
+    "version": 2,
     "links": [
-        {"title": "Boimate AI", "url": "https://boimate.com/ai"},
+        {"title": "Boimate", "url": "https://boimate.com"},
         {"title": "NotebookLM", "url": "https://notebooklm.google.com"},
-        {"title": "Gemini", "url": "https://gemini.google.com"},
         {"title": "MuslimBangla", "url": "https://muslimbangla.com"},
         {"title": "iHadis", "url": "https://ihadis.com/en"},
         {"title": "LiveMCQ", "url": "https://web.livemcq.com/"},
@@ -2081,7 +2081,7 @@ _STUDY_DEFAULTS = {
     ],
     "allow_hosts": [
         "boimate.com", "www.boimate.com",
-        "notebooklm.google.com", "gemini.google.com", "bard.google.com",
+        "notebooklm.google.com",
         "accounts.google.com", "accounts.youtube.com", "myaccount.google.com",
         "translate.google.com", "translate.googleapis.com", "clients6.google.com",
         "www.google.com", "google.com", "apis.google.com", "content.googleapis.com",
@@ -2107,7 +2107,8 @@ def _study_config():
     try:
         with open(STUDY_CONFIG_PATH) as f:
             cfg = json.load(f)
-        if isinstance(cfg, dict) and cfg.get("links") and cfg.get("allow_hosts"):
+        if (isinstance(cfg, dict) and cfg.get("links") and cfg.get("allow_hosts")
+                and int(cfg.get("version", 1)) >= 2):
             return cfg
     except Exception:
         pass
@@ -2526,6 +2527,10 @@ def show_study_window(parent=None, end_ts=None):
             lib_box.pack_start(b, False, False, 0)
             shown += 1
         lib_head.set_text(f"LIBRARY ({shown})")
+        try:
+            lib_box.show_all()  # children added after window show need explicit show
+        except Exception:
+            pass
 
     scan_state = {"items": [], "done": False}
 
