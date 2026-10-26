@@ -2069,10 +2069,10 @@ _SCAN_SKIP = {
 }
 
 _STUDY_DEFAULTS = {
-    "version": 2,
+    "version": 4,
     "links": [
         {"title": "Boimate", "url": "https://boimate.com"},
-        {"title": "NotebookLM", "url": "https://notebooklm.google.com"},
+        {"title": "Gemini Notebook", "url": "https://notebooklm.google.com"},
         {"title": "MuslimBangla", "url": "https://muslimbangla.com"},
         {"title": "iHadis", "url": "https://ihadis.com/en"},
         {"title": "LiveMCQ", "url": "https://web.livemcq.com/"},
@@ -2081,7 +2081,9 @@ _STUDY_DEFAULTS = {
     ],
     "allow_hosts": [
         "boimate.com", "www.boimate.com",
-        "notebooklm.google.com",
+        "notebooklm.google.com", "notebook.google.com",
+        "*.notebook.google.com", "notebooklm-pa.googleapis.com",
+        "content-push.googleapis.com", "csp.withgoogle.com",
         "accounts.google.com", "accounts.youtube.com", "myaccount.google.com",
         "translate.google.com", "translate.googleapis.com", "clients6.google.com",
         "www.google.com", "google.com", "apis.google.com", "content.googleapis.com",
@@ -2108,7 +2110,7 @@ def _study_config():
         with open(STUDY_CONFIG_PATH) as f:
             cfg = json.load(f)
         if (isinstance(cfg, dict) and cfg.get("links") and cfg.get("allow_hosts")
-                and int(cfg.get("version", 1)) >= 2):
+                and int(cfg.get("version", 1)) >= 4):
             return cfg
     except Exception:
         pass
