@@ -14,3 +14,7 @@ case "$cur" in
 esac
 
 ibus engine ibus-avro >/dev/null 2>&1 || true
+
+# Super+Space switches input source (Bengali <-> English); Shift+Super+Space reverse
+gsettings set org.gnome.desktop.wm.keybindings switch-input-source "['<Super>space']" 2>/dev/null || true
+gsettings set org.gnome.desktop.wm.keybindings switch-input-source-backward "['<Shift><Super>space']" 2>/dev/null || true
