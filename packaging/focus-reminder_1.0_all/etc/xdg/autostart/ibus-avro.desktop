@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=IBus (Avro Phonetic)
+Comment=Start IBus with Avro so Bengali typing works everywhere, incl. lockout
+Exec=/usr/local/bin/ibus-avro-setup.sh
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

@@ -66,13 +66,26 @@ mkdir -p /etc/systemd/user/default.target.wants
 ln -sf /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service /etc/systemd/user/default.target.wants/xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service
 ln -sf /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service /etc/systemd/user/default.target.wants/xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service
 
-echo "[5/6] Installing XDG autostart (display environment import)"
+echo "[5/6] Installing XDG autostart (display environment import + Avro input)"
 cat > /etc/xdg/autostart/focus-reminder-env.desktop <<'EOF'
 [Desktop Entry]
 Type=Application
 Name=Focus Reminder Env
 Comment=Import graphical session environment for Focus Reminder (all users)
 Exec=/bin/sh -c 'systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR XDG_SESSION_TYPE'
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+EOF
+
+install -Dm755 "$(dirname "$0")/packaging/focus-reminder_1.0_all/usr/local/bin/ibus-avro-setup.sh" \
+  /usr/local/bin/ibus-avro-setup.sh 2>/dev/null || true
+cat > /etc/xdg/autostart/ibus-avro.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=IBus (Avro Phonetic)
+Comment=Start IBus with Avro so Bengali typing works everywhere, incl. lockout
+Exec=/usr/local/bin/ibus-avro-setup.sh
 Hidden=false
 NoDisplay=true
 X-GNOME-Autostart-enabled=true

@@ -982,6 +982,8 @@ def _lockout_proc_sweep(sigs=None):
             if int(pid) == me:
                 continue
             exe = os.readlink(f"/proc/{pid}/exe")
+            if "ibus" in os.path.basename(exe) or "input-method" in exe:
+                continue  # never kill input methods (Avro/Bengali typing)
             st = os.stat(exe)
             if _exe_matches(exe, st, sigs or {"inos": set(), "hashes": {}}):
                 os.kill(int(pid), signal.SIGKILL)
