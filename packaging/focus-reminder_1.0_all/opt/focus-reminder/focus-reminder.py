@@ -443,39 +443,22 @@ def _load_suspend_state():
 
 
 def _restore_suspend_checkpoint():
-    """Resume the saved remaining lockout time after boot or power loss."""
-    try:
-        with open(SUSPEND_CHECKPOINT_STATE) as f:
-            checkpoint = json.load(f)
-        remaining = max(0.0, float(checkpoint.get("remaining_seconds", 0)))
-        if remaining <= 0:
-            return _load_suspend_state()
-        now = time.time()
-        schedule = checkpoint.get("schedule")
-        if (isinstance(schedule, dict) and isinstance(schedule.get("segments"), list)
-                and schedule["segments"]):
-            stage = max(0, min(int(schedule.get("stage", 0)),
-                               len(schedule["segments"]) - 1))
-            stage_left = checkpoint.get("stage_remaining_seconds")
-            if stage_left is not None:
-                duration = int(schedule["segments"][stage])
-                stage_left = min(float(duration), max(0.0, float(stage_left)))
-                schedule["stage"] = stage
-                schedule["stage_start"] = now - (duration - stage_left)
-                schedule["origin_start"] = now
-                _save_lockout_schedule(schedule)
-                end = _schedule_end(schedule)
-            else:
-                end = now + remaining
-        else:
-            end = now + remaining
-        _atomic_write(SUSPEND_STATE, str(float(end)))
-        _save_suspend_state(end, mode="active")
-        print(f"Restored {max(1, int((end - now) / 60))} min of lockout after restart.",
-              flush=True)
-        return end
-    except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
-        return _load_suspend_state()
+    """Return the lockout deadline after boot or power loss (wall clock).
+
+    Power-off time counts toward the lockout, so rebooting, logging out or
+    powering off cannot buy a usable-desktop window. The checkpoint is only
+    a fallback when the absolute deadline file is missing.
+    """
+    end = _load_suspend_state()
+    if end <= 0:
+        try:
+            with open(SUSPEND_CHECKPOINT_STATE) as f:
+                checkpoint = json.load(f)
+            end = (float(checkpoint.get("saved_at", 0))
+                   + max(0.0, float(checkpoint.get("remaining_seconds", 0))))
+        except Exception:
+            end = 0
+    return end
 
 
 def _clear_suspend_state():
@@ -2460,18 +2443,61 @@ def _input_norm(text):
     return s.translate(_BLOCK_LEET)
 
 
+_LETTER_RE = re.compile(r"[a-z0-9\u0980-\u09FF]")
+
+
+def _compact_map(text, collapse=False):
+    """Compact form + gap flags (True = char starts a new chunk in the input)."""
+    out, gaps = [], []
+    pending_gap = True
+    for ch in _input_norm(text):
+        if _LETTER_RE.match(ch):
+            out.append(ch)
+            gaps.append(pending_gap)
+            pending_gap = False
+        else:
+            pending_gap = True
+    if collapse:
+        cc, cg = [], []
+        for ch, gap in zip(out, gaps):
+            if cc and ch == cc[-1] and not gap:
+                continue
+            cc.append(ch)
+            cg.append(gap)
+        out, gaps = cc, cg
+    return "".join(out), gaps
+
+
+def _compact_variants(text):
+    raw = _compact_map(text)
+    col = _compact_map(text, collapse=True)
+    return [raw] if raw[0] == col[0] else [raw, col]
+
+
 def _compact(text):
-    s = re.sub(r"[^a-z0-9\u0980-\u09FF]+", "", _input_norm(text))
-    return re.sub(r"(.)\1+", r"\1", s)
+    return _compact_map(text, collapse=True)[0]
+
+
+def _is_bangla(word):
+    return any("\u0980" <= ch <= "\u09ff" for ch in word)
 
 
 _BLOCK_NORM = [(w, re.sub(r"[^a-z0-9\u0980-\u09FF]+", " ",
                           _input_norm(w)).strip()) for w in BLOCKED_INPUT_WORDS]
-_BLOCK_COMPACT = [(w, _compact(w)) for w in BLOCKED_INPUT_WORDS]
+_BLOCK_COMPACT = []
+for _w in BLOCKED_INPUT_WORDS:
+    for _form in {_compact_map(_w)[0], _compact_map(_w, collapse=True)[0]}:
+        _BLOCK_COMPACT.append((_w, _form))
 
 
 def _explicit_hit(text):
-    """Return the matched explicit word, or None (normalisation-proof)."""
+    """Return the matched explicit word, or None.
+
+    Every blocked word goes through the same normaliser: lowercase, accent
+    folding, zero-width removal, leetspeak, punctuation/spacing and repeated
+    letters.  Short risky words additionally require word boundaries so normal
+    text (imagine, branding, bhabishyat) still passes.
+    """
     if not text:
         return None
     spaced = " " + re.sub(r"[^a-z0-9\u0980-\u09FF]+", " ",
@@ -2479,12 +2505,65 @@ def _explicit_hit(text):
     for word, norm in _BLOCK_NORM:
         if norm and (" " + norm + " ") in spaced:
             return word
-    comp = _compact(text)
+
+    variants = _compact_variants(text)
     for word, comp_word in _BLOCK_COMPACT:
-        if not comp_word or len(comp_word) < 4 or word in _BLOCK_WORD_ONLY:
+        if not comp_word:
             continue
-        if comp_word in comp:
+        if _is_bangla(comp_word):
+            min_len = 2
+        elif word in _BLOCK_WORD_ONLY:
+            min_len = 3
+        else:
+            min_len = 4
+        if len(comp_word) < min_len:
+            continue
+        for comp, gaps in variants:
+            start = 0
+            while True:
+                at = comp.find(comp_word, start)
+                if at < 0:
+                    break
+                end = at + len(comp_word)
+                if word not in _BLOCK_WORD_ONLY:
+                    return word
+                if gaps[at]:
+                    internal = any(gaps[k] for k in range(at + 1, end))
+                    after_gap = (end >= len(comp)) or gaps[end]
+                    if internal or after_gap:
+                        return word
+                start = at + 1
+    return None
+    spaced = " " + re.sub(r"[^a-z0-9\u0980-\u09FF]+", " ",
+                          _input_norm(text)).strip() + " "
+    for word, norm in _BLOCK_NORM:
+        if norm and (" " + norm + " ") in spaced:
             return word
+    comp, gaps = _compact_map(text)
+    for word, comp_word in _BLOCK_COMPACT:
+        if not comp_word:
+            continue
+        if _is_bangla(comp_word):
+            min_len = 2
+        elif word in _BLOCK_WORD_ONLY:
+            min_len = 3
+        else:
+            min_len = 4
+        if len(comp_word) < min_len:
+            continue
+        start = 0
+        while True:
+            at = comp.find(comp_word, start)
+            if at < 0:
+                break
+            if word not in _BLOCK_WORD_ONLY:
+                return word
+            end = at + len(comp_word)
+            internal_gap = any(gaps[k] for k in range(at + 1, end))
+            after_gap = (end >= len(comp)) or gaps[end]
+            if internal_gap or (gaps[at] and after_gap):
+                return word
+            start = at + 1
     return None
 
 def _build_input_filter_js():
@@ -2506,11 +2585,35 @@ def _build_input_filter_js():
   function spaced(s) {
     return ' ' + norm(s).replace(/[^a-z0-9\u0980-\u09FF]+/g, ' ').trim() + ' ';
   }
-  function sq(s) {
-    return norm(s).replace(/[^a-z0-9\u0980-\u09FF]+/g, '').replace(/(.)\1+/g, '$1');
+  function sqMap(s, collapse) {
+    var n = norm(s), chars = [], gaps = [], pending = true, i;
+    for (i = 0; i < n.length; i++) {
+      var ch = n[i];
+      if (/[a-z0-9\u0980-\u09FF]/.test(ch)) { chars.push(ch); gaps.push(pending); pending = false; }
+      else { pending = true; }
+    }
+    if (collapse) {
+      var cc = [], cg = [];
+      for (i = 0; i < chars.length; i++) {
+        if (cc.length && chars[i] === cc[cc.length - 1] && !gaps[i]) { continue; }
+        cc.push(chars[i]); cg.push(gaps[i]);
+      }
+      chars = cc; gaps = cg;
+    }
+    return { c: chars.join(''), g: gaps };
+  }
+  function sqVariants(s) {
+    var raw = sqMap(s, false), col = sqMap(s, true);
+    return raw.c === col.c ? [raw] : [raw, col];
   }
   var BAN = RAW.map(norm);
-  var BANC = RAW.map(sq);
+  var BANC = [];
+  RAW.forEach(function (w) {
+    var seen = {};
+    [sqMap(w, false).c, sqMap(w, true).c].forEach(function (c) {
+      if (c && !seen[c]) { seen[c] = 1; BANC.push({ w: w, c: c }); }
+    });
+  });
   var WORD_ONLY = {'sex':1,'anal':1,'cum':1,'dick':1,'cock':1,'nude':1,'xxx':1,
                    'magi':1,'randi':1,'bhabi':1,'mms':1};
   function hit(text) {
@@ -2521,11 +2624,27 @@ def _build_input_filter_js():
       var w = BAN[i].replace(/[^a-z0-9\u0980-\u09FF]+/g, ' ').trim();
       if (w && t.indexOf(' ' + w + ' ') !== -1) { return RAW[i]; }
     }
-    var c = sq(text);
+    var variants = sqVariants(text);
     for (i = 0; i < BANC.length; i++) {
-      var cw = BANC[i];
-      if (!cw || cw.length < 4 || WORD_ONLY[RAW[i]]) { continue; }
-      if (c.indexOf(cw) !== -1) { return RAW[i]; }
+      var word = BANC[i].w, cw = BANC[i].c;
+      var minL = /[\u0980-\u09FF]/.test(cw) ? 2 : (WORD_ONLY[word] ? 3 : 4);
+      if (cw.length < minL) { continue; }
+      for (var v = 0; v < variants.length; v++) {
+        var cm = variants[v], pos = 0;
+        while (true) {
+          var at = cm.c.indexOf(cw, pos);
+          if (at < 0) { break; }
+          var end = at + cw.length;
+          if (!WORD_ONLY[word]) { return word; }
+          if (cm.g[at]) {
+            var internal = false, k;
+            for (k = at + 1; k < end; k++) { if (cm.g[k]) { internal = true; break; } }
+            var afterGap = (end >= cm.c.length) ? true : cm.g[end];
+            if (internal || afterGap) { return word; }
+          }
+          pos = at + 1;
+        }
+      }
     }
     return null;
   }

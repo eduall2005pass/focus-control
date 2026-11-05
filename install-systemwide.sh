@@ -13,6 +13,7 @@
 # user's own $HOME, so privacy is preserved and instances never clash.
 set -e
 cd "$(dirname "$0")"
+SRC_DIR="$(pwd)"
 APP_SRC="focus-reminder-ubuntu.py"
 [ -f "$APP_SRC" ] || { echo "ERROR: $APP_SRC not found. Run from repo root."; exit 1; }
 [ "$(id -u)" = "0" ] || { echo "ERROR: run with sudo: sudo bash install-systemwide.sh"; exit 1; }
@@ -24,6 +25,57 @@ echo "[2/6] Installing Inter font system-wide"
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fonts-inter
 fc-cache -f >/dev/null
+
+echo "[2b/6] Installing login gate (no usable desktop while a lockout is pending)"
+cat > /usr/local/bin/focus-login-gate.py <<'PYEOF'
+#!/usr/bin/env python3
+"""PAM account gate: deny graphical login while a focus lockout is pending.
+
+The deadline is absolute wall-clock time, so powering off, logging out or
+switching users cannot skip the lockout. Corrupt values and deadlines more
+than 7 days away are ignored to avoid a permanent lockout.
+"""
+import os
+import pwd
+import sys
+import time
+
+user = os.environ.get("PAM_USER", "").strip()
+if not user:
+    sys.exit(0)
+try:
+    home = pwd.getpwnam(user).pw_dir
+except KeyError:
+    sys.exit(0)
+
+path = os.path.join(home, ".local", "share", "focus-reminder", "suspend.state")
+try:
+    with open(path) as f:
+        end = float(f.read().strip())
+except Exception:
+    sys.exit(0)
+
+now = time.time()
+if now < end <= now + 7 * 86400:
+    print(f"Focus lockout active: {int((end - now + 59) // 60)} min left.",
+          file=sys.stderr)
+    sys.exit(1)  # PAM account failure -> login refused
+sys.exit(0)
+PYEOF
+chmod 755 /usr/local/bin/focus-login-gate.py
+for pamfile in /etc/pam.d/gdm-password /etc/pam.d/gdm-autologin \
+               /etc/pam.d/gdm-fingerprint /etc/pam.d/gdm-smartcard \
+               /etc/pam.d/gdm-smartcard-sssd-or-password /etc/pam.d/lightdm; do
+  [ -f "$pamfile" ] || continue
+  if grep -q "focus-login-gate.py" "$pamfile"; then continue; fi
+  [ -f "${pamfile}.focus.bak" ] || cp -a "$pamfile" "${pamfile}.focus.bak"
+  awk '!done && /^account[[:space:]]/ {
+         print "account required pam_exec.so quiet /usr/local/bin/focus-login-gate.py"
+         done=1
+       }
+       {print}' "$pamfile" > "${pamfile}.focus.tmp"
+  mv "${pamfile}.focus.tmp" "$pamfile"
+done
 
 echo "[3/6] Installing app icon system-wide"
 install -Dm644 "$SRC_DIR/assets/focus-reminder.png" /usr/share/icons/hicolor/48x48/apps/focus-reminder.png
