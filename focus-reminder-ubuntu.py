@@ -28,6 +28,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1421,6 +1422,53 @@ def show_typing_test(parent=None):
     view.set_accepts_tab(True)
     scroll.add(view)
     _typing_view = view
+    _tbuf = view.get_buffer()
+    _block_note = Gtk.Label()
+    _block_note.set_markup('<span foreground="#fca5a5">\u26d4 Focus Input Filter: '
+                           'explicit content blocked</span>')
+    _block_note.get_style_context().add_class("typehead")
+    _block_note.set_halign(Gtk.Align.CENTER)
+    _block_note.set_no_show_all(True)
+
+    _good_text = {"v": ""}
+
+    def _typing_filter(buf, _loc, text, _length):
+        try:
+            inserted = text or ""
+            existing = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+            if not _explicit_hit(existing + inserted):
+                _good_text["v"] = existing + inserted
+                return False
+            try:
+                buf.stop_emission_by_name("insert-text")  # do not let it land
+            except Exception:
+                pass
+            if len(inserted) == 1:
+                def _trim():
+                    cur = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+                    cut = len(cur)
+                    while cut > 0 and not cur[cut - 1].isspace():
+                        cut -= 1
+                    if cut < len(cur):
+                        buf.set_text(cur[:cut])
+                        buf.place_cursor(buf.get_end_iter())
+                    return False
+                GLib.idle_add(_trim)
+            else:
+                good = _good_text["v"]
+                def _revert():
+                    buf.set_text(good)
+                    buf.place_cursor(buf.get_end_iter())
+                    return False
+                GLib.idle_add(_revert)
+            _block_note.show()
+            Gdk.beep()
+            GLib.timeout_add_seconds(3, lambda: (_block_note.hide(), False)[1])
+        except Exception:
+            pass
+        return False
+
+    _tbuf.connect("insert-text", _typing_filter)
     status_lbl = Gtk.Label(label="Type above. Save keeps a .txt copy.")
     status_lbl.get_style_context().add_class("typehead")
     status_lbl.set_halign(Gtk.Align.CENTER)
@@ -1462,6 +1510,7 @@ def show_typing_test(parent=None):
     row.pack_start(save_btn, False, False, 0)
     row.pack_start(back_btn, False, False, 0)
     outer.pack_start(head, False, False, 0)
+    outer.pack_start(_block_note, False, False, 0)
     outer.pack_start(scroll, True, True, 0)
     outer.pack_start(status_lbl, False, False, 0)
     outer.pack_start(row, False, False, 0)
@@ -1669,6 +1718,20 @@ def build_tray_menu():
     lock_item = Gtk.MenuItem(label="\U0001F512  Focus Lockout 30 min (no sleep)")
     lock_item.connect("activate", lambda *_: do_pseudo_lockout(SUSPEND_MINUTES))
     menu.append(lock_item)
+    setup_item = Gtk.MenuItem(label="Telegram setup mode (15 min)")
+    if setup_mode_active():
+        setup_item.set_label("Telegram setup mode: ON \u2014 click to stop")
+
+    def _toggle_setup(*_):
+        if setup_mode_active():
+            disable_setup_mode()
+            setup_item.set_label("Telegram setup mode (15 min)")
+        else:
+            enable_setup_mode()
+            setup_item.set_label("Telegram setup mode: ON \u2014 click to stop")
+
+    setup_item.connect("activate", _toggle_setup)
+    menu.append(setup_item)
     menu.append(Gtk.SeparatorMenuItem())
     def _waste_text():
         try:
@@ -2290,8 +2353,229 @@ STUDY_RECENTS_STATE = os.path.join(LEDGER_DIR, "study-recents.json")
 STUDY_WEB_DATA_DIR = os.path.join(LEDGER_DIR, "study-web-data")
 STUDY_WEB_CACHE_DIR = os.path.join(LEDGER_DIR, "study-web-cache")
 _study_web_context = None
+
+# ---------- Input Filtering Service ----------
+# Blocks explicit adult text from ever being typed/sent in the study browser and
+# the typing test. Normalisation defeats leetspeak, spacing and zero-width tricks.
+INPUT_FILTER_NAME = "Focus Input Filter"
+STUDY_WEB_COOKIE_DB = os.path.join(STUDY_WEB_DATA_DIR, "cookies.sqlite")
+
+BLOCKED_INPUT_WORDS = [
+    # English / international
+    "porn", "porno", "pornography", "xxx", "xnxx", "xvideo", "xhamster", "pornhub",
+    "sex", "sexy", "sexting", "sexual", "nude", "nudes", "naked", "nsfw",
+    "horny", "aroused", "orgasm", "erotic", "hentai", "milf", "incest",
+    "boobs", "boob", "pussy", "dick", "cock", "penis", "cum", "semen",
+    "blowjob", "handjob", "anal", "anus", "masturbate", "masturbation",
+    "slut", "whore", "prostitute", "onlyfans", "camgirl", "rapist", "condom",
+    "viagra", "chudai", "chudachudi", "chodachudi",
+    # Bangla script
+    "\u09aa\u09b0\u09cd\u09a8", "\u09aa\u09b0\u09cd\u09a3",
+    "\u09b8\u09c7\u0995\u09cd\u09b8", "\u09b8\u09c7\u0995\u09cd\u09b8\u09bf",
+    "\u09a8\u0997\u09cd\u09a8", "\u0989\u09b2\u0999\u09cd\u0997",
+    "\u09b9\u09b0\u09cd\u09a8\u09bf",
+    "\u09ac\u09cc\u09a6\u09bf", "\u09ad\u09be\u09ac\u09bf",
+    "\u099a\u09c1\u09a6\u09be", "\u099a\u09cb\u09a6\u09be",
+    "\u099a\u09c1\u09a6\u09bf", "\u099a\u09cb\u09a6\u09a8",
+    "\u099a\u09c1\u09a6\u09be\u099a\u09c1\u09a6\u09bf",
+    "\u099a\u09cb\u09a6\u09be\u099a\u09c1\u09a6\u09bf",
+    # Bangla typed in Latin letters
+    "boudi", "bhabi", "chuda", "choda", "chudi", "chudir", "chudar",
+    "chodon", "chudacudi",
+]
+
+# Tokens too risky for compact (substring) matching -> whole-word match only.
+_BLOCK_WORD_ONLY = {"sex", "anal", "cum", "dick", "cock", "nude", "xxx"}
+_BLOCK_LEET = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s",
+                             "6": "g", "7": "t", "8": "b", "9": "g", "@": "a",
+                             "$": "s", "!": "i", "|": "i"})
+_ZERO_WIDTH = "\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2060\ufeff"
+
+
+def _input_norm(text):
+    s = str(text or "").lower()
+    s = "".join(ch for ch in s if ch not in _ZERO_WIDTH)
+    s = unicodedata.normalize("NFKD", s)
+    # strip Latin accents only (keep Bangla/Indic vowel signs)
+    s = "".join(ch for ch in s if not (unicodedata.combining(ch) and ord(ch) < 0x0900))
+    return s.translate(_BLOCK_LEET)
+
+
+def _compact(text):
+    s = re.sub(r"[^a-z0-9\u0980-\u09FF]+", "", _input_norm(text))
+    return re.sub(r"(.)\1+", r"\1", s)
+
+
+_BLOCK_NORM = [(w, re.sub(r"[^a-z0-9\u0980-\u09FF]+", " ",
+                          _input_norm(w)).strip()) for w in BLOCKED_INPUT_WORDS]
+_BLOCK_COMPACT = [(w, _compact(w)) for w in BLOCKED_INPUT_WORDS]
+
+
+def _explicit_hit(text):
+    """Return the matched explicit word, or None (normalisation-proof)."""
+    if not text:
+        return None
+    spaced = " " + re.sub(r"[^a-z0-9\u0980-\u09FF]+", " ",
+                          _input_norm(text)).strip() + " "
+    for word, norm in _BLOCK_NORM:
+        if norm and (" " + norm + " ") in spaced:
+            return word
+    comp = _compact(text)
+    for word, comp_word in _BLOCK_COMPACT:
+        if not comp_word or len(comp_word) < 4 or word in _BLOCK_WORD_ONLY:
+            continue
+        if comp_word in comp:
+            return word
+    return None
+
+def _build_input_filter_js():
+    import json as _json
+    words = _json.dumps(BLOCKED_INPUT_WORDS)
+    return r"""
+(function () {
+  if (window.__focusInputFilter) { return; }
+  window.__focusInputFilter = true;
+  var RAW = __WORDS__;
+  var ZERO = /[\u200b-\u200f\u202a-\u202e\u2060\ufeff]/g;
+  var LEET = {'0':'o','1':'i','3':'e','4':'a','5':'s','6':'g','7':'t','8':'b','9':'g',
+              '@':'a','$':'s','!':'i','|':'i'};
+  function norm(s) {
+    s = String(s || '').toLowerCase().replace(ZERO, '');
+    try { s = s.normalize('NFKD').replace(/[\u0300-\u036f]/g, ''); } catch (e) {}
+    return s.replace(/[013456789@$!|]/g, function (c) { return LEET[c] || c; });
+  }
+  function spaced(s) {
+    return ' ' + norm(s).replace(/[^a-z0-9\u0980-\u09FF]+/g, ' ').trim() + ' ';
+  }
+  function sq(s) {
+    return norm(s).replace(/[^a-z0-9\u0980-\u09FF]+/g, '').replace(/(.)\1+/g, '$1');
+  }
+  var BAN = RAW.map(norm);
+  var BANC = RAW.map(sq);
+  var WORD_ONLY = {'sex':1,'anal':1,'cum':1,'dick':1,'cock':1,'nude':1,'xxx':1};
+  function hit(text) {
+    if (!text) { return null; }
+    var t = spaced(text);
+    var i;
+    for (i = 0; i < BAN.length; i++) {
+      var w = BAN[i].replace(/[^a-z0-9\u0980-\u09FF]+/g, ' ').trim();
+      if (w && t.indexOf(' ' + w + ' ') !== -1) { return RAW[i]; }
+    }
+    var c = sq(text);
+    for (i = 0; i < BANC.length; i++) {
+      var cw = BANC[i];
+      if (!cw || cw.length < 4 || WORD_ONLY[RAW[i]]) { continue; }
+      if (c.indexOf(cw) !== -1) { return RAW[i]; }
+    }
+    return null;
+  }
+  window.__focusFilterHit = hit;
+
+  var warned = 0;
+  function toast(msg) {
+    var now = Date.now();
+    if (now - warned < 1000) { return; }
+    warned = now;
+    var d = document.getElementById('__focus_filter_toast');
+    if (!d) {
+      d = document.createElement('div');
+      d.id = '__focus_filter_toast';
+      d.style.cssText = 'position:fixed;top:14px;left:50%;transform:translateX(-50%);' +
+        'z-index:2147483647;background:#7f1d1d;color:#fff;font:bold 14px sans-serif;' +
+        'padding:10px 18px;border-radius:10px;box-shadow:0 6px 20px rgba(0,0,0,.55);' +
+        'pointer-events:none;max-width:80vw;';
+      (document.body || document.documentElement).appendChild(d);
+    }
+    d.textContent = '\u26d4 Focus Input Filter: ' + msg;
+    d.style.display = 'block';
+    clearTimeout(d.__t);
+    d.__t = setTimeout(function () { d.style.display = 'none'; }, 2600);
+  }
+  function editable(el) {
+    return !!el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' || el.isContentEditable);
+  }
+  function val(el) { return el.isContentEditable ? el.innerText : el.value; }
+  var lastGood = new WeakMap();
+
+  document.addEventListener('focusin', function (e) {
+    var el = e.target;
+    if (editable(el)) { lastGood.set(el, el.isContentEditable ? el.innerHTML : el.value); }
+  }, true);
+
+  document.addEventListener('input', function (e) {
+    var el = e.target;
+    if (!editable(el)) { return; }
+    var bad = hit(val(el));
+    if (bad) {
+      var good = lastGood.get(el);
+      if (good !== undefined) {
+        if (el.isContentEditable) { el.innerHTML = good; } else { el.value = good; }
+      }
+      toast('explicit content blocked (' + bad + ')');
+      return;
+    }
+    lastGood.set(el, el.isContentEditable ? el.innerHTML : el.value);
+  }, true);
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter' || !editable(e.target)) { return; }
+    if (hit(val(e.target))) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      toast('message not allowed');
+    }
+  }, true);
+
+  document.addEventListener('paste', function (e) {
+    var el = e.target;
+    if (!editable(el)) { return; }
+    var cd = e.clipboardData || window.clipboardData;
+    var txt = cd ? (cd.getData('text') || '') : '';
+    if (hit(txt)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      toast('paste blocked');
+    }
+  }, true);
+
+  document.addEventListener('submit', function (e) {
+    var f = e.target;
+    if (!f || !f.querySelectorAll) { return; }
+    var bad = null;
+    f.querySelectorAll('input,textarea').forEach(function (el) {
+      if (!bad) { bad = hit(el.value); }
+    });
+    if (bad) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      toast('send blocked');
+    }
+  }, true);
+
+  document.addEventListener('click', function (e) {
+    var el = e.target;
+    var box = editable(el) ? el : (editable(document.activeElement) ? document.activeElement : null);
+    if (!box && el && el.closest) {
+      var root = el.closest('form,[role="dialog"]');
+      if (root) { box = root.querySelector('input,textarea,[contenteditable="true"]'); }
+    }
+    if (box && hit(val(box))) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      toast('send blocked');
+    }
+  }, true);
+})();
+""".replace("__WORDS__", words)
+
+
+INPUT_FILTER_JS = _build_input_filter_js()
+_study_ucm = None
+
 UPLOAD_PASSWORD_PATH = os.path.join(LEDGER_DIR, "phone-upload-password")
 UPLOAD_PUBLIC_URL = "https://upload21.medisparkbd.com/"
+# Public Telegram group: anyone can send PDFs here; Telegram Web handles download.
+PHONE_PDF_UPLOAD_URL = "https://t.me/pdf258upload"
 UPLOAD_SERVER_HOST = "127.0.0.1"
 UPLOAD_SERVER_PORT = 8765
 UPLOAD_MAX_BYTES = 90 * 1024 * 1024
@@ -2314,7 +2598,7 @@ _STUDY_DEFAULTS = {
         {"title": "iHadis", "url": "https://ihadis.com/en"},
         {"title": "LiveMCQ", "url": "https://web.livemcq.com/"},
         {"title": "Translate", "url": "https://translate.google.com"},
-        {"title": "Phone PDF Upload", "url": UPLOAD_PUBLIC_URL},
+        {"title": "Phone PDF Upload", "url": PHONE_PDF_UPLOAD_URL},
     ],
     "allow_hosts": [
         "boimate.com", "www.boimate.com", "*.boimate.com",
@@ -2334,6 +2618,7 @@ _STUDY_DEFAULTS = {
         "ihadis.com", "www.ihadis.com",
         "livemcq.com", "www.livemcq.com", "web.livemcq.com", "*.livemcq.com",
         "127.0.0.1", "localhost", "upload21.medisparkbd.com",
+        "t.me", "telegram.org", "www.telegram.org",
         "cdn.jsdelivr.net", "cdnjs.cloudflare.com", "unpkg.com",
         "*.cloudfront.net", "*.amazonaws.com", "*.b-cdn.net",
         "*.digitaloceanspaces.com", "*.supabase.co", "*.firebaseapp.com",
@@ -2365,8 +2650,8 @@ def _study_config():
                     changed = True
                     continue
                 if title == "phone pdf upload":
-                    if uri != UPLOAD_PUBLIC_URL:
-                        item["url"] = UPLOAD_PUBLIC_URL
+                    if uri != PHONE_PDF_UPLOAD_URL:
+                        item["url"] = PHONE_PDF_UPLOAD_URL
                         changed = True
                 kept_links.append(item)
             if len(kept_links) != len(cfg["links"]):
@@ -2376,7 +2661,10 @@ def _study_config():
                 host for host in old_hosts
                 if "whatsapp.com" not in str(host).lower()
                 and "whatsapp.net" not in str(host).lower()
-                and "trycloudflare.com" not in str(host).lower()]
+                and "trycloudflare.com" not in str(host).lower()
+                and str(host).lower() not in (
+                    "*.t.me", "*.telegram.org", "cdn-telegram.org",
+                    "*.cdn-telegram.org", "telegram.me", "*.telegram.me")]
             if cfg["allow_hosts"] != old_hosts:
                 changed = True
             for link in _STUDY_DEFAULTS["links"]:
@@ -2644,6 +2932,78 @@ def _host_allowed(host, patterns):
     return False
 
 
+# Telegram stays limited to one public group page: no Telegram Web, no other chats.
+TELEGRAM_GROUP_HOSTS = ("t.me", "www.t.me")
+TELEGRAM_GROUP_PATH = "/pdf258upload"
+
+# Temporary "setup mode": lets the user log in to Telegram Web (needed once for
+# downloads), then auto-expires back to the strict single-group rule.
+SETUP_MODE_STATE = os.path.join(LEDGER_DIR, "setup-mode.state")
+SETUP_MODE_MINUTES = 15
+TELEGRAM_SETUP_SUFFIXES = (
+    "t.me", "telegram.org", "telegram.me", "telegram.dog",
+    "cdn-telegram.org", "telesco.pe")
+
+
+def setup_mode_until():
+    try:
+        with open(SETUP_MODE_STATE) as f:
+            return float(f.read().strip())
+    except Exception:
+        return 0
+
+
+def setup_mode_active():
+    return setup_mode_until() > time.time()
+
+
+def _setup_host_allowed(host):
+    if not setup_mode_active():
+        return False
+    return any(host == s or host.endswith("." + s) for s in TELEGRAM_SETUP_SUFFIXES)
+
+
+def enable_setup_mode(minutes=SETUP_MODE_MINUTES):
+    until = time.time() + minutes * 60
+    try:
+        os.makedirs(LEDGER_DIR, exist_ok=True)
+        with open(SETUP_MODE_STATE, "w") as f:
+            f.write(str(until))
+    except Exception as e:
+        print(f"setup mode save error: {e}", flush=True)
+        return 0
+    at = time.strftime("%H:%M", time.localtime(until))
+    notify(f"Telegram setup mode ON for {minutes} min (until {at}).")
+    print(f"Telegram setup mode ON for {minutes} min, auto-off at {at}.", flush=True)
+    return until
+
+
+def disable_setup_mode():
+    try:
+        if os.path.exists(SETUP_MODE_STATE):
+            os.remove(SETUP_MODE_STATE)
+    except Exception:
+        pass
+    print("Telegram setup mode OFF — strict single-group rule restored.", flush=True)
+
+
+def _page_allowed(uri, patterns):
+    """Host allowlist plus path lock for Telegram (only the PDF upload group)."""
+    try:
+        parsed = urlparse(uri or "")
+        host = (parsed.hostname or "").lower()
+        if _setup_host_allowed(host):
+            return True
+        if not _host_allowed(host, patterns):
+            return False
+        if host in TELEGRAM_GROUP_HOSTS:
+            path = (parsed.path or "/").rstrip("/").lower()
+            return path == TELEGRAM_GROUP_PATH or path.startswith(TELEGRAM_GROUP_PATH + "/")
+        return True
+    except Exception:
+        return False
+
+
 def _scan_media(roots, limit=6000):
     """All PDFs/images under roots (whole laptop). Newest first."""
     found = []
@@ -2809,7 +3169,7 @@ def _render_pdf_page(path, page, zoom=1.0, cancel=None):
 def show_study_window(parent=None, end_ts=None):
     """Study container inside lockout: whitelisted links, PDF/image library,
     remote PDF upload, media intake. Suspension keeps running."""
-    global _study_win, _study_parent, _study_web_context
+    global _study_win, _study_parent, _study_web_context, _study_ucm
 
     if WebKit2 is None:
         print("WebKit2 unavailable — study view disabled", flush=True)
@@ -2984,17 +3344,46 @@ def show_study_window(parent=None, end_ts=None):
                 base_cache_directory=STUDY_WEB_CACHE_DIR)
             _study_web_context = WebKit2.WebContext.new_with_website_data_manager(
                 data_manager)
-            _study_web_context.get_cookie_manager().set_accept_policy(
-                WebKit2.CookieAcceptPolicy.ALWAYS)
+            _cm = _study_web_context.get_cookie_manager()
+            _cm.set_accept_policy(WebKit2.CookieAcceptPolicy.ALWAYS)
+            try:
+                _cm.set_persistent_storage(STUDY_WEB_COOKIE_DB,
+                                           WebKit2.CookiePersistentStorage.SQLITE)
+            except Exception as _e:
+                print(f"cookie storage unavailable: {_e}", flush=True)
+            try:
+                data_manager.set_itp_enabled(False)  # keep Google/WhatsApp logins
+            except Exception:
+                pass
+            try:
+                _study_web_context.set_cache_model(WebKit2.CacheModel.WEB_BROWSER)
+            except Exception:
+                pass
         except Exception as e:
             print(f"persistent study browser profile unavailable: {e}", flush=True)
             try:
                 _study_web_context = WebKit2.WebContext.get_default()
             except Exception:
                 _study_web_context = None
+    if _study_ucm is None:
+        try:
+            _study_ucm = WebKit2.UserContentManager()
+            _study_ucm.add_script(WebKit2.UserScript.new(
+                INPUT_FILTER_JS,
+                WebKit2.UserContentInjectedFrames.ALL_FRAMES,
+                WebKit2.UserScriptInjectionTime.START,
+                None, None))
+        except Exception as _e:
+            print(f"input filter script unavailable: {_e}", flush=True)
+            _study_ucm = None
     try:
-        web = (WebKit2.WebView.new_with_context(_study_web_context)
-               if _study_web_context is not None else WebKit2.WebView())
+        if _study_web_context is not None and _study_ucm is not None:
+            web = WebKit2.WebView(web_context=_study_web_context,
+                                  user_content_manager=_study_ucm)
+        elif _study_web_context is not None:
+            web = WebKit2.WebView.new_with_context(_study_web_context)
+        else:
+            web = WebKit2.WebView()
     except Exception:
         web = WebKit2.WebView()
     try:
@@ -3102,7 +3491,7 @@ def show_study_window(parent=None, end_ts=None):
             uri = "https://" + uri
         parsed = urlparse(uri)
         host = (parsed.hostname or "").lower()
-        if parsed.scheme not in ("http", "https") or not _host_allowed(host, allow):
+        if parsed.scheme not in ("http", "https") or not _page_allowed(uri, allow):
             _toast(f"Blocked: {host or uri} — not in study list")
             return
         view.load_uri(uri)
@@ -3194,7 +3583,7 @@ def show_study_window(parent=None, end_ts=None):
                     if parsed.scheme == "file" and uri == local_pdf_uri["uri"]:
                         return False
                     if (parsed.scheme in ("http", "https")
-                            and _host_allowed(parsed.hostname, allow)):
+                            and _page_allowed(uri, allow)):
                         return False
                     decision.ignore()
                     _toast(f"Blocked: {parsed.hostname or uri} — not in study list")
@@ -3205,7 +3594,7 @@ def show_study_window(parent=None, end_ts=None):
                     parsed = urlparse(uri)
                     decision.ignore()
                     if (parsed.scheme in ("http", "https")
-                            and _host_allowed(parsed.hostname, allow)):
+                            and _page_allowed(uri, allow)):
                         GLib.idle_add(_split_load_uri, view, address, uri)
                     else:
                         _toast("Popup blocked: site is not in the study list")
@@ -3215,7 +3604,7 @@ def show_study_window(parent=None, end_ts=None):
                     mime = (response.get_mime_type() or "").lower().split(";", 1)[0]
                     uri = response.get_uri() or ""
                     parsed = urlparse(uri)
-                    if (_host_allowed(parsed.hostname, allow)
+                    if (_page_allowed(uri, allow)
                             and (mime == "application/pdf"
                                  or parsed.path.lower().endswith(".pdf"))):
                         decision.download()
@@ -3348,7 +3737,7 @@ def show_study_window(parent=None, end_ts=None):
     def _record_recent_website(uri, title):
         try:
             parsed = urlparse(uri or "")
-            if parsed.scheme not in ("http", "https") or not _host_allowed(parsed.hostname, allow):
+            if parsed.scheme not in ("http", "https") or not _page_allowed(uri, allow):
                 return
             label = title or parsed.hostname
             _record_recent("web", uri, label)
@@ -3399,7 +3788,7 @@ def show_study_window(parent=None, end_ts=None):
                 mime = (response.get_mime_type() or "").lower().split(";", 1)[0].strip()
                 host = (urlparse(uri).hostname or "").lower()
                 path = urlparse(uri).path.lower()
-                if (_host_allowed(host, allow)
+                if (_page_allowed(uri, allow)
                         and (mime == "application/pdf" or path.endswith(".pdf"))):
                     decision.download()
                     return True
@@ -3407,13 +3796,8 @@ def show_study_window(parent=None, end_ts=None):
                 uri = decision.get_navigation_action().get_request().get_uri()
                 if uri and uri.startswith(("file://", "blob:", "data:", "about:")):
                     return False  # in-page PDF/blob from an already-allowed page
-                host = ""
-                try:
-                    host = (decision.get_navigation_action().get_request().get_uri()
-                            .split("://", 1)[1].split("/", 1)[0])
-                except Exception:
-                    host = ""
-                if _host_allowed(host, allow):
+                host = (urlparse(uri).hostname or "").lower() if uri else ""
+                if uri and _page_allowed(uri, allow):
                     if uri.lower().split("?")[0].endswith(".pdf"):
                         # fetch into inbox and open in the built-in reader
                         decision.ignore()
@@ -3430,7 +3814,7 @@ def show_study_window(parent=None, end_ts=None):
                 uri = decision.get_navigation_action().get_request().get_uri()
                 host = (urlparse(uri).hostname or "").lower() if uri else ""
                 decision.ignore()
-                if uri and _host_allowed(host, allow):
+                if uri and _page_allowed(uri, allow):
                     # BoiMate and file hosts sometimes target a new window. Reuse
                     # the current view so its normal download policy can handle it.
                     GLib.idle_add(web.load_uri, uri)
@@ -4333,8 +4717,7 @@ def show_study_window(parent=None, end_ts=None):
     actual_size_btn.connect("clicked", _actual_size)
 
     def _load_link(url):
-        if url.startswith("file://") or _host_allowed(
-                url.split("://", 1)[1].split("/", 1)[0], allow):
+        if url.startswith("file://") or _page_allowed(url, allow):
             stack.set_visible_child_name("web")
             web.load_uri(url)
         else:
@@ -4638,7 +5021,7 @@ def show_study_window(parent=None, end_ts=None):
                 _toast("That document is no longer available at its saved location")
         elif item.get("kind") == "web":
             url = item.get("url", "")
-            if url and _host_allowed(urlparse(url).hostname, allow):
+            if url and _page_allowed(url, allow):
                 stack.set_visible_child_name("web")
                 web.load_uri(url)
             else:
@@ -5013,6 +5396,17 @@ if __name__ == "__main__":
     import sys
     if "--show-upload-password" in sys.argv:
         print(_ensure_phone_upload_password(), flush=True)
+    elif "--setup-telegram" in sys.argv:
+        _minutes = SETUP_MODE_MINUTES
+        _i = sys.argv.index("--setup-telegram")
+        if len(sys.argv) > _i + 1:
+            try:
+                _minutes = max(1, min(120, int(sys.argv[_i + 1])))
+            except ValueError:
+                pass
+        enable_setup_mode(_minutes)
+    elif "--setup-telegram-off" in sys.argv:
+        disable_setup_mode()
     elif "--lockout" in sys.argv:
         # One-shot pseudo lockout: locks now, stays on, no sleep.
         _mins = SUSPEND_MINUTES
