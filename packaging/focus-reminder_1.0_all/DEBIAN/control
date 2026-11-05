@@ -1,10 +1,10 @@
 Package: focus-reminder
-Version: 1.0
+Version: 1.0.8
 Section: utils
 Priority: optional
 Architecture: all
 Depends: python3, gir1.2-gtk-3.0
-Recommends: gir1.2-ayatanaappindicator3-0.1, fonts-inter
+Recommends: gir1.2-ayatanaappindicator3-0.1, fonts-inter, gvfs-backends
 Maintainer: Focus Reminder <local>
 Description: Whole-device focus reminder with goals, waste tracking and suspend lockout
  Fullscreen 10-minute focus reminders, goal manager with dates, typing
