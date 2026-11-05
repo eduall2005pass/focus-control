@@ -372,6 +372,24 @@ def lock_session():
 
 suspend_until = 0
 SUSPEND_STATE = os.path.join(LEDGER_DIR, "suspend.state")
+NEXT_ALERT_STATE = os.path.join(LEDGER_DIR, "next-alert.state")
+
+
+def _load_next_alert():
+    try:
+        with open(NEXT_ALERT_STATE) as f:
+            return float(f.read().strip())
+    except Exception:
+        return 0
+
+
+def _save_next_alert(ts):
+    try:
+        os.makedirs(LEDGER_DIR, exist_ok=True)
+        with open(NEXT_ALERT_STATE, "w") as f:
+            f.write(str(float(ts)))
+    except Exception as e:
+        print(f"next alert save error: {e}", flush=True)
 SUSPEND_CHECKPOINT_STATE = os.path.join(LEDGER_DIR, "suspend-checkpoint.json")
 LOCKOUT_SCHEDULE_STATE = os.path.join(LEDGER_DIR, "lockout-schedule.json")
 
@@ -521,6 +539,9 @@ def _begin_lockout_schedule(minutes):
 
 def enforce_suspension_until(end_ts):
     """Non-skippable: re-enforce after reboot/poweroff until countdown ends."""
+    # Lock immediately, before the countdown window is up, so there is no
+    # usable-desktop gap right after power-on.
+    lock_session()
     while time.time() < _load_suspend_state():
         if not _has_display():
             time.sleep(10)
@@ -981,7 +1002,15 @@ _LOCKDOWN_KEYS = [
     ("org.gnome.mutter", "overlay-key", "''"),                       # Super -> overview
     ("org.gnome.desktop.interface", "enable-hot-corners", "false"),  # hot corner
     ("org.gnome.desktop.wm.keybindings", "switch-applications", "@as []"),  # Super+Tab / Alt+Tab
+    ("org.gnome.desktop.wm.keybindings", "switch-applications-backward", "@as []"),
     ("org.gnome.desktop.wm.keybindings", "switch-windows", "@as []"),        # Alt+Tab (windows)
+    ("org.gnome.desktop.wm.keybindings", "switch-windows-backward", "@as []"),
+    ("org.gnome.desktop.wm.keybindings", "panel-run-dialog", "@as []"),      # Alt+F2
+    ("org.gnome.desktop.wm.keybindings", "unmaximize", "@as []"),            # Super+Down shrink
+    ("org.gnome.desktop.wm.keybindings", "begin-move", "@as []"),            # Alt+F7 move
+    ("org.gnome.desktop.wm.keybindings", "begin-resize", "@as []"),          # Alt+F8 resize
+    ("org.gnome.shell.keybindings", "toggle-overview", "@as []"),            # Super+S
+    ("org.gnome.shell.keybindings", "toggle-application-view", "@as []"),    # Super+A
     ("org.gnome.desktop.notifications", "show-banners", "false"),  # banners can launch apps
 ]
 
@@ -1149,22 +1178,28 @@ def _swallow_shell_keys(win):
 
 
 def _arm_focus_guard(win, is_lockout=False):
-    """Re-raise window if anything steals focus. Returns timeout id for cleanup."""
-    def _on_focus_out(*_):
+    """Re-raise + re-fullscreen the window if anything steals focus or shrinks it."""
+    def _reassert():
         try:
-            if win.get_visible() and (not is_lockout or _typing_win is None):
-                GLib.idle_add(win.present)
+            if not win.get_visible():
+                return
+            if is_lockout and _typing_win is not None:
+                return
+            gdkwin = win.get_window()
+            if (gdkwin is not None
+                    and not (gdkwin.get_state() & Gdk.WindowState.FULLSCREEN)):
+                win.fullscreen()
+            win.present()
         except Exception:
             pass
+
+    def _on_focus_out(*_):
+        GLib.idle_add(_reassert)
         return False
     win.connect("focus-out-event", _on_focus_out)
 
     def _guard():
-        try:
-            if win.get_visible() and (not is_lockout or _typing_win is None):
-                win.present()
-        except Exception:
-            pass
+        _reassert()
         return True
     return GLib.timeout_add(500, _guard)
 
@@ -2380,12 +2415,36 @@ BLOCKED_INPUT_WORDS = [
     "\u099a\u09c1\u09a6\u09be\u099a\u09c1\u09a6\u09bf",
     "\u099a\u09cb\u09a6\u09be\u099a\u09c1\u09a6\u09bf",
     # Bangla typed in Latin letters
-    "boudi", "bhabi", "chuda", "choda", "chudi", "chudir", "chudar",
-    "chodon", "chudacudi",
+    "boudi", "bhabi", "chuda", "choda", "chudi", "chudir", "chudar", "chodar",
+    "chodon", "chudacudi", "chudacudir", "chudachudir",
+    # Story / slang terms (single + pair words)
+    "choti", "panu", "jouno", "jounota", "sexstory", "sexstories", "sexvideo",
+    "sexchat", "sex golpo", "choti golpo", "panu golpo", "jouno golpo",
+    "chudacudir golpo", "chudir golpo", "chodar golpo", "choda chudi golpo",
+    "bangla choti", "bangla panu", "desi sex", "desi porn", "desi choti",
+    "kamasutra", "kamsutra", "erotica", "smut", "tits", "titties", "cumshot",
+    "gangbang", "orgy", "threesome", "dildo", "vibrator", "fetish", "bondage",
+    "stripper", "stripclub", "brothel", "magi", "khanki", "randi", "mms",
+    "mms video", "blue film", "adult video", "adult story", "sex story",
+    # More Bangla script
+    "\u099a\u099f\u09bf", "\u09aa\u09be\u09a8\u09c1",
+    "\u09af\u09cc\u09a8", "\u09af\u09cc\u09a8\u09a4\u09be",
+    "\u09af\u09cc\u09a8\u0997\u09b2\u09cd\u09aa",
+    "\u09aa\u09b0\u09cd\u09a8\u09cb\u0997\u09cd\u09b0\u09be\u09ab\u09bf",
+    "\u099a\u099f\u09bf \u0997\u09b2\u09cd\u09aa",
+    "\u09aa\u09be\u09a8\u09c1 \u0997\u09b2\u09cd\u09aa",
+    "\u09af\u09cc\u09a8 \u0997\u09b2\u09cd\u09aa",
+    "\u0997\u09c1\u09a6", "\u09ad\u09cb\u09a6\u09be",
+    "\u09af\u09cb\u09a8\u09bf", "\u09b8\u09cd\u09a4\u09a8",
+    "\u09ac\u09c0\u09b0\u09cd\u09af", "\u09b9\u09b8\u09cd\u09a4\u09ae\u09c8\u09a5\u09c1\u09a8",
+    "\u0995\u09be\u09ae\u09c1\u0995", "\u0985\u09b6\u09cd\u09b2\u09c0\u09b2",
+    "\u0996\u09be\u09a8\u0995\u09bf", "\u09ae\u09be\u0997\u09bf",
+    "\u09b0\u09be\u09a8\u09cd\u09a1\u09bf",
 ]
 
 # Tokens too risky for compact (substring) matching -> whole-word match only.
-_BLOCK_WORD_ONLY = {"sex", "anal", "cum", "dick", "cock", "nude", "xxx"}
+_BLOCK_WORD_ONLY = {"sex", "anal", "cum", "dick", "cock", "nude", "xxx",
+                    "magi", "randi", "bhabi", "mms"}
 _BLOCK_LEET = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s",
                              "6": "g", "7": "t", "8": "b", "9": "g", "@": "a",
                              "$": "s", "!": "i", "|": "i"})
@@ -2452,7 +2511,8 @@ def _build_input_filter_js():
   }
   var BAN = RAW.map(norm);
   var BANC = RAW.map(sq);
-  var WORD_ONLY = {'sex':1,'anal':1,'cum':1,'dick':1,'cock':1,'nude':1,'xxx':1};
+  var WORD_ONLY = {'sex':1,'anal':1,'cum':1,'dick':1,'cock':1,'nude':1,'xxx':1,
+                   'magi':1,'randi':1,'bhabi':1,'mms':1};
   function hit(text) {
     if (!text) { return null; }
     var t = spaced(text);
@@ -5327,12 +5387,20 @@ def main():
     else:
         _clear_suspend_state()
         _gnome_heal()  # no lockout active: undo any stale shell lockdown
+    next_alert = _load_next_alert()
+    if next_alert <= 0:
+        next_alert = time.time() + FOCUS_MINUTES * 60
+        _save_next_alert(next_alert)
+    elif next_alert <= time.time():
+        print("Reminder overdue from before power-off — showing immediately.", flush=True)
     while True:
         while time.time() < suspend_until:
             time.sleep(20)
-        end = time.time() + FOCUS_MINUTES * 60
-        while time.time() < end and not tr.limit_pending:
+        while time.time() < next_alert and not tr.limit_pending:
             time.sleep(20)
+        # Persist the next cycle BEFORE showing, so a reboot cannot buy free time.
+        next_alert = time.time() + FOCUS_MINUTES * 60
+        _save_next_alert(next_alert)
         if tr.limit_pending:
             tr.limit_pending = False
             notify(f"Daily waste limit ({DAILY_WASTE_LIMIT_MIN}m) exceeded!")
