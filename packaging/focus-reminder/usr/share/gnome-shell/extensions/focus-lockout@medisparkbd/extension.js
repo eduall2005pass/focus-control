@@ -37,6 +37,7 @@ export default class FocusLockoutExtension extends Extension {
         this._studyLaunching = false;
         this._lockdownActive = false;
         this._overviewBlocked = false;
+        this._notificationSettings = null;
         this._windowCreatedId = global.display.connect('window-created', (_display, metaWindow) => {
             try {
                 const title = metaWindow.get_title();
@@ -183,6 +184,25 @@ export default class FocusLockoutExtension extends Extension {
                 s.reset('show-favorites');
                 s.reset('show-show-apps-button');
                 s.reset('hot-keys');
+            }
+        } catch (_) {}
+
+        // 4. Prevent notification banners from appearing over the lockout.
+        try {
+            const notifications = new Gio.Settings({
+                schema_id: 'org.gnome.desktop.notifications',
+            });
+            if (active) {
+                if (!this._notificationSettings) {
+                    this._notificationSettings = {
+                        showBanners: notifications.get_boolean('show-banners'),
+                    };
+                }
+                notifications.set_boolean('show-banners', false);
+            } else if (this._notificationSettings) {
+                notifications.set_boolean(
+                    'show-banners', this._notificationSettings.showBanners);
+                this._notificationSettings = null;
             }
         } catch (_) {}
     }

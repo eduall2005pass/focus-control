@@ -1,4 +1,4 @@
-# Focus Control (v1.0) — Whole-Device Focus Protection for Ubuntu
+# Focus Control (v2.0.36) — Whole-Device Focus Protection for Ubuntu
 
 Fullscreen focus reminders, goal manager, typing practice, waste-time
 ledger, emergency suspend (minutes / hours / days) with reboot-proof
@@ -30,7 +30,7 @@ lockout, and a persistent system tray. Runs automatically for every user.
 ## Install
 
 ```bash
-sudo dpkg -i packaging/focus-reminder_2.0.11_all.deb
+sudo dpkg -i packaging/focus-reminder_2.0.36_all.deb
 ```
 
 Alternative (script, same contents): `sudo bash install-systemwide.sh`
@@ -93,6 +93,12 @@ Submit path (Flathub requires a PR from you):
 - Suspend confirmations require the system (sudo) password; it is never stored.
 - Power Off needs confirmation; shutdown itself may ask for auth (system policy).
 - Uninstall is blocked by design (prerm + hold + immutable files).
+- On GNOME Shell, the lockout extension provides the compositor-level overlay
+  used on both X11 and Wayland. It blocks overview/app switching, hides the
+  dock, suppresses notification banners, and keeps the lockout surface below
+  the mapped Study window during transitions. Other Wayland compositors do not
+  expose an equivalent privileged overlay API, so ordinary application windows
+  cannot guarantee zero desktop exposure there.
 
 ## Optional OS / boot security policy
 
