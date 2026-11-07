@@ -8,3 +8,6 @@ ExecStart=/usr/bin/python3 /opt/focus-reminder/focus-reminder.py --tray
 Restart=always
 RestartSec=5
 TimeoutStopSec=10
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+DISABLED_FLAG="/var/tmp/focus-apps-disabled.state"
+
+while true; do
+    if /usr/local/bin/focus-lockout-check; then
+        # প্রথমবার Lockout শুরু হলে Snap ও সার্ভিস ডিসেবল করা
+        if [ ! -f "$DISABLED_FLAG" ]; then
+            touch "$DISABLED_FLAG"
+            /usr/bin/snap disable telegram-desktop >/dev/null 2>&1 || true
+            /usr/bin/snap disable snap-store >/dev/null 2>&1 || true
+            systemctl stop waydroid-container.service >/dev/null 2>&1 || true
+            systemctl mask waydroid-container.service >/dev/null 2>&1 || true
+        fi
+
+        # Telegram বন্ধ করা
+        pkill -9 -f "telegram-desktop" 2>/dev/null || true
+        pkill -9 -x "Telegram" 2>/dev/null || true
+        /usr/bin/flatpak kill org.telegram.desktop 2>/dev/null || true
+
+        # App Center ও ইনস্টলার বন্ধ করা
+        pkill -9 -x "snap-store" 2>/dev/null || true
+        pkill -9 -x "gnome-software" 2>/dev/null || true
+        pkill -9 -f "gdebi-gtk" 2>/dev/null || true
+
+        # Ubuntu Terminals বন্ধ করা (Ptyxis, GNOME Terminal ইত্যাদি)
+        pkill -9 -f "ptyxis" 2>/dev/null || true
+        pkill -9 -x "ptyxis" 2>/dev/null || true
+        pkill -9 -f "ptyxis-agent" 2>/dev/null || true
+        pkill -9 -f "gnome-terminal" 2>/dev/null || true
+        pkill -9 -x "gnome-terminal-server" 2>/dev/null || true
+        pkill -9 -x "kgx" 2>/dev/null || true
+        pkill -9 -x "xterm" 2>/dev/null || true
+        pkill -9 -x "alacritty" 2>/dev/null || true
+        pkill -9 -x "kitty" 2>/dev/null || true
+
+        # Kilo Coding Agent ও AI CLI বন্ধ করা
+        pkill -9 -f "kilo" 2>/dev/null || true
+        pkill -9 -f "@kilocode" 2>/dev/null || true
+        pkill -9 -f "/.kilo" 2>/dev/null || true
+        pkill -9 -f "opencode" 2>/dev/null || true
+        pkill -9 -f "claude" 2>/dev/null || true
+        pkill -9 -f "aider" 2>/dev/null || true
+
+        # Waydroid বন্ধ করা
+        if pgrep -f "waydroid" >/dev/null 2>&1; then
+            /usr/bin/waydroid session stop 2>/dev/null || true
+            systemctl stop waydroid-container.service 2>/dev/null || true
+            pkill -9 -f "waydroid" 2>/dev/null || true
+        fi
+
+        # নতুন যেকোনো অ্যাপ ইনস্টলেশন প্রসেস বন্ধ করা
+        pkill -9 -f "(apt|apt-get|snap|flatpak|adb|waydroid)[[:space:]]+.*install" 2>/dev/null || true
+        pkill -9 -f "dpkg[[:space:]]+(-i|--install|--unpack)" 2>/dev/null || true
+    else
+        # Lockout শেষ হলে অ্যাপগুলো পুনরায় সচল (Enable) করা
+        if [ -f "$DISABLED_FLAG" ]; then
+            rm -f "$DISABLED_FLAG"
+            /usr/bin/snap enable telegram-desktop >/dev/null 2>&1 || true
+            /usr/bin/snap enable snap-store >/dev/null 2>&1 || true
+            systemctl unmask waydroid-container.service >/dev/null 2>&1 || true
+            systemctl start waydroid-container.service >/dev/null 2>&1 || true
+        fi
+    fi
+    sleep 1
+done

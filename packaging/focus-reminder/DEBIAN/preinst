@@ -7,6 +7,8 @@ for path in \
     /etc/systemd/system/focus-boot-enforce.service \
     /usr/local/bin/focus-boot-enforce.sh \
     /usr/local/bin/focus-pam-lock.sh \
+    /usr/local/bin/focus-lockout-check \
+    /usr/local/bin/focus-app-enforcer \
     /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service \
     /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service \
     /usr/share/applications/focus-reminder.desktop; do

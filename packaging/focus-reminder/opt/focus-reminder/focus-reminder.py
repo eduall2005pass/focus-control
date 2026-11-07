@@ -49,7 +49,7 @@ try:
 except Exception:  # WebKit not available -> study view disabled, app still runs
     WebKit2 = None
 
-FOCUS_VERSION = "2.0.26"
+FOCUS_VERSION = "2.0.27"
 
 FOCUS_MINUTES = 10
 SUSPEND_MINUTES = 30
@@ -378,9 +378,44 @@ PAM_LOCK_FLAG = os.path.join(LEDGER_DIR, "pam-lock-requested")
 SHELL_LOCKOUT_FLAG = os.path.join(LEDGER_DIR, "shell-lockout-active")
 GTK_LOCKOUT_READY = os.path.join(LEDGER_DIR, "gtk-lockout-ready")
 STUDY_ACTIVE_FLAG = os.path.join(LEDGER_DIR, "study-active.flag")
+WIFI_ACTIVE_FLAG = os.path.join(LEDGER_DIR, "wifi-active.flag")
 STUDY_SUSPEND_STATE = os.path.join(LEDGER_DIR, "study-suspended.state")
 STUDY_VIOLATIONS_STATE = os.path.join(LEDGER_DIR, "study-violations.json")
 NEXT_ALERT_STATE = os.path.join(LEDGER_DIR, "next-alert.state")
+
+
+def _touch_study_active():
+    try:
+        os.makedirs(LEDGER_DIR, exist_ok=True)
+        with open(STUDY_ACTIVE_FLAG, "w") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+
+def _clear_study_active():
+    try:
+        if os.path.exists(STUDY_ACTIVE_FLAG):
+            os.remove(STUDY_ACTIVE_FLAG)
+    except Exception:
+        pass
+
+
+def _touch_wifi_active():
+    try:
+        os.makedirs(LEDGER_DIR, exist_ok=True)
+        with open(WIFI_ACTIVE_FLAG, "w") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+
+def _clear_wifi_active():
+    try:
+        if os.path.exists(WIFI_ACTIVE_FLAG):
+            os.remove(WIFI_ACTIVE_FLAG)
+    except Exception:
+        pass
 
 
 def _load_next_alert():
@@ -631,29 +666,30 @@ def enforce_suspension_until(end_ts):
         # PAM and the system boot service may have recovered the deadline from
         # different durable markers. Persist the later one before showing UI.
         _save_suspend_state(end_ts, mode="active")
-    # The login session must be running before GTK can create the lockout
-    # window. Keep the custom fullscreen lockout in front instead of invoking
-    # the separate GNOME lock screen, which can cover the countdown window.
-    while time.time() < end_ts:
-        saved_end = _load_suspend_state()
-        if saved_end > end_ts:
-            end_ts = saved_end
-        if not _has_display() or not _gtk_display_ready():
-            time.sleep(0.5)
-            continue
-        try:
-            show_lockout_window((end_ts - time.time()) / 60)
+    _shell_saved = _gnome_lockdown()
+    _sigs = _lockout_exe_signatures()
+    _lockout_proc_sweep(_sigs)
+
+    # When called from GTK UI/tray, do not block the GTK main event loop.
+    # The background systemd enforcer daemon and GNOME Shell extension overlay
+    # actively enforce the lockout. Blocking here causes Mutter "Force Quit" dialogs.
+    if Gtk.main_level() > 0:
+        return
+
+    try:
+        while time.time() < end_ts:
             saved_end = _load_suspend_state()
             if saved_end > end_ts:
                 end_ts = saved_end
-            if time.time() < end_ts:
-                continue
-            break  # returns only when timer ends (Power Off reboots -> state persists)
-        except Exception as e:
-            print(f"lockout enforce retry: {e}", flush=True)
-            time.sleep(1)
-    _clear_suspend_state()
-    _clear_lockout_schedule()
+            _lockout_proc_sweep(_sigs)
+            time.sleep(0.5)
+    except Exception as e:
+        print(f"lockout enforce retry: {e}", flush=True)
+    finally:
+        _gnome_restore(_shell_saved)
+        if _load_suspend_state() <= time.time():
+            _clear_suspend_state()
+            _clear_lockout_schedule()
 
 
 def do_suspend(minutes=SUSPEND_MINUTES):
@@ -678,23 +714,23 @@ def do_pseudo_lockout(minutes=SUSPEND_MINUTES, label="Focus lockout"):
     _shell_saved = _gnome_lockdown()
     _sigs = _lockout_exe_signatures()
     _lockout_proc_sweep(_sigs)
+
+    # When called from GTK UI/tray, do not block the GTK main event loop.
+    # The background systemd enforcer daemon and GNOME Shell extension overlay
+    # actively enforce the lockout. Blocking here causes Mutter "Force Quit" dialogs.
+    if Gtk.main_level() > 0:
+        return
+
     try:
-        # Check if GNOME Shell overlay is immediately active
-        deadline = time.monotonic() + 0.4
-        while time.time() < end and time.monotonic() < deadline \
-                and not _shell_overlay_active():
+        # GNOME Shell Focus Lockout overlay owns the screen!
+        while time.time() < end:
             _lockout_proc_sweep(_sigs)
-            time.sleep(0.05)
-        if _shell_overlay_active():
-            while time.time() < end and _shell_overlay_active():
-                _lockout_proc_sweep(_sigs)
-                time.sleep(0.5)
-            if time.time() < end:
-                show_lockout_window(max(0.01, (end - time.time()) / 60), pseudo=True)
-        else:
-            show_lockout_window(minutes, pseudo=True)
+            time.sleep(0.5)
+            cur_end = _load_suspend_state()
+            if cur_end > end:
+                end = cur_end
     except Exception as e:
-        print(f"pseudo lockout window error: {e}", flush=True)
+        print(f"pseudo lockout error: {e}", flush=True)
     finally:
         _gnome_restore(_shell_saved)
         # Only clear if our own deadline is over (power-off keeps it for restart).
@@ -842,10 +878,26 @@ def _gtk_display_ready():
     """Initialize GTK only when the imported graphical session is usable."""
     try:
         result = Gtk.init_check([])
-        return bool(result[0] if isinstance(result, tuple) else result)
+        ok = bool(result[0] if isinstance(result, tuple) else result)
+        if ok:
+            try:
+                import gi.overrides.Gtk as ogtk
+                ogtk.initialized = True
+            except Exception:
+                pass
+            return True
+        return False
     except TypeError:
         try:
-            return bool(Gtk.init_check())
+            ok = bool(Gtk.init_check())
+            if ok:
+                try:
+                    import gi.overrides.Gtk as ogtk
+                    ogtk.initialized = True
+                except Exception:
+                    pass
+                return True
+            return False
         except Exception:
             return Gdk.Display.get_default() is not None
     except Exception:
@@ -1174,6 +1226,11 @@ def _apply_css(win):
 
 
 def _new_fullscreen(title):
+    try:
+        import gi.overrides.Gtk as ogtk
+        ogtk.initialized = True
+    except Exception:
+        pass
     win = Gtk.Window(title=title)
     win.fullscreen()
     win.set_keep_above(True)
@@ -1293,10 +1350,11 @@ LOCKOUT_PROC_DENY = frozenset({
     "vivaldi", "torbrowser", "tor-browser", "zen", "floorp",
     "librewolf", "waterfox", "epiphany", "qutebrowser", "falkon",
     "midori",
-    "gnome-terminal", "gnome-terminal-server", "xterm", "konsole",
-    "alacritty", "kitty", "tilix", "terminator", "wezterm",
+    "gnome-terminal", "gnome-terminal-server", "ptyxis", "ptyxis-agent", "kgx",
+    "xterm", "konsole", "alacritty", "kitty", "tilix", "terminator", "wezterm",
+    "foot", "x-terminal-emulator",
     "opencode", "claude", "gemini", "aichat", "tgpt", "sgpt",
-    "codex", "cursor-agent", "aider", "ollama", "kilo", "cline",
+    "codex", "cursor-agent", "aider", "ollama", "kilo", ".kilo", "cline",
     "cursor", "copilot", "agy", "windsurf", "trae", "amazon-q",
     "roocode", "continue", "goose", "goose-cli",
     "openhands", "crush", "amp", "devin", "cody", "tabby",
@@ -1377,6 +1435,19 @@ def _lockout_proc_sweep(sigs=None):
             st = os.stat(exe)
             if _exe_matches(exe, st, sigs or {"inos": set(), "hashes": {}}):
                 os.kill(int(pid), signal.SIGKILL)
+                continue
+            # Also catch node/python wrappers and AI agents/terminals by cmdline
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd_raw = f.read().decode("utf-8", errors="ignore").lower()
+                if any(w in cmd_raw for w in (
+                    "kilo", "@kilocode", ".kilo", "ptyxis", "gnome-terminal", "kgx",
+                    "opencode", "claude", "aider", "ollama", "windsurf"
+                )):
+                    os.kill(int(pid), signal.SIGKILL)
+                    continue
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -2701,9 +2772,16 @@ def _build_network_panel(parent_win=None, toast_fn=None):
 
 def show_wifi_dialog(parent=None):
     """Show modal dialog for Wi-Fi scanning and connection."""
+    try:
+        import gi.overrides.Gtk as ogtk
+        ogtk.initialized = True
+    except Exception:
+        pass
     dialog = Gtk.Dialog(title="Wi-Fi Networks", parent=parent, modal=True)
     dialog.set_default_size(360, 480)
-    dialog.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+    dialog.set_position(Gtk.WindowPosition.CENTER_ON_PARENT if parent else Gtk.WindowPosition.CENTER)
+    dialog.set_keep_above(True)
+    dialog.set_skip_taskbar_hint(True)
     _apply_css(dialog)
     box = dialog.get_content_area()
     box.set_spacing(10)
@@ -2713,8 +2791,8 @@ def show_wifi_dialog(parent=None):
     box.set_margin_bottom(16)
     panel, scan_fn = _build_network_panel(parent_win=dialog, toast_fn=lambda msg: notify(msg))
     box.pack_start(panel, True, True, 0)
-    close_btn = dialog.add_button("Close", Gtk.ResponseType.CLOSE)
-    close_btn.get_style_context().add_class("btn-ghost")
+    close_btn = dialog.add_button("✕ Close", Gtk.ResponseType.CLOSE)
+    close_btn.get_style_context().add_class("btn-primary")
     dialog.show_all()
     scan_fn()
     dialog.run()
@@ -2876,7 +2954,9 @@ def show_lockout_window(minutes, pseudo=False):
             schedule["segments"][int(schedule["stage"])])
 
     def fmt_left():
-        left = max(0, int(_stage_end() - time.time()))
+        # Show the FULL remaining lockout (all stages), so an extension adds to
+        # the visible timer immediately instead of waiting for the next stage.
+        left = max(0, int(end - time.time()))
         d, rem = divmod(left, 86400)
         h, rem = divmod(rem, 3600)
         m, s = divmod(rem, 60)
@@ -2898,8 +2978,33 @@ def show_lockout_window(minutes, pseudo=False):
         except Exception:
             pass
 
+    def _sync_schedule_from_disk():
+        """Pick up extensions made from the Study top bar or another window."""
+        nonlocal end, total
+        try:
+            saved_end = _load_suspend_state()
+            disk = _load_lockout_schedule(saved_end)
+            if disk is None:
+                return
+            disk_end = _schedule_end(disk)
+            if disk_end > end + 0.5:
+                schedule.clear()
+                schedule.update(disk)
+                end = max(disk_end, saved_end)
+                total = max(1, sum(int(x) for x in schedule["segments"]))
+                unlock_lbl.set_text(
+                    f"Unlocks at {time.strftime('%Y-%m-%d %H:%M', time.localtime(end))}")
+                _set_extend_button()
+            elif saved_end > end + 0.5:
+                end = saved_end
+                unlock_lbl.set_text(
+                    f"Unlocks at {time.strftime('%Y-%m-%d %H:%M', time.localtime(end))}")
+        except Exception as e:
+            print(f"lockout schedule sync error: {e}", flush=True)
+
     def tick():
         nonlocal end, total
+        _sync_schedule_from_disk()
         if time.time() >= _stage_end() and int(schedule["stage"]) + 1 < len(schedule["segments"]):
             stage_boundary = _stage_end()
             schedule["stage"] = int(schedule["stage"]) + 1
@@ -2925,7 +3030,8 @@ def show_lockout_window(minutes, pseudo=False):
                                  / total))
         prog.set_fraction(done_frac)
         prog.set_text(f"{int(done_frac * 100)}% served")
-        if time.time() >= _stage_end() and int(schedule["stage"]) + 1 >= len(schedule["segments"]):
+        if (time.time() >= _stage_end() and time.time() >= end
+                and int(schedule["stage"]) + 1 >= len(schedule["segments"])):
             if _typing_win is not None and ending["phase"] == 0:
                 # typing open: close it first (quits ITS nested loop),
                 # then finish lockout on the next tick in our own loop
@@ -4350,12 +4456,7 @@ def show_study_window(parent=None, end_ts=None):
         if _saved > time.time():
             end_ts = _saved
 
-    def _touch_study_active():
-        try:
-            with open(STUDY_ACTIVE_FLAG, "w") as f:
-                f.write(str(time.time()))
-        except Exception:
-            pass
+    _touch_study_active()
 
     cfg = _study_config()
     allow = cfg.get("allow_hosts") or _STUDY_DEFAULTS["allow_hosts"]
@@ -5026,14 +5127,24 @@ def show_study_window(parent=None, end_ts=None):
     split_paned.set_wide_handle(True)
     split_paned.set_hexpand(True)
     split_paned.set_vexpand(True)
+    split_active_pane = {"current": "left"}
 
-    def _split_load_uri(view, raw_uri, local_pdf_uri=None):
+    paned_split_done = [False]
+    def _on_paned_size(widget, alloc):
+        if not paned_split_done[0] and alloc.width > 200:
+            paned_split_done[0] = True
+            widget.set_position(alloc.width // 2)
+    split_paned.connect("size-allocate", _on_paned_size)
+
+    def _split_load_uri(view, raw_uri):
         uri = (raw_uri or "").strip()
         if not uri:
             return
         if uri.startswith("file:"):
-            if uri != local_pdf_uri:
-                _toast("Only a PDF selected from this device can open here")
+            parsed = urlparse(uri)
+            fpath = urllib.parse.unquote(parsed.path)
+            if not (os.path.isfile(fpath) and fpath.lower().endswith(".pdf")):
+                _toast("Only a PDF file from this device can open here")
                 return
             view.load_uri(uri)
             return
@@ -5051,6 +5162,7 @@ def show_study_window(parent=None, end_ts=None):
 
     def _build_split_pane(caption):
         pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        pane.set_can_focus(True)
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         caption_label = Gtk.Label(label=caption)
         caption_label.get_style_context().add_class("sidehead")
@@ -5061,17 +5173,20 @@ def show_study_window(parent=None, end_ts=None):
                 chooser.append(str(link["url"]), str(link.get("title") or "Study link"))
         chooser.set_hexpand(True)
         pdf_button = Gtk.Button(label="Select PDF")
+        fullscreen_btn = Gtk.Button(label="⛶")
         back_button = Gtk.Button(label="‹")
         forward_button = Gtk.Button(label="›")
-        for button in (pdf_button, back_button, forward_button):
+        for button in (pdf_button, fullscreen_btn, back_button, forward_button):
             button.get_style_context().add_class("webnavbtn")
             button.get_style_context().add_class("floatbtn")
-        pdf_button.set_tooltip_text("Choose a PDF from this device")
+        pdf_button.set_tooltip_text("Choose a PDF from this device to view here")
+        fullscreen_btn.set_tooltip_text("Open this PDF in fullscreen reader")
         back_button.set_tooltip_text("Back in this pane")
         forward_button.set_tooltip_text("Forward in this pane")
         toolbar.pack_start(caption_label, False, False, 2)
         toolbar.pack_start(chooser, True, True, 0)
         toolbar.pack_start(pdf_button, False, False, 0)
+        toolbar.pack_start(fullscreen_btn, False, False, 0)
         toolbar.pack_start(back_button, False, False, 0)
         toolbar.pack_start(forward_button, False, False, 0)
         pane.pack_start(toolbar, False, False, 0)
@@ -5083,7 +5198,12 @@ def show_study_window(parent=None, end_ts=None):
         view.set_hexpand(True)
         view.set_vexpand(True)
         try:
-            _configure_study_settings(view.get_settings())
+            st = view.get_settings()
+            _configure_study_settings(st)
+            if hasattr(st, "set_allow_file_access_from_file_urls"):
+                st.set_allow_file_access_from_file_urls(True)
+            if hasattr(st, "set_allow_universal_access_from_file_urls"):
+                st.set_allow_universal_access_from_file_urls(True)
         except Exception:
             pass
         scroll = Gtk.ScrolledWindow()
@@ -5091,17 +5211,45 @@ def show_study_window(parent=None, end_ts=None):
         scroll.add(view)
         pane.pack_start(scroll, True, True, 0)
 
+        current_pdf_path = {"path": None}
         local_pdf_uri = {"uri": None}
+
+        def _mark_active(*_):
+            split_active_pane["current"] = "right" if caption.upper() == "RIGHT" else "left"
+
+        view.connect("focus-in-event", _mark_active)
+        pane.connect("button-press-event", _mark_active)
+
         def _choose(_chooser):
             selected = chooser.get_active_id()
             if selected:
+                current_pdf_path["path"] = None
                 local_pdf_uri["uri"] = None
+                caption_label.set_text(caption)
+                caption_label.set_tooltip_text(None)
                 _split_load_uri(view, selected)
 
+        def _load_pdf_into_pane(selected_path):
+            if not selected_path or not os.path.isfile(selected_path):
+                return
+            abs_p = os.path.abspath(selected_path)
+            current_pdf_path["path"] = abs_p
+            local_pdf_uri["uri"] = Gio.File.new_for_path(abs_p).get_uri()
+            chooser.set_active_id("")
+            caption_label.set_text(os.path.basename(abs_p)[:18])
+            caption_label.set_tooltip_text(abs_p)
+            _split_load_uri(view, local_pdf_uri["uri"])
+            _record_recent_document(abs_p, 1)
+
         def _select_pdf(*_):
+            _mark_active()
             dialog = Gtk.FileChooserDialog(
                 title="Select PDF for " + caption.lower() + " pane",
                 parent=win, action=Gtk.FileChooserAction.OPEN)
+            dialog.set_transient_for(win)
+            dialog.set_modal(True)
+            dialog.set_keep_above(True)
+            dialog.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
             dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
             dialog.add_button("Open PDF", Gtk.ResponseType.ACCEPT)
             pdf_filter = Gtk.FileFilter()
@@ -5111,15 +5259,21 @@ def show_study_window(parent=None, end_ts=None):
             pdf_filter.add_pattern("*.PDF")
             dialog.add_filter(pdf_filter)
             if os.path.isdir(STUDY_INBOX):
-                dialog.set_current_folder(STUDY_INBOX)
+                try:
+                    dialog.set_current_folder(STUDY_INBOX)
+                except Exception:
+                    pass
             response = dialog.run()
             selected_path = dialog.get_filename() if response == Gtk.ResponseType.ACCEPT else None
             dialog.destroy()
             if selected_path and selected_path.lower().endswith(".pdf"):
-                local_pdf_uri["uri"] = Gio.File.new_for_path(
-                    os.path.abspath(selected_path)).get_uri()
-                chooser.set_active_id("")
-                _split_load_uri(view, local_pdf_uri["uri"], local_pdf_uri["uri"])
+                _load_pdf_into_pane(selected_path)
+
+        def _go_fullscreen(*_):
+            if current_pdf_path.get("path") and os.path.isfile(current_pdf_path["path"]):
+                _open_media(current_pdf_path["path"], force_fullscreen=True)
+            else:
+                _toast("Choose a PDF first to view in fullscreen")
 
         def _policy(_view, decision, decision_type):
             try:
@@ -5129,7 +5283,7 @@ def show_study_window(parent=None, end_ts=None):
                     parsed = urlparse(uri)
                     if parsed.scheme in ("about", "blob", "data"):
                         return False
-                    if parsed.scheme == "file" and uri == local_pdf_uri["uri"]:
+                    if parsed.scheme == "file":
                         return False
                     if (parsed.scheme in ("http", "https")
                             and _page_allowed(uri, allow)):
@@ -5143,7 +5297,7 @@ def show_study_window(parent=None, end_ts=None):
                     parsed = urlparse(uri)
                     decision.ignore()
                     if (_page_allowed(uri, allow) or parsed.scheme in ("about", "blob", "data")):
-                        GLib.idle_add(_split_load_uri, view, address, uri)
+                        GLib.idle_add(_split_load_uri, view, uri)
                     else:
                         _toast("Popup blocked: site is not in the study list")
                     return True
@@ -5153,13 +5307,15 @@ def show_study_window(parent=None, end_ts=None):
                     uri = response.get_uri() or ""
                     parsed = urlparse(uri)
                     path = parsed.path.lower()
+                    if parsed.scheme == "file":
+                        return False
                     is_att = bool(response.get_suggested_filename())
                     unsupported = not decision.is_mime_type_supported()
-                    is_file_ext = path.endswith((".pdf", ".zip", ".rar", ".7z", ".tar", ".gz",
+                    is_file_ext = path.endswith((".zip", ".rar", ".7z", ".tar", ".gz",
                                                 ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
                                                 ".mp3", ".m4a", ".wav", ".mp4", ".mkv", ".webm",
                                                 ".epub", ".txt", ".csv"))
-                    if (is_att or unsupported or is_file_ext or mime == "application/pdf"):
+                    if is_att or unsupported or is_file_ext:
                         if (_page_allowed(uri, allow) or _page_allowed(view.get_uri() or "", allow)
                                 or parsed.scheme in ("blob", "data")):
                             decision.download()
@@ -5173,20 +5329,21 @@ def show_study_window(parent=None, end_ts=None):
                 _record_recent_website(view.get_uri(), view.get_title())
 
         pdf_button.connect("clicked", _select_pdf)
+        fullscreen_btn.connect("clicked", _go_fullscreen)
         chooser.connect("changed", _choose)
         back_button.connect("clicked", lambda *_: view.go_back()
                             if view.can_go_back() else None)
         forward_button.connect("clicked", lambda *_: view.go_forward()
-                               if view.can_go_forward() else None)
+                                if view.can_go_forward() else None)
         view.connect("authenticate", _on_web_authenticate)
         view.connect("permission-request", lambda _v, req: (req.allow(), True)[1])
         view.connect("decide-policy", _policy)
         view.connect("load-changed", _loaded)
         view.connect("context-menu", lambda *_: True)
-        return pane
+        return (pane, view, _load_pdf_into_pane, current_pdf_path)
 
-    split_left = _build_split_pane("LEFT")
-    split_right = _build_split_pane("RIGHT")
+    split_left, split_left_view, split_left_load_pdf, split_left_info = _build_split_pane("LEFT")
+    split_right, split_right_view, split_right_load_pdf, split_right_info = _build_split_pane("RIGHT")
     split_paned.pack1(split_left, True, False)
     split_paned.pack2(split_right, True, False)
     split_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -5200,8 +5357,11 @@ def show_study_window(parent=None, end_ts=None):
         if stack.get_visible_child_name() == "split":
             stack.set_visible_child_name(split_return_page["name"])
         else:
-            split_return_page["name"] = stack.get_visible_child_name() or "home"
+            prev = stack.get_visible_child_name() or "home"
+            split_return_page["name"] = prev
             stack.set_visible_child_name("split")
+            if prev == "reader" and state.get("path") and os.path.isfile(state["path"]):
+                split_left_load_pdf(state["path"])
 
     def _sync_split_button(_stack, _property):
         active = stack.get_visible_child_name() == "split"
@@ -6739,7 +6899,7 @@ def show_study_window(parent=None, end_ts=None):
     def _remember():
         STROKE_MEM[(state["path"], state["page"])] = (state["strokes"], state["redo"])
 
-    def _open_media(path):
+    def _open_media(path, force_fullscreen=False):
         ext = os.path.splitext(path)[1].lower()
         if ext in (".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv",
                    ".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac",
@@ -6750,6 +6910,16 @@ def show_study_window(parent=None, end_ts=None):
                 _toast(f"Opening {os.path.basename(path)}…")
             except Exception as e:
                 _toast(f"Could not open: {e}")
+            return
+        if stack.get_visible_child_name() == "split" and not force_fullscreen and ext == ".pdf":
+            target = split_right_load_pdf if split_active_pane.get("current") == "right" else split_left_load_pdf
+            target(path)
+            doc_state.update(active=True, title=os.path.basename(path), icon="📄")
+            try:
+                _render_dock()
+            except Exception:
+                pass
+            _toast(f"Opened {os.path.basename(path)} in split view")
             return
         doc_state.update(active=True, title=os.path.basename(path),
                          icon="📄" if ext == ".pdf" else "🖼️")
@@ -7551,6 +7721,10 @@ def show_study_window(parent=None, end_ts=None):
             title="Open PDF / Image",
             parent=win,
             action=Gtk.FileChooserAction.OPEN)
+        chooser.set_transient_for(win)
+        chooser.set_modal(True)
+        chooser.set_keep_above(True)
+        chooser.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
         chooser.add_button("Cancel", Gtk.ResponseType.CANCEL)
         chooser.add_button("Open", Gtk.ResponseType.ACCEPT)
         chooser.set_select_multiple(True)
@@ -8005,6 +8179,7 @@ def show_study_window(parent=None, end_ts=None):
         _kw.connect("key-press-event", _on_key)
 
     def _on_back_clicked(*_):
+        _clear_study_active()
         if _study_parent is not None:
             try:
                 _study_parent.show()
@@ -8013,12 +8188,6 @@ def show_study_window(parent=None, end_ts=None):
                     Gtk.main_iteration_do(False)
             except Exception:
                 pass
-        else:
-            if _load_suspend_state() > time.time():
-                try:
-                    os.remove(STUDY_ACTIVE_FLAG)
-                except OSError:
-                    pass
         win.destroy()
 
     back_btn.connect("clicked", _on_back_clicked)
@@ -8076,6 +8245,8 @@ def show_study_window(parent=None, end_ts=None):
                 buttons=Gtk.ButtonsType.OK_CANCEL,
                 text=f"Extend Lockout by {extra_days} Days?"
             )
+            dlg.set_keep_above(True)
+            dlg.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
             dlg.format_secondary_text(
                 f"Current stage is {stage_seconds // 86400} days.\n"
                 f"Policy rule extends by {extra_days} days.\n"
@@ -8102,6 +8273,8 @@ def show_study_window(parent=None, end_ts=None):
             dlg = Gtk.Dialog(
                 title="Extend Lockout Time", transient_for=win, modal=True
             )
+            dlg.set_keep_above(True)
+            dlg.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
             dlg.set_default_size(360, 160)
             c_area = dlg.get_content_area()
             c_area.set_spacing(12)
@@ -8210,10 +8383,7 @@ def show_study_window(parent=None, end_ts=None):
         global _study_auto_closing
         global _study_block_count_updater
         _study_block_count_updater = None
-        try:
-            os.remove(STUDY_ACTIVE_FLAG)
-        except OSError:
-            pass
+        _clear_study_active()
         if _study_sweep:
             try:
                 GLib.source_remove(_study_sweep)
@@ -8247,19 +8417,16 @@ def show_study_window(parent=None, end_ts=None):
 
     win.connect("destroy", _on_destroy)
     win.show_all()
-    win.present()
+    try:
+        win.present_with_time(int(time.time()))
+    except Exception:
+        win.present()
     win.grab_focus()
     _touch_study_active()
     while Gtk.events_pending():
         Gtk.main_iteration_do(False)
     Gtk.main()
-    if _is_study_suspended() and _study_parent is None:
-        suspend_deadline = _get_study_suspended_until()
-        rem_m = max(1, int(math.ceil((suspend_deadline - time.time()) / 60.0)))
-        do_pseudo_lockout(rem_m, "Study Mode Suspended")
-    elif _load_suspend_state() > time.time() and _study_parent is None:
-        rem_m = max(1, int(math.ceil((_load_suspend_state() - time.time()) / 60.0)))
-        do_pseudo_lockout(rem_m, "Focus lockout")
+    # Lockout screen is maintained by GNOME Shell extension overlay. Clean exit.
 
 
 def show_study_or_typing(parent, end_ts):
@@ -8372,17 +8539,29 @@ if __name__ == "__main__":
             time.sleep(0.5)
         show_now_once()
     elif "--study" in sys.argv:
+        _touch_study_active()
         while not _has_display() or not _gtk_display_ready():
-            print("Study waiting for display…", flush=True)
-            time.sleep(0.5)
+            time.sleep(0.02)
         if _is_study_suspended():
+            _clear_study_active()
             until = _get_study_suspended_until()
             rem_m = max(1, int(math.ceil((until - time.time()) / 60.0)))
             notify(f"Study Mode is temporarily suspended ({rem_m}m remaining).")
-            if _load_suspend_state() > time.time():
-                do_pseudo_lockout(max(1, int(math.ceil((_load_suspend_state() - time.time()) / 60.0))))
             sys.exit(0)
-        show_study_window()
+        try:
+            show_study_window()
+        finally:
+            _clear_study_active()
+        sys.exit(0)
+    elif "--wifi" in sys.argv:
+        _touch_wifi_active()
+        while not _has_display() or not _gtk_display_ready():
+            time.sleep(0.02)
+        try:
+            show_wifi_dialog()
+        finally:
+            _clear_wifi_active()
+        sys.exit(0)
     elif "--tray" in sys.argv or "--emergency-button" in sys.argv:
         # single instance for the tray process too (separate lock from main)
         try:

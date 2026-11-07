@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+import os, sys, glob, json, time
+from datetime import datetime
+
+def parse_ts(val):
+    if isinstance(val, (int, float)):
+        return val / 1000.0 if val > 1e11 else float(val)
+    if isinstance(val, str):
+        val = val.strip()
+        try:
+            num = float(val)
+            return num / 1000.0 if num > 1e11 else num
+        except Exception:
+            pass
+        try:
+            return datetime.fromisoformat(val.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            pass
+    return 0.0
+
+def is_focus_control_locked():
+    now = time.time()
+    
+    # 1. System-wide run flag
+    run_flag = "/run/focus-reminder-lock.flag"
+    if os.path.isfile(run_flag):
+        try:
+            with open(run_flag, "r") as f:
+                if f.read().strip() == "active":
+                    return True
+        except Exception:
+            pass
+
+    # 2. Per-user focus-reminder state files
+    user_dirs = glob.glob("/home/*/.local/share/focus-reminder") + [
+        "/root/.local/share/focus-reminder",
+        "/var/tmp/focus-reminder",
+    ]
+    for base in user_dirs:
+        if not os.path.isdir(base):
+            continue
+        
+        # Check suspend.state
+        state_file = os.path.join(base, "suspend.state")
+        if os.path.isfile(state_file):
+            try:
+                with open(state_file, "r") as f:
+                    ts = parse_ts(f.read().strip())
+                    if now < ts <= (now + 86400 * 7):
+                        return True
+            except Exception:
+                pass
+
+        # Check suspend-checkpoint.json
+        chk_file = os.path.join(base, "suspend-checkpoint.json")
+        if os.path.isfile(chk_file):
+            try:
+                with open(chk_file, "r") as f:
+                    data = json.load(f)
+                    rem = float(data.get("remaining_seconds", 0))
+                    saved = float(data.get("saved_at", 0))
+                    if rem > 0 and now < (saved + rem + 86400 * 7):
+                        return True
+            except Exception:
+                pass
+
+        # Check shell-lockout-active
+        flag_file = os.path.join(base, "shell-lockout-active")
+        if os.path.isfile(flag_file):
+            try:
+                if (now - os.path.getmtime(flag_file)) < 15:
+                    return True
+            except Exception:
+                pass
+
+        # Check study-suspended.state
+        study_susp = os.path.join(base, "study-suspended.state")
+        if os.path.isfile(study_susp):
+            try:
+                with open(study_susp, "r") as f:
+                    ts = parse_ts(f.read().strip())
+                    if now < ts <= (now + 86400 * 7):
+                        return True
+            except Exception:
+                pass
+
+    return False
+
+if __name__ == "__main__":
+    locked = is_focus_control_locked()
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "status":
+        print("🔒 Focus Control Lockout: ACTIVE (অ্যাপ ও ইনস্টলার ডিসেবল আছে)" if locked else "🔓 Focus Control Lockout: INACTIVE (স্বাভাবিক মোড)")
+    sys.exit(0 if locked else 1)

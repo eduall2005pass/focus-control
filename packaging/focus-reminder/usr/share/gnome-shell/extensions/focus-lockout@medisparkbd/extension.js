@@ -1,6 +1,7 @@
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import Meta from 'gi://Meta';
 import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -21,6 +22,9 @@ export default class FocusLockoutExtension extends Extension {
         this._studyActivePath = GLib.build_filenamev([
             GLib.get_home_dir(), STATE_DIR, 'study-active.flag',
         ]);
+        this._wifiActivePath = GLib.build_filenamev([
+            GLib.get_home_dir(), STATE_DIR, 'wifi-active.flag',
+        ]);
         this._studySuspendPath = GLib.build_filenamev([
             GLib.get_home_dir(), STATE_DIR, 'study-suspended.state',
         ]);
@@ -29,7 +33,19 @@ export default class FocusLockoutExtension extends Extension {
         this._end = 0;
         this._monitorId = 0;
         this._studyBtn = null;
+        this._wifiBtn = null;
         this._studyLaunching = false;
+        this._lockdownActive = false;
+        this._overviewBlocked = false;
+        this._windowCreatedId = global.display.connect('window-created', (_display, metaWindow) => {
+            try {
+                const title = metaWindow.get_title();
+                const wmClass = metaWindow.get_wm_class();
+                if (title === 'Study' || wmClass === 'focus-reminder' || title === 'Open PDF / Image' || title === 'Wi-Fi Networks' || title === 'Extend Lockout Time') {
+                    metaWindow.activate(global.get_current_time());
+                }
+            } catch (_) {}
+        });
         this._monitors = [];
         this._setupFileMonitors();
         this._pollId = GLib.timeout_add(
@@ -49,7 +65,7 @@ export default class FocusLockoutExtension extends Extension {
     }
 
     _setupFileMonitors() {
-        const paths = [this._statePath, this._studyActivePath, this._gtkReadyPath, this._studySuspendPath];
+        const paths = [this._statePath, this._studyActivePath, this._wifiActivePath, this._gtkReadyPath, this._studySuspendPath];
         for (const p of paths) {
             try {
                 const file = Gio.File.new_for_path(p);
@@ -82,7 +98,93 @@ export default class FocusLockoutExtension extends Extension {
             GLib.source_remove(this._pollId);
             this._pollId = 0;
         }
+        if (this._windowCreatedId) {
+            global.display.disconnect(this._windowCreatedId);
+            this._windowCreatedId = 0;
+        }
         this._hideOverlay();
+        this._setLockdownActive(false);
+    }
+
+    _setLockdownActive(active) {
+        if (this._lockdownActive === active) return;
+        this._lockdownActive = active;
+
+        // 1. Overview block/unblock (blocks Super key and Activities overview completely)
+        try {
+            if (active) {
+                if (Main.overview && !this._overviewBlocked) {
+                    Main.overview.block();
+                    this._overviewBlocked = true;
+                }
+            } else {
+                if (Main.overview && this._overviewBlocked) {
+                    Main.overview.unblock();
+                    this._overviewBlocked = false;
+                }
+            }
+        } catch (_) {}
+
+        // 2. Hide/show and deactivate Clutter stage dock actors (Ubuntu Dock)
+        try {
+            const findDocks = (actor) => {
+                let found = [];
+                if (!actor) return found;
+                if (actor.name === 'dashtodockContainer' ||
+                    (actor.has_style_class_name && actor.has_style_class_name('dashtodock'))) {
+                    found.push(actor);
+                }
+                if (actor.get_children) {
+                    for (const child of actor.get_children()) {
+                        found = found.concat(findDocks(child));
+                    }
+                }
+                return found;
+            };
+            const docks = findDocks(global.stage);
+            for (const dock of docks) {
+                dock.visible = !active;
+                dock.reactive = !active;
+                dock.opacity = active ? 0 : 255;
+                if (active && !dock._focusLockHook) {
+                    dock._focusLockHook = true;
+                    dock.connect('notify::visible', () => {
+                        if (this._lockdownActive && dock.visible) {
+                            dock.visible = false;
+                            dock.reactive = false;
+                        }
+                    });
+                }
+            }
+        } catch (_) {}
+
+        // 3. Dash-to-dock / Ubuntu Dock GSettings lockdown
+        try {
+            const s = new Gio.Settings({schema_id: 'org.gnome.shell.extensions.dash-to-dock'});
+            if (active) {
+                s.set_boolean('dock-fixed', false);
+                s.set_boolean('autohide', true);
+                s.set_boolean('autohide-in-fullscreen', false);
+                s.set_boolean('intellihide', false);
+                s.set_boolean('require-pressure-to-show', true);
+                s.set_double('pressure-threshold', 1000000.0);
+                s.set_boolean('show-running', false);
+                s.set_boolean('show-favorites', false);
+                s.set_boolean('show-show-apps-button', false);
+                s.set_boolean('hot-keys', false);
+            } else {
+                s.reset('dock-fixed');
+                s.reset('autohide');
+                s.reset('autohide-in-fullscreen');
+                s.reset('intellihide');
+                s.reset('require-pressure-to-show');
+                s.reset('pressure-threshold');
+                s.reset('show-running');
+                s.reset('show-favorites');
+                s.reset('show-show-apps-button');
+                s.reset('hot-keys');
+            }
+        } catch (_) {}
     }
 
     _readDeadline() {
@@ -115,7 +217,31 @@ export default class FocusLockoutExtension extends Extension {
             if (!ok)
                 return false;
             const ts = Number(new TextDecoder().decode(bytes).trim());
-            return Number.isFinite(ts) && (Date.now() / 1000 - ts < 10);
+            const age = Date.now() / 1000 - ts;
+            if (!Number.isFinite(ts) || age < 0 || age >= 8)
+                return false;
+            if (age < 2.5)
+                return true;
+            const wins = global.display.get_tab_list(Meta.TabList.NORMAL_ALL, null);
+            return wins.some(w => w && (w.get_title() === 'Study' || (w.get_wm_class && w.get_wm_class() === 'focus-reminder')));
+        } catch (_) {
+            return false;
+        }
+    }
+
+    _isWifiActive() {
+        try {
+            const [ok, bytes] = GLib.file_get_contents(this._wifiActivePath);
+            if (!ok)
+                return false;
+            const ts = Number(new TextDecoder().decode(bytes).trim());
+            const age = Date.now() / 1000 - ts;
+            if (!Number.isFinite(ts) || age < 0 || age >= 10)
+                return false;
+            if (age < 1.5)
+                return true;
+            const wins = global.display.get_tab_list(Meta.TabList.NORMAL_ALL, null);
+            return wins.some(w => w && (w.get_title() === 'Wi-Fi Networks' || w.get_title() === 'Wi-Fi'));
         } catch (_) {
             return false;
         }
@@ -139,18 +265,20 @@ export default class FocusLockoutExtension extends Extension {
         if (end > now) {
             this._end = end;
             this._writeFlag();
+            this._setLockdownActive(true);
 
             const isStudySuspended = this._getStudySuspendedUntil() > now;
 
-            // If GTK lockout window is active or (Study mode is active AND NOT suspended), hide shell overlay
-            if (this._isGtkReady() || (this._isStudyActive() && !isStudySuspended)) {
+            // Focus Lockout screen is the primary and only lockout screen.
+            // Temporarily step aside ONLY when Study Mode or Wi-Fi dialog is active.
+            if ((this._isStudyActive() && !isStudySuspended) || this._isWifiActive()) {
                 if (this._root) {
                     this._hideOverlay();
                 }
                 return;
             }
 
-            // Otherwise, show shell overlay (guarantees zero-delay modal shield on login/reboot)
+            // Otherwise, show shell overlay (guarantees zero-delay modal shield)
             if (!this._root) {
                 this._showOverlay();
             }
@@ -182,10 +310,15 @@ export default class FocusLockoutExtension extends Extension {
                     this._studyBtn.style = 'background-color: #2563eb; color: #ffffff; padding: 12px 32px; border-radius: 8px; font-weight: bold; font-size: 18px;';
                 }
             }
-        } else if (this._root) {
-            this._hideOverlay();
         } else {
-            this._removeFlag();
+            if (this._root) {
+                this._hideOverlay();
+            } else {
+                this._removeFlag();
+            }
+            try { GLib.unlink(this._studyActivePath); } catch (_) {}
+            try { GLib.unlink(this._wifiActivePath); } catch (_) {}
+            this._setLockdownActive(false);
         }
     }
 
@@ -205,10 +338,6 @@ export default class FocusLockoutExtension extends Extension {
 
     _showOverlay() {
         GLib.mkdir_with_parents(GLib.path_get_dirname(this._flagPath), 0o700);
-        try {
-            GLib.spawn_command_line_async("gnome-extensions disable ubuntu-dock@ubuntu.com");
-            GLib.spawn_command_line_async("gnome-extensions disable ding@rastersoft.com");
-        } catch (_) {}
 
         const width = global.stage.width;
         const height = global.stage.height;
@@ -227,27 +356,6 @@ export default class FocusLockoutExtension extends Extension {
         // Block all keyboard bypass
         this._root.connect('key-press-event', () => Clutter.EVENT_STOP);
         this._root.connect('key-release-event', () => Clutter.EVENT_STOP);
-
-        // Trap ALL pointer clicks everywhere on the overlay, propagating only to active action buttons
-        const isActionTarget = (src) => {
-            if (!src) return false;
-            if (src === this._studyBtn || src === powerBtn) return true;
-            if (this._studyBtn && this._studyBtn.contains && this._studyBtn.contains(src)) return true;
-            if (powerBtn && powerBtn.contains && powerBtn.contains(src)) return true;
-            return false;
-        };
-        this._root.connect('button-press-event', (_actor, event) => {
-            if (isActionTarget(event.get_source())) {
-                return Clutter.EVENT_PROPAGATE;
-            }
-            return Clutter.EVENT_STOP;
-        });
-        this._root.connect('button-release-event', (_actor, event) => {
-            if (isActionTarget(event.get_source())) {
-                return Clutter.EVENT_PROPAGATE;
-            }
-            return Clutter.EVENT_STOP;
-        });
 
         const topSpace = new St.Widget({y_expand: true});
         const bottomSpace = new St.Widget({y_expand: true});
@@ -313,7 +421,17 @@ export default class FocusLockoutExtension extends Extension {
             this._studyLaunching = true;
             this._studyBtn.reactive = false;
             this._studyBtn.set_label('⏳ Opening Study Mode…');
-            // Overlay remains up until Python Study window touches study-active.flag, ensuring zero-gap transition.
+            // Safety timeout so button never stays stuck disabled
+            GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 5, () => {
+                if (this._studyLaunching && this._root) {
+                    this._studyLaunching = false;
+                    if (this._studyBtn) {
+                        this._studyBtn.set_label('📚  Study Mode');
+                        this._studyBtn.reactive = true;
+                    }
+                }
+                return GLib.SOURCE_REMOVE;
+            });
             try {
                 GLib.spawn_command_line_async('python3 /opt/focus-reminder/focus-reminder.py --study');
             } catch (err) {
@@ -336,13 +454,35 @@ export default class FocusLockoutExtension extends Extension {
         });
         powerBtn.connect('clicked', () => {
             try {
-                GLib.spawn_command_line_async('systemctl poweroff');
+                GLib.spawn_command_line_async('systemctl poweroff -i');
             } catch (err) {
                 logError(err, 'Could not power off');
             }
         });
 
+        this._wifiBtn = new St.Button({
+            label: '📶  Wi-Fi',
+            style_class: 'button',
+            reactive: true,
+            can_focus: true,
+            track_hover: true,
+            style: 'background-color: #1e293b; color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.45); padding: 12px 32px; border-radius: 8px; font-weight: bold; font-size: 18px;',
+        });
+        this._wifiBtn.connect('clicked', () => {
+            try {
+                GLib.mkdir_with_parents(GLib.path_get_dirname(this._wifiActivePath), 0o700);
+                GLib.file_set_contents(this._wifiActivePath, `${Date.now() / 1000}\n`);
+            } catch (_) {}
+            this._hideOverlay();
+            try {
+                GLib.spawn_command_line_async('python3 /opt/focus-reminder/focus-reminder.py --wifi');
+            } catch (err) {
+                logError(err, 'Could not spawn wifi dialog');
+            }
+        });
+
         btnBox.add_child(this._studyBtn);
+        btnBox.add_child(this._wifiBtn);
         btnBox.add_child(powerBtn);
         content.add_child(btnBox);
 
@@ -350,9 +490,9 @@ export default class FocusLockoutExtension extends Extension {
         this._root.add_child(content);
         this._root.add_child(bottomSpace);
 
-        // GNOME Shell 50.1 layoutManager addTopChrome: trackFullscreen only, NO affectsInputRegion
+        // GNOME Shell 50.1 layoutManager addTopChrome: trackFullscreen: false so fullscreen windows never hide lockout
         Main.layoutManager.addTopChrome(this._root, {
-            trackFullscreen: true,
+            trackFullscreen: false,
             affectsStruts: false,
         });
 
@@ -372,7 +512,7 @@ export default class FocusLockoutExtension extends Extension {
     }
 
     _writeFlag() {
-        if (!this._grab && !this._isGtkReady())
+        if (!this._grab)
             return;
         try {
             GLib.file_set_contents(
@@ -413,16 +553,9 @@ export default class FocusLockoutExtension extends Extension {
             this._root = null;
         }
         this._studyBtn = null;
+        this._wifiBtn = null;
         this._timerLabel = null;
         this._unlockLabel = null;
         this._removeFlag();
-
-        const end = this._readDeadline();
-        if (end <= Date.now() / 1000) {
-            try {
-                GLib.spawn_command_line_async("gnome-extensions enable ubuntu-dock@ubuntu.com");
-                GLib.spawn_command_line_async("gnome-extensions enable ding@rastersoft.com");
-            } catch (_) {}
-        }
     }
 }
