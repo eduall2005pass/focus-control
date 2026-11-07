@@ -1,0 +1,7 @@
+{
+  "uuid": "focus-lockout@medisparkbd",
+  "name": "Focus Lockout Screen",
+  "description": "Shows an unclosable countdown overlay while a Focus Reminder lockout is active.",
+  "shell-version": ["50"],
+  "version": 1
+}

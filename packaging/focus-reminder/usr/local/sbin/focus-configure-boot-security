@@ -1,0 +1,59 @@
+#!/bin/bash
+# Opt-in GRUB hardening for Focus Reminder. Run as root on the target machine.
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Run with sudo: sudo focus-configure-boot-security" >&2
+  exit 1
+fi
+if ! command -v grub-mkpasswd-pbkdf2 >/dev/null || ! command -v update-grub >/dev/null; then
+  echo "This tool requires Ubuntu/Debian GRUB utilities (grub-mkpasswd-pbkdf2 and update-grub)." >&2
+  exit 1
+fi
+CUSTOM=/etc/grub.d/40_custom
+DEFAULTS=/etc/default/grub
+MARKER='# BEGIN focus-reminder boot security'
+if grep -qF "$MARKER" "$CUSTOM" 2>/dev/null; then
+  echo "Focus boot security is already configured in $CUSTOM. Remove it first to rotate the password." >&2
+  exit 1
+fi
+
+echo "Set a GRUB password. This password is separate from your Linux login password."
+echo "Without it, menu entries, recovery mode, and GRUB editing will be unavailable."
+HASH_OUTPUT=$(grub-mkpasswd-pbkdf2 2>&1) || exit 1
+HASH=$(printf '%s\n' "$HASH_OUTPUT" | sed -n 's/^PBKDF2 hash of your password is \(.*\)$/\1/p' | tail -n1)
+unset HASH_OUTPUT
+if [[ ! "$HASH" =~ ^grub\.pbkdf2\.sha512\.[A-Za-z0-9./=]+$ ]]; then
+  echo "Could not read the generated GRUB password hash; no configuration was changed." >&2
+  exit 1
+fi
+
+STAMP=$(date +%Y%m%d%H%M%S)
+cp -a "$CUSTOM" "$CUSTOM.focus-reminder-backup-$STAMP" 2>/dev/null || true
+cp -a "$DEFAULTS" "$DEFAULTS.focus-reminder-backup-$STAMP"
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+cat > "$TMP" <<EOF
+$MARKER
+set superusers="focusadmin"
+password_pbkdf2 focusadmin $HASH
+# END focus-reminder boot security
+EOF
+cat "$TMP" >> "$CUSTOM"
+
+if grep -q '^GRUB_DISABLE_RECOVERY=' "$DEFAULTS"; then
+  sed -i 's/^GRUB_DISABLE_RECOVERY=.*/GRUB_DISABLE_RECOVERY="true"/' "$DEFAULTS"
+else
+  printf '\nGRUB_DISABLE_RECOVERY="true"\n' >> "$DEFAULTS"
+fi
+
+if ! update-grub; then
+  cp -a "$CUSTOM.focus-reminder-backup-$STAMP" "$CUSTOM"
+  cp -a "$DEFAULTS.focus-reminder-backup-$STAMP" "$DEFAULTS"
+  update-grub >/dev/null 2>&1 || true
+  echo "update-grub failed; the original GRUB configuration was restored." >&2
+  exit 1
+fi
+chmod 755 "$CUSTOM"
+echo "Boot menu protection configured. Keep the GRUB password safe and verify it at the next planned reboot."
+echo "Backups: $CUSTOM.focus-reminder-backup-$STAMP and $DEFAULTS.focus-reminder-backup-$STAMP"

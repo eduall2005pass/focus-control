@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Focus Reminder Tray
+Comment=Show the Focus Reminder menu in the GNOME top panel
+Exec=/usr/local/bin/focus-tray-start.sh
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-Phase=Application
+X-GNOME-Autostart-enabled=true

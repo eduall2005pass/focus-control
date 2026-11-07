@@ -1,0 +1,20 @@
+[Unit]
+Description=Focus Reminder — Boot-time Suspension Enforcer (system)
+Documentation=man:focus-reminder
+# Start as soon as basic system is up — before any user logs in.
+After=systemd-user-sessions.service
+Before=display-manager.service
+Wants=systemd-user-sessions.service
+
+[Service]
+Type=simple
+# Restore a saved lockout before the display manager is allowed to start.
+ExecStartPre=/usr/local/bin/focus-boot-enforce.sh --restore
+ExecStart=/usr/local/bin/focus-boot-enforce.sh
+Restart=always
+RestartSec=3
+# Keep running even when no suspension is active (guards against future suspensions)
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

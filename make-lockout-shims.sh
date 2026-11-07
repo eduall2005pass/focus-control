@@ -6,7 +6,7 @@
 #   refusal during suspension.
 # Usage: sudo ./make-lockout-shims.sh   (run from anywhere; uses $SUDO_USER)
 set -e
-NAMES="chrome chromium chromium-browser firefox brave brave-browser msedge opera vivaldi gnome-terminal gnome-terminal-server xterm konsole alacritty kitty tilix terminator wezterm opencode claude gemini aichat tgpt sgpt codex cursor-agent aider ollama kilo cline cursor copilot agy"
+NAMES="chrome google-chrome google-chrome-stable chromium chromium-browser ungoogled-chromium firefox firefox-esr brave brave-browser msedge microsoft-edge opera vivaldi torbrowser tor-browser zen floorp librewolf waterfox epiphany qutebrowser falkon midori gnome-terminal gnome-terminal-server xterm konsole alacritty kitty tilix terminator wezterm opencode claude gemini aichat tgpt sgpt codex cursor-agent aider ollama kilo cline cursor copilot agy windsurf trae amazon-q roocode continue goose goose-cli openhands crush amp devin cody tabby junie kiro antigravity"
 
 make_shim() {
   local dest="$1" real="$2"

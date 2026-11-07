@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Focus Reminder Env
+Comment=Start Focus Reminder after the graphical display is ready
+Exec=/usr/local/bin/focus-session-start.sh
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,15 @@
+#!/bin/sh
+# Unconditionally clear immutable flag so dpkg can overwrite files smoothly
+for path in \
+    /opt/focus-reminder/focus-reminder.py \
+    /etc/systemd/user/focus-reminder.service \
+    /etc/systemd/user/focus-tray.service \
+    /etc/systemd/system/focus-boot-enforce.service \
+    /usr/local/bin/focus-boot-enforce.sh \
+    /usr/local/bin/focus-pam-lock.sh \
+    /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service \
+    /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service \
+    /usr/share/applications/focus-reminder.desktop; do
+    chattr -i "$path" 2>/dev/null || true
+done
+exit 0

@@ -4,8 +4,8 @@
 # states, keyboard support, confirmation for destructive actions.
 # - Every 10 min: fullscreen system-wide alert (SKIPPED while ChatGPT/Gemini in use)
 # - OpenCode/browser running -> alert MUST appear
-# - Actions: Back to Work (primary) / Snooze 10 (secondary) /
-#            Suspend Device 30 (secondary, lockout) / Power Off (destructive, confirm)
+# - Actions: Back to Work (primary) / Goal / Emergency Lockout / Study /
+#            Power Off (destructive, confirm)
 # Auto-started via systemd user service + autostart desktop file.
 
 import atexit
@@ -17,11 +17,13 @@ import hashlib
 import html
 import hmac
 import json
+import math
 import os
 import re
 import secrets
 import shutil
 import signal
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -47,7 +49,7 @@ try:
 except Exception:  # WebKit not available -> study view disabled, app still runs
     WebKit2 = None
 
-FOCUS_VERSION = "1.0.8"
+FOCUS_VERSION = "2.0.26"
 
 FOCUS_MINUTES = 10
 SUSPEND_MINUTES = 30
@@ -372,6 +374,12 @@ def lock_session():
 
 suspend_until = 0
 SUSPEND_STATE = os.path.join(LEDGER_DIR, "suspend.state")
+PAM_LOCK_FLAG = os.path.join(LEDGER_DIR, "pam-lock-requested")
+SHELL_LOCKOUT_FLAG = os.path.join(LEDGER_DIR, "shell-lockout-active")
+GTK_LOCKOUT_READY = os.path.join(LEDGER_DIR, "gtk-lockout-ready")
+STUDY_ACTIVE_FLAG = os.path.join(LEDGER_DIR, "study-active.flag")
+STUDY_SUSPEND_STATE = os.path.join(LEDGER_DIR, "study-suspended.state")
+STUDY_VIOLATIONS_STATE = os.path.join(LEDGER_DIR, "study-violations.json")
 NEXT_ALERT_STATE = os.path.join(LEDGER_DIR, "next-alert.state")
 
 
@@ -403,12 +411,99 @@ def _atomic_write(path, content):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        dir_fd = os.open(LEDGER_DIR, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except Exception:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+
+
+def _get_study_suspended_until():
+    try:
+        if os.path.isfile(STUDY_SUSPEND_STATE):
+            with open(STUDY_SUSPEND_STATE) as f:
+                ts = float(f.read().strip())
+            return ts if ts > time.time() else 0.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _is_study_suspended():
+    until = _get_study_suspended_until()
+    if until > time.time():
+        return True
+    if until > 0:
+        try:
+            os.remove(STUDY_SUSPEND_STATE)
+        except OSError:
+            pass
+    return False
+
+
+_last_violation_recorded = 0.0
+_study_block_count_updater = None
+
+
+def _record_input_violation():
+    global _last_violation_recorded
+    now = time.time()
+    if now - _last_violation_recorded < 0.5:
+        return _get_recent_violation_count(), False
+    _last_violation_recorded = now
+    recent = []
+    try:
+        if os.path.isfile(STUDY_VIOLATIONS_STATE):
+            with open(STUDY_VIOLATIONS_STATE) as f:
+                recent = [float(t) for t in json.load(f) if now - float(t) <= 300.0]
+    except Exception:
+        recent = []
+    recent.append(now)
+    try:
+        os.makedirs(LEDGER_DIR, exist_ok=True)
+        _atomic_write(STUDY_VIOLATIONS_STATE, json.dumps(recent))
+    except Exception as e:
+        print(f"violations write error: {e}", flush=True)
+    count = len(recent)
+    if count >= 10:
+        suspend_deadline = now + 30 * 60
+        try:
+            _atomic_write(STUDY_SUSPEND_STATE, str(float(suspend_deadline)))
+        except Exception as e:
+            print(f"study suspend write error: {e}", flush=True)
+        current_lockout = _load_suspend_state()
+        if current_lockout < suspend_deadline:
+            _save_suspend_state(suspend_deadline, mode="active")
+            _begin_lockout_schedule(30)
+        return count, True
+    return count, False
+
+
+def _get_recent_violation_count():
+    now = time.time()
+    try:
+        if os.path.isfile(STUDY_VIOLATIONS_STATE):
+            with open(STUDY_VIOLATIONS_STATE) as f:
+                return len([float(t) for t in json.load(f) if now - float(t) <= 300.0])
+    except Exception:
+        pass
+    return 0
+
+
+def _trigger_study_suspension():
+    global _study_win
+    notify("Study Mode suspended for 30 minutes due to 10 blocked keywords.")
+    if _study_win is not None:
+        try:
+            _study_win.destroy()
+        except Exception:
+            pass
 
 
 def _save_suspend_state(ts, mode="active"):
@@ -443,12 +538,7 @@ def _load_suspend_state():
 
 
 def _restore_suspend_checkpoint():
-    """Return the lockout deadline after boot or power loss (wall clock).
-
-    Power-off time counts toward the lockout, so rebooting, logging out or
-    powering off cannot buy a usable-desktop window. The checkpoint is only
-    a fallback when the absolute deadline file is missing.
-    """
+    """Return the persisted deadline; boot recovery pauses its remaining time."""
     end = _load_suspend_state()
     if end <= 0:
         try:
@@ -459,6 +549,20 @@ def _restore_suspend_checkpoint():
         except Exception:
             end = 0
     return end
+
+
+def _consume_pam_lock_flag():
+    """Consume the login-time end timestamp written by focus-pam-lock.sh."""
+    try:
+        with open(PAM_LOCK_FLAG) as f:
+            end_ts = float(f.read().strip())
+    except Exception:
+        return 0
+    try:
+        os.remove(PAM_LOCK_FLAG)
+    except OSError:
+        pass  # root may own the PAM-created flag directory
+    return end_ts
 
 
 def _clear_suspend_state():
@@ -522,21 +626,32 @@ def _begin_lockout_schedule(minutes):
 
 def enforce_suspension_until(end_ts):
     """Non-skippable: re-enforce after reboot/poweroff until countdown ends."""
-    # Lock immediately, before the countdown window is up, so there is no
-    # usable-desktop gap right after power-on.
-    lock_session()
-    while time.time() < _load_suspend_state():
-        if not _has_display():
-            time.sleep(10)
+    end_ts = max(float(end_ts or 0), _load_suspend_state())
+    if end_ts > _load_suspend_state():
+        # PAM and the system boot service may have recovered the deadline from
+        # different durable markers. Persist the later one before showing UI.
+        _save_suspend_state(end_ts, mode="active")
+    # The login session must be running before GTK can create the lockout
+    # window. Keep the custom fullscreen lockout in front instead of invoking
+    # the separate GNOME lock screen, which can cover the countdown window.
+    while time.time() < end_ts:
+        saved_end = _load_suspend_state()
+        if saved_end > end_ts:
+            end_ts = saved_end
+        if not _has_display() or not _gtk_display_ready():
+            time.sleep(0.5)
             continue
         try:
-            show_lockout_window((_load_suspend_state() - time.time()) / 60)
-            if time.time() < _load_suspend_state():
+            show_lockout_window((end_ts - time.time()) / 60)
+            saved_end = _load_suspend_state()
+            if saved_end > end_ts:
+                end_ts = saved_end
+            if time.time() < end_ts:
                 continue
             break  # returns only when timer ends (Power Off reboots -> state persists)
         except Exception as e:
             print(f"lockout enforce retry: {e}", flush=True)
-            time.sleep(15)
+            time.sleep(1)
     _clear_suspend_state()
     _clear_lockout_schedule()
 
@@ -560,17 +675,66 @@ def do_pseudo_lockout(minutes=SUSPEND_MINUTES, label="Focus lockout"):
     notify(f"{label} for {_fmt_short(minutes * 60)}. Device stays on and locked.")
     print(f"{label}: {minutes} min (no sleep) until "
           f"{time.strftime('%H:%M', time.localtime(end))}.", flush=True)
+    _shell_saved = _gnome_lockdown()
+    _sigs = _lockout_exe_signatures()
+    _lockout_proc_sweep(_sigs)
     try:
-        show_lockout_window(minutes, pseudo=True)
+        # Check if GNOME Shell overlay is immediately active
+        deadline = time.monotonic() + 0.4
+        while time.time() < end and time.monotonic() < deadline \
+                and not _shell_overlay_active():
+            _lockout_proc_sweep(_sigs)
+            time.sleep(0.05)
+        if _shell_overlay_active():
+            while time.time() < end and _shell_overlay_active():
+                _lockout_proc_sweep(_sigs)
+                time.sleep(0.5)
+            if time.time() < end:
+                show_lockout_window(max(0.01, (end - time.time()) / 60), pseudo=True)
+        else:
+            show_lockout_window(minutes, pseudo=True)
     except Exception as e:
         print(f"pseudo lockout window error: {e}", flush=True)
     finally:
+        _gnome_restore(_shell_saved)
         # Only clear if our own deadline is over (power-off keeps it for restart).
         if _load_suspend_state() <= time.time():
             suspend_until = 0
             _clear_suspend_state()
             _clear_lockout_schedule()
     print("Pseudo lockout ended — normal reminders resumed.", flush=True)
+
+
+def _shell_overlay_active():
+    try:
+        return time.time() - os.path.getmtime(SHELL_LOCKOUT_FLAG) <= 5
+    except OSError:
+        return False
+
+
+_startup_ready_sent = False
+
+
+def _systemd_startup_ready():
+    """Release GNOME startup only after the lockout window has been shown."""
+    global _startup_ready_sent
+    if _startup_ready_sent:
+        return
+    notify_socket = os.environ.get("NOTIFY_SOCKET")
+    if not notify_socket:
+        return
+    try:
+        address = ("\0" + notify_socket[1:]
+                   if notify_socket.startswith("@") else notify_socket)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            sock.connect(address)
+            sock.sendall(b"READY=1\nSTATUS=Focus Reminder ready")
+        finally:
+            sock.close()
+        _startup_ready_sent = True
+    except Exception as e:
+        print(f"systemd startup notification error: {e}", flush=True)
 
 
 def power_off():
@@ -625,25 +789,67 @@ BROWSER_APP_SET = {s.lower() for s in BROWSER_PROCS.split("|")}
 
 
 def _has_display():
-    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
-        return True
     # Service may have started before graphical session — try importing
     # DISPLAY / WAYLAND_DISPLAY from the systemd user environment manager.
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        try:
+            out = subprocess.check_output(
+                ["systemctl", "--user", "show-environment"],
+                timeout=5, text=True, stderr=subprocess.DEVNULL,
+            )
+            for line in out.splitlines():
+                if line.startswith("DISPLAY="):
+                    os.environ["DISPLAY"] = line.split("=", 1)[1]
+                elif line.startswith("WAYLAND_DISPLAY="):
+                    os.environ["WAYLAND_DISPLAY"] = line.split("=", 1)[1]
+                elif line.startswith("XAUTHORITY="):
+                    os.environ.setdefault("XAUTHORITY", line.split("=", 1)[1])
+                elif line.startswith("XDG_RUNTIME_DIR="):
+                    os.environ.setdefault("XDG_RUNTIME_DIR", line.split("=", 1)[1])
+        except Exception:
+            pass
+
+    wayland = os.environ.get("WAYLAND_DISPLAY")
+    if wayland:
+        wayland_path = (wayland if os.path.isabs(wayland) else
+                        os.path.join(os.environ.get("XDG_RUNTIME_DIR", ""), wayland))
+        try:
+            if stat.S_ISSOCK(os.stat(wayland_path).st_mode):
+                return True
+        except OSError:
+            pass
+
+    display = os.environ.get("DISPLAY", "")
+    if display:
+        # Local X11/Xwayland displays are usable only after their socket exists.
+        # Remote DISPLAY values have no local socket and keep their old behavior.
+        local_display = display
+        if local_display.startswith("unix:"):
+            local_display = local_display[5:]
+        if local_display.startswith(":"):
+            number = local_display[1:].split(".", 1)[0]
+            if number.isdigit():
+                try:
+                    return stat.S_ISSOCK(os.stat(f"/tmp/.X11-unix/X{number}").st_mode)
+                except OSError:
+                    return False
+        else:
+            return True
+    return False
+
+
+def _gtk_display_ready():
+    """Initialize GTK only when the imported graphical session is usable."""
     try:
-        out = subprocess.check_output(
-            ["systemctl", "--user", "show-environment"],
-            timeout=5, text=True, stderr=subprocess.DEVNULL,
-        )
-        for line in out.splitlines():
-            if line.startswith("DISPLAY="):
-                os.environ["DISPLAY"] = line.split("=", 1)[1]
-            elif line.startswith("WAYLAND_DISPLAY="):
-                os.environ["WAYLAND_DISPLAY"] = line.split("=", 1)[1]
-            elif line.startswith("XAUTHORITY="):
-                os.environ.setdefault("XAUTHORITY", line.split("=", 1)[1])
+        result = Gtk.init_check([])
+        return bool(result[0] if isinstance(result, tuple) else result)
+    except TypeError:
+        try:
+            return bool(Gtk.init_check())
+        except Exception:
+            return Gdk.Display.get_default() is not None
     except Exception:
-        pass
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        return Gdk.Display.get_default() is not None
 
 
 def _idle_ms():
@@ -1016,6 +1222,14 @@ def _gnome_lockdown():
             _run(["gsettings", "set", schema, key, locked_val], timeout=10)
         except Exception as e:
             print(f"lockdown set {schema} {key}: {e}", flush=True)
+    try:
+        _run(["gnome-extensions", "disable", "ubuntu-dock@ubuntu.com"], timeout=5)
+    except Exception:
+        pass
+    try:
+        _run(["gnome-extensions", "disable", "ding@rastersoft.com"], timeout=5)
+    except Exception:
+        pass
     return saved
 
 
@@ -1025,6 +1239,14 @@ def _gnome_restore(saved):
             _run(["gsettings", "set", schema, key, raw], timeout=10)
         except Exception as e:
             print(f"lockdown restore {schema} {key}: {e}", flush=True)
+    try:
+        _run(["gnome-extensions", "enable", "ubuntu-dock@ubuntu.com"], timeout=5)
+    except Exception:
+        pass
+    try:
+        _run(["gnome-extensions", "enable", "ding@rastersoft.com"], timeout=5)
+    except Exception:
+        pass
 
 
 def _gnome_heal():
@@ -1051,19 +1273,34 @@ def _gnome_heal():
                 print(f"self-heal: restored {schema} {key}", flush=True)
             except Exception as e:
                 print(f"self-heal failed {schema} {key}: {e}", flush=True)
+    try:
+        _run(["gnome-extensions", "enable", "ubuntu-dock@ubuntu.com"], timeout=5)
+    except Exception:
+        pass
+    try:
+        _run(["gnome-extensions", "enable", "ding@rastersoft.com"], timeout=5)
+    except Exception:
+        pass
 
 
 # Binaries that must not run while the device is suspended (browsers, which can
 # open anything incl. AI agents; terminals/VT-launched shells; AI CLIs).
 # Matched by exact basename of argv[0] — never by substring, never self.
 LOCKOUT_PROC_DENY = frozenset({
-    "chrome", "chromium", "chromium-browser", "firefox", "brave",
-    "brave-browser", "msedge", "opera", "vivaldi",
+    "chrome", "google-chrome", "google-chrome-stable", "chromium",
+    "chromium-browser", "ungoogled-chromium", "firefox", "firefox-esr",
+    "brave", "brave-browser", "msedge", "microsoft-edge", "opera",
+    "vivaldi", "torbrowser", "tor-browser", "zen", "floorp",
+    "librewolf", "waterfox", "epiphany", "qutebrowser", "falkon",
+    "midori",
     "gnome-terminal", "gnome-terminal-server", "xterm", "konsole",
     "alacritty", "kitty", "tilix", "terminator", "wezterm",
     "opencode", "claude", "gemini", "aichat", "tgpt", "sgpt",
-    "codex", "cursor-agent", "aider", "ollama",
-    "kilo", "cline", "cursor", "copilot", "agy",
+    "codex", "cursor-agent", "aider", "ollama", "kilo", "cline",
+    "cursor", "copilot", "agy", "windsurf", "trae", "amazon-q",
+    "roocode", "continue", "goose", "goose-cli",
+    "openhands", "crush", "amp", "devin", "cody", "tabby",
+    "junie", "kiro", "antigravity",
 })
 
 
@@ -1105,7 +1342,7 @@ def _lockout_exe_signatures():
 def _exe_matches(exe, st, sigs):
     """True if a /proc/PID/exe target is a denylisted binary in any disguise."""
     try:
-        if os.path.basename(exe.split(" (deleted)")[0]) in LOCKOUT_PROC_DENY:
+        if os.path.basename(exe.split(" (deleted)")[0]).lower() in LOCKOUT_PROC_DENY:
             return True
         if (st.st_dev, st.st_ino) in sigs["inos"]:
             return True
@@ -1513,13 +1750,24 @@ def show_typing_test(parent=None):
                 status_lbl.set_text("Nothing saved — type something first.")
             except Exception:
                 pass
+    def _back_to_lockout():
+        if _typing_parent is not None:
+            try:
+                _typing_parent.show()
+                _typing_parent.present()
+                while Gtk.events_pending():
+                    Gtk.main_iteration_do(False)
+            except Exception:
+                pass
+        win.destroy()
+
     save_btn.connect("clicked", _save)
-    back_btn.connect("clicked", lambda *_: win.destroy())  # destroy, NOT close
+    back_btn.connect("clicked", lambda *_: _back_to_lockout())
 
     def _on_key(_w, ev):
         try:
             if ev is not None and ev.keyval == Gdk.KEY_Escape:
-                win.destroy()  # destroy, NOT close
+                _back_to_lockout()
                 return True
         except Exception:
             pass
@@ -1534,10 +1782,19 @@ def show_typing_test(parent=None):
     outer.pack_start(row, False, False, 0)
     win.add(outer)
 
+    _tsigs = _lockout_exe_signatures()
+    _lockout_proc_sweep(_tsigs)
+    _tsweep = GLib.timeout_add_seconds(
+        1, lambda: (_lockout_proc_sweep(_tsigs), True)[1])
+
     def _on_typing_destroy(*_):
         global _typing_win, _typing_view, _typing_parent
         try:
             GLib.source_remove(_tguard)
+        except Exception:
+            pass
+        try:
+            GLib.source_remove(_tsweep)
         except Exception:
             pass
         auto = _typing_auto_closing
@@ -1702,8 +1959,8 @@ def _tray_show_reminder():
     print(f"tray reminder action={action}", flush=True)
     if action == "suspend":
         do_suspend(_take_chosen_minutes())
-    elif action == "lockout":
-        do_pseudo_lockout(SUSPEND_MINUTES)
+    elif action == "study":
+        show_study_window()
     elif action == "poweroff":
         power_off()
     elif action == "goal":
@@ -1736,20 +1993,6 @@ def build_tray_menu():
     lock_item = Gtk.MenuItem(label="\U0001F512  Focus Lockout 30 min (no sleep)")
     lock_item.connect("activate", lambda *_: do_pseudo_lockout(SUSPEND_MINUTES))
     menu.append(lock_item)
-    setup_item = Gtk.MenuItem(label="Telegram setup mode (15 min)")
-    if setup_mode_active():
-        setup_item.set_label("Telegram setup mode: ON \u2014 click to stop")
-
-    def _toggle_setup(*_):
-        if setup_mode_active():
-            disable_setup_mode()
-            setup_item.set_label("Telegram setup mode (15 min)")
-        else:
-            enable_setup_mode()
-            setup_item.set_label("Telegram setup mode: ON \u2014 click to stop")
-
-    setup_item.connect("activate", _toggle_setup)
-    menu.append(setup_item)
     menu.append(Gtk.SeparatorMenuItem())
     def _waste_text():
         try:
@@ -1770,6 +2013,7 @@ def build_tray_menu():
 
     menu.connect("show", lambda *_: _refresh_waste())  # refresh on every open
     GLib.timeout_add_seconds(30, _refresh_waste)  # + live refresh every 30s
+    _item("📚  Study Mode", show_study_window)
     _item("Show Reminder Now", _tray_show_reminder)
     # NOTE: no Quit item by design — the tray stays persistent (see xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service).
     menu.show_all()
@@ -1779,9 +2023,9 @@ def build_tray_menu():
 def tray_loop():
     """Top-bar tray ONLY (persistent, no quit, no separate button).
     Waits for the AppIndicator package instead of falling back."""
-    while not _has_display():
-        print("Tray waiting for display…", flush=True)
-        time.sleep(15)
+    while not _has_display() or not _gtk_display_ready():
+        print("Tray waiting for a usable graphical display…", flush=True)
+        time.sleep(3)
     _AI = None
     while True:
         if _AI is None:
@@ -1965,7 +2209,7 @@ def show_goal_manager():
 
 
 def show_alert():
-    """Fullscreen alert. Returns: close | goal | suspend | poweroff."""
+    """Fullscreen alert. Returns: close | goal | suspend | study | poweroff."""
     result = {"action": "close", "done": False, "tick": None}
 
     def _stop_tick():
@@ -2053,26 +2297,32 @@ def show_alert():
     suspend_btn.set_tooltip_text(
         "Start an emergency lockout for minutes, hours or days. Screen stays on; password required.")
     suspend_btn.connect("clicked", choose("emergency"))
-    lock_btn = Gtk.Button(label="\U0001F512  Lock 30")
-    lock_btn.get_style_context().add_class("btn-secondary")
-    lock_btn.set_size_request(135, 48)
-    lock_btn.set_tooltip_text("Focus lockout for 30 min — device stays ON but locked. Cannot be skipped.")
-    lock_btn.connect("clicked", choose("lockout"))
+    study_btn = Gtk.Button(label="\U0001F4DA  Study")
+    study_btn.get_style_context().add_class("btn-secondary")
+    study_btn.set_size_request(135, 48)
+    study_btn.set_tooltip_text("Open Study mode without starting a device lockout.")
+    study_btn.connect("clicked", choose("study"))
+    if _is_study_suspended():
+        until = _get_study_suspended_until()
+        rem_m = max(1, int(math.ceil((until - time.time()) / 60.0)))
+        study_btn.set_sensitive(False)
+        study_btn.set_label(f"📚 Study Suspended ({rem_m}m)")
+        study_btn.set_tooltip_text(f"Study Mode is suspended due to blocked keywords. Available in {rem_m}m.")
     power_btn = Gtk.Button(label="\u23fb  Power Off")
     power_btn.get_style_context().add_class("btn-danger")
     power_btn.set_size_request(125, 48)
     power_btn.set_tooltip_text("Shut down this machine. Requires confirmation.")
     power_btn.connect("clicked", choose("poweroff"))
-    for b in (close_btn, goal_btn, suspend_btn, lock_btn, power_btn):
+    for b in (close_btn, goal_btn, suspend_btn, study_btn, power_btn):
         row_all.pack_start(b, False, False, 0)
 
-    hint = Gtk.Label(label="Emergency Lockout keeps this device on and countdown-locked. "
-                           "Lock 30 starts a fixed 30-minute lockout. Power Off asks for confirmation first.")
+    hint = Gtk.Label(label="Study opens study links and your PDF library without locking this device. "
+                           "Emergency Lockout keeps this device on and countdown-locked.")
     hint.get_style_context().add_class("caption")
     hint.set_halign(Gtk.Align.CENTER)
     hint.set_line_wrap(True)
 
-    buttons.extend([close_btn, goal_btn, suspend_btn, lock_btn, power_btn])
+    buttons.extend([close_btn, goal_btn, suspend_btn, study_btn, power_btn])
 
     for w in (_accent(), topbadges, title):
         card.pack_start(w, False, False, 0)
@@ -2130,6 +2380,333 @@ def show_alert():
         pass
     Gtk.main()
     return result["action"]
+
+
+def _build_network_panel(parent_win=None, toast_fn=None):
+    toast = toast_fn or (lambda msg: notify(msg))
+    network_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
+    network_panel.set_size_request(340, 360)
+    network_panel.get_style_context().add_class("netpanel")
+    net_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    net_title = Gtk.Label(label="WI-FI NETWORKS")
+    net_title.get_style_context().add_class("nettitle")
+    net_title.set_halign(Gtk.Align.START)
+    net_title.set_hexpand(True)
+    net_refresh = Gtk.Button(label="↻  Scan")
+    net_refresh.get_style_context().add_class("webnavbtn")
+    net_header.pack_start(net_title, True, True, 0)
+    net_header.pack_end(net_refresh, False, False, 0)
+    network_panel.pack_start(net_header, False, False, 0)
+
+    net_status = Gtk.Label(label="Ready to scan")
+    net_status.get_style_context().add_class("netstatus")
+    net_status.set_halign(Gtk.Align.START)
+    net_status.set_line_wrap(True)
+    network_panel.pack_start(net_status, False, False, 0)
+    net_wifi_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    net_wifi_text = Gtk.Label(label="Wi-Fi")
+    net_wifi_text.get_style_context().add_class("netrowname")
+    net_wifi_text.set_halign(Gtk.Align.START)
+    net_wifi_text.set_hexpand(True)
+    net_wifi_switch = Gtk.Switch()
+    net_wifi_row.pack_start(net_wifi_text, True, True, 0)
+    net_wifi_row.pack_end(net_wifi_switch, False, False, 0)
+    network_panel.pack_start(net_wifi_row, False, False, 0)
+    net_disconnect = Gtk.Button(label="Disconnect")
+    net_disconnect.get_style_context().add_class("webnavbtn")
+    net_disconnect.set_halign(Gtk.Align.START)
+    net_disconnect.set_sensitive(False)
+    network_panel.pack_start(net_disconnect, False, False, 0)
+    network_panel.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
+                             False, False, 0)
+    net_scroll = Gtk.ScrolledWindow()
+    net_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    net_scroll.set_min_content_height(180)
+    net_scroll.set_vexpand(True)
+    net_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+    net_scroll.add(net_list)
+    network_panel.pack_start(net_scroll, True, True, 0)
+
+    net_state = {"updating": False, "active": None, "device": None}
+
+    def _net_fields(line):
+        fields, value, escaped = [], [], False
+        for char in line:
+            if escaped:
+                value.append({"n": "\n", "r": "\r", "t": "\t"}.get(char, char))
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == ":":
+                fields.append("".join(value))
+                value = []
+            else:
+                value.append(char)
+        fields.append("".join(value))
+        return fields
+
+    def _net_clear():
+        for child in net_list.get_children():
+            net_list.remove(child)
+
+    def _net_message(message):
+        label = Gtk.Label(label=message)
+        label.get_style_context().add_class("netstatus")
+        label.set_halign(Gtk.Align.START)
+        label.set_line_wrap(True)
+        net_list.pack_start(label, False, False, 5)
+
+    def _net_scan_done(enabled, active, device, entries, error):
+        net_refresh.set_sensitive(True)
+        net_wifi_switch.set_sensitive(True)
+        if enabled is not None:
+            net_state["updating"] = True
+            net_wifi_switch.set_active(enabled)
+            net_state["updating"] = False
+        net_state["active"], net_state["device"] = active, device
+        net_disconnect.set_sensitive(bool(active and device))
+        net_status.set_text(error or (f"Connected to {active}" if active else
+                                      ("Choose a network to connect" if enabled else "Wi-Fi is off")))
+        _net_clear()
+        if error:
+            _net_message(error)
+        elif enabled and not entries:
+            _net_message("No networks found yet. Keep this panel open and tap Scan again.")
+        elif not enabled:
+            _net_message("Turn on Wi-Fi to scan for networks.")
+        else:
+            for ssid, security, signal, connected, saved_profile in entries:
+                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                row.get_style_context().add_class("netrow")
+                info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+                title = Gtk.Label(label=ssid)
+                title.set_xalign(0)
+                title.set_ellipsize(Pango.EllipsizeMode.END)
+                title.get_style_context().add_class("netrowname")
+                kind = "Secured" if security and security not in ("--", "") else "Open"
+                detail_text = ("Saved Wi-Fi profile" if saved_profile else
+                               f"{kind} · Signal {signal}%")
+                detail = Gtk.Label(label=detail_text)
+                detail.set_xalign(0)
+                detail.get_style_context().add_class("netmeta")
+                info.pack_start(title, False, False, 0)
+                info.pack_start(detail, False, False, 0)
+                info.set_hexpand(True)
+                row.pack_start(info, True, True, 0)
+                action = Gtk.Button(label="Connected" if connected else "Connect")
+                action.get_style_context().add_class("webnavbtn")
+                action.set_sensitive(not connected)
+                action.connect("clicked", lambda _b, s=ssid, sec=security, saved=saved_profile:
+                               _net_connect(s, sec, saved_profile=saved))
+                row.pack_end(action, False, False, 0)
+                net_list.pack_start(row, False, False, 0)
+        net_list.show_all()
+        return False
+
+    def _net_scan(*_):
+        net_refresh.set_sensitive(False)
+        net_status.set_text("Scanning nearby networks…")
+        _net_clear()
+        _net_message("Scanning…")
+        net_list.show_all()
+
+        def _work():
+            try:
+                scan_error_message = None
+                radio = _run(["nmcli", "-t", "radio", "wifi"],
+                             capture_output=True, text=True, timeout=8)
+                if radio.returncode:
+                    raise RuntimeError((radio.stderr or "NetworkManager is unavailable").strip())
+                enabled = (radio.stdout or "").strip().lower() == "enabled"
+                device, active = None, None
+                devs = _run(["nmcli", "-t", "-f", "DEVICE,TYPE", "device", "status"],
+                            capture_output=True, text=True, timeout=8)
+                if devs.returncode == 0:
+                    for line in (devs.stdout or "").splitlines():
+                        fields = _net_fields(line)
+                        if len(fields) > 1 and fields[1] in ("wifi", "802-11-wireless"):
+                            device = fields[0]
+                            break
+                conns = _run(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE",
+                              "connection", "show", "--active"],
+                             capture_output=True, text=True, timeout=8)
+                if conns.returncode == 0:
+                    for line in (conns.stdout or "").splitlines():
+                        fields = _net_fields(line)
+                        if len(fields) >= 3 and fields[1] in ("wifi", "802-11-wireless"):
+                            active, device = fields[0], fields[2]
+                            break
+                entries = []
+                if enabled:
+                    fields = "IN-USE,SSID,SECURITY,SIGNAL"
+
+                    def _read_wifi_list(command):
+                        result = _run(command, capture_output=True, text=True, timeout=20)
+                        if result.returncode:
+                            return [], (result.stderr or result.stdout or
+                                        "Could not list Wi-Fi networks").strip()
+                        best = {}
+                        for line in (result.stdout or "").splitlines():
+                            row = _net_fields(line)
+                            if len(row) < 4 or not row[1].strip():
+                                continue
+                            in_use, ssid, security, strength_text = row[:4]
+                            try:
+                                strength = int(strength_text)
+                            except ValueError:
+                                strength = 0
+                            key = (ssid, security)
+                            used = in_use.strip() == "*"
+                            if key not in best or strength > best[key][2] or used:
+                                best[key] = (ssid, security, strength, used, False)
+                        found = sorted(best.values(), key=lambda item: (
+                            not item[3], -item[2], item[0].casefold()))
+                        return found, None
+
+                    base = ["nmcli", "-t", "--escape", "yes", "-f", fields,
+                            "device", "wifi", "list", "--rescan", "yes"]
+                    listing_command = base + (["ifname", device] if device else [])
+                    entries, scan_error = _read_wifi_list(listing_command)
+                    if not entries:
+                        fallback_commands = [base]
+                        if device:
+                            fallback_commands.append(base + ["ifname", device])
+                        fallback_commands.append([
+                            "nmcli", "-t", "--escape", "yes", "-f", fields,
+                            "device", "wifi", "list", "--rescan", "no"])
+                        last_error = scan_error
+                        for command in fallback_commands:
+                            entries, fallback_error = _read_wifi_list(command)
+                            if entries:
+                                break
+                            last_error = fallback_error or last_error
+                    saved_result = _run(
+                        ["nmcli", "-t", "--escape", "yes", "-f", "NAME,TYPE",
+                         "connection", "show"], capture_output=True, text=True,
+                        timeout=10)
+                    if saved_result.returncode == 0:
+                        present = {item[0] for item in entries}
+                        for line in (saved_result.stdout or "").splitlines():
+                            fields = _net_fields(line)
+                            if (len(fields) >= 2
+                                    and fields[1] in ("802-11-wireless", "wifi")
+                                    and fields[0] not in present):
+                                entries.append((fields[0], "saved", None,
+                                                fields[0] == active, True))
+                                present.add(fields[0])
+                    if not entries and scan_error and last_error:
+                        print(f"Wi-Fi scan detail: {last_error}", flush=True)
+                        scan_error_message = last_error
+                GLib.idle_add(_net_scan_done, enabled, active, device, entries,
+                              scan_error_message)
+            except Exception as exc:
+                print(f"Wi-Fi scan failed: {exc}", flush=True)
+                GLib.idle_add(_net_scan_done, None, None, None, [], str(exc))
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _net_operation(args, input_text=None, message="Network updated"):
+        net_refresh.set_sensitive(False)
+        net_wifi_switch.set_sensitive(False)
+        net_status.set_text("Updating network…")
+
+        def _work():
+            try:
+                result = _run(["nmcli", *args], input=input_text,
+                              capture_output=True, text=True, timeout=35)
+                error = None if result.returncode == 0 else (
+                    result.stderr or result.stdout or "Network operation failed").strip()
+            except Exception as exc:
+                error = str(exc)
+            def _finish():
+                if error:
+                    net_status.set_text(error)
+                    toast(f"Network: {error}")
+                else:
+                    toast(message)
+                _net_scan()
+                return False
+            GLib.idle_add(_finish)
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _net_connect(ssid, security, saved_profile=False):
+        if saved_profile:
+            _net_operation(["--wait", "25", "connection", "up", "id", ssid],
+                           message=f"Connected to {ssid}")
+            return
+        secured = bool(security and security not in ("--", ""))
+        password = None
+        if secured:
+            dialog = Gtk.Dialog(title=f"Connect to {ssid}", transient_for=parent_win, modal=True)
+            dialog.set_default_size(340, -1)
+            area = dialog.get_content_area()
+            area.set_spacing(10)
+            area.set_margin_top(16); area.set_margin_bottom(12)
+            area.set_margin_start(18); area.set_margin_end(18)
+            prompt = Gtk.Label(label=f"Enter the Wi-Fi password for {ssid}")
+            prompt.set_halign(Gtk.Align.START)
+            entry = Gtk.Entry()
+            entry.set_visibility(False)
+            entry.set_activates_default(True)
+            entry.set_placeholder_text("Wi-Fi password")
+            area.pack_start(prompt, False, False, 0)
+            area.pack_start(entry, False, False, 0)
+            dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            dialog.add_button("Connect", Gtk.ResponseType.OK)
+            dialog.set_default_response(Gtk.ResponseType.OK)
+            dialog.show_all()
+            if dialog.run() == Gtk.ResponseType.OK:
+                password = entry.get_text()
+            entry.set_text("")
+            dialog.destroy()
+            if not password:
+                return
+        args = ["--wait", "25"]
+        if password is not None:
+            args += ["--ask", "device", "wifi", "connect", ssid]
+            _net_operation(args, password + "\n", f"Connected to {ssid}")
+        else:
+            args += ["device", "wifi", "connect", ssid]
+            _net_operation(args, message=f"Connected to {ssid}")
+
+    def _net_toggle(_switch, enabled):
+        if not net_state["updating"]:
+            _net_operation(["radio", "wifi", "on" if enabled else "off"],
+                           message="Wi-Fi turned on" if enabled else "Wi-Fi turned off")
+        return True
+
+    def _net_disconnect(*_):
+        active = net_state.get("active")
+        if active:
+            _net_operation(["connection", "down", "id", active],
+                           message=f"Disconnected from {active}")
+
+    net_refresh.connect("clicked", _net_scan)
+    net_wifi_switch.connect("state-set", _net_toggle)
+    net_disconnect.connect("clicked", _net_disconnect)
+
+    return network_panel, _net_scan
+
+
+def show_wifi_dialog(parent=None):
+    """Show modal dialog for Wi-Fi scanning and connection."""
+    dialog = Gtk.Dialog(title="Wi-Fi Networks", parent=parent, modal=True)
+    dialog.set_default_size(360, 480)
+    dialog.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+    _apply_css(dialog)
+    box = dialog.get_content_area()
+    box.set_spacing(10)
+    box.set_margin_start(16)
+    box.set_margin_end(16)
+    box.set_margin_top(16)
+    box.set_margin_bottom(16)
+    panel, scan_fn = _build_network_panel(parent_win=dialog, toast_fn=lambda msg: notify(msg))
+    box.pack_start(panel, True, True, 0)
+    close_btn = dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+    close_btn.get_style_context().add_class("btn-ghost")
+    dialog.show_all()
+    scan_fn()
+    dialog.run()
+    dialog.destroy()
 
 
 def show_lockout_window(minutes, pseudo=False):
@@ -2192,8 +2769,40 @@ def show_lockout_window(minutes, pseudo=False):
     study_btn = Gtk.Button(label="\U0001F4DA  Study")
     study_btn.get_style_context().add_class("btn-primary")
     study_btn.set_size_request(160, 48)
-    study_btn.set_tooltip_text("Study links, PDF library and typing (suspension continues).")
-    study_btn.connect("clicked", lambda *_: show_study_window(parent=win, end_ts=end))
+
+    def _sync_study_button():
+        until = _get_study_suspended_until()
+        now_ts = time.time()
+        ctx = study_btn.get_style_context()
+        if until > now_ts:
+            rem_m = max(1, int(math.ceil((until - now_ts) / 60.0)))
+            study_btn.set_sensitive(False)
+            study_btn.set_label(f"📚 Study Suspended ({rem_m}m)")
+            study_btn.set_tooltip_text(
+                f"Study Mode is temporarily suspended due to blocked keywords. Available in {rem_m}m.")
+            ctx.remove_class("btn-primary")
+            ctx.add_class("btn-secondary")
+        else:
+            study_btn.set_sensitive(True)
+            study_btn.set_label("📚  Study")
+            study_btn.set_tooltip_text("Study links and PDF reader (suspension continues).")
+            ctx.remove_class("btn-secondary")
+            ctx.add_class("btn-primary")
+
+    _sync_study_button()
+
+    def _on_study_clicked(*_):
+        if _is_study_suspended():
+            _sync_study_button()
+            return
+        show_study_window(parent=win, end_ts=end)
+
+    study_btn.connect("clicked", _on_study_clicked)
+    wifi_btn = Gtk.Button(label="\U0001F4F6  Wi-Fi")
+    wifi_btn.get_style_context().add_class("btn-ghost")
+    wifi_btn.set_size_request(122, 34)
+    wifi_btn.set_tooltip_text("Scan and connect to Wi-Fi networks.")
+    wifi_btn.connect("clicked", lambda *_: show_wifi_dialog(parent=win))
     type_btn = Gtk.Button(label="Typing Test")
     type_btn.get_style_context().add_class("btn-ghost")
     type_btn.set_size_request(160, 48)
@@ -2270,6 +2879,13 @@ def show_lockout_window(minutes, pseudo=False):
     ending = {"phase": 0}
     checkpoint_tick = {"last": 0.0}
 
+    def _touch_gtk_ready():
+        try:
+            with open(GTK_LOCKOUT_READY, "w") as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass
+
     def tick():
         nonlocal end, total
         if time.time() >= _stage_end() and int(schedule["stage"]) + 1 < len(schedule["segments"]):
@@ -2285,6 +2901,8 @@ def show_lockout_window(minutes, pseudo=False):
             unlock_lbl.set_text(f"Unlocks at {time.strftime('%Y-%m-%d %H:%M', time.localtime(end))}")
             _set_extend_button()
         now = time.time()
+        _touch_gtk_ready()
+        _sync_study_button()
         if now - checkpoint_tick["last"] >= 5:
             _save_suspend_state(end, mode="active")
             checkpoint_tick["last"] = now
@@ -2313,8 +2931,14 @@ def show_lockout_window(minutes, pseudo=False):
             return False
         return True
 
+    time_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=SPACE)
+    time_row.set_halign(Gtk.Align.CENTER)
+    time_row.set_valign(Gtk.Align.CENTER)
+    time_row.pack_start(time_label, False, False, 0)
+    time_row.pack_start(wifi_btn, False, False, 0)
+
     if _compact:
-        for w in (_accent(), badge, time_label, prog, unlock_lbl, sub,
+        for w in (_accent(), badge, time_row, prog, unlock_lbl, sub,
                   extend_btn,
                   goals_lbl, goals_scroll, lockrow):
             card.pack_start(w, False, False, 0)
@@ -2322,7 +2946,7 @@ def show_lockout_window(minutes, pseudo=False):
         left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2 * SPACE)
         left.set_hexpand(True)
         left.set_halign(Gtk.Align.FILL)
-        for w in (badge, time_label, prog, unlock_lbl, sub,
+        for w in (badge, time_row, prog, unlock_lbl, sub,
                   extend_btn, lockrow):
             left.pack_start(w, False, False, 0)
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=SPACE)
@@ -2345,7 +2969,7 @@ def show_lockout_window(minutes, pseudo=False):
     _lockout_sigs = _lockout_exe_signatures()
     _lockout_proc_sweep(_lockout_sigs)  # immediate: nothing usable survives
     _sweep_id = GLib.timeout_add_seconds(
-        3, lambda: (_lockout_proc_sweep(_lockout_sigs), True)[1])
+        1, lambda: (_lockout_proc_sweep(_lockout_sigs), True)[1])
 
     def _on_lock_destroy(*_):
         for _sid in (_guard_id, _sweep_id):
@@ -2353,11 +2977,20 @@ def show_lockout_window(minutes, pseudo=False):
                 GLib.source_remove(_sid)
             except Exception:
                 pass
+        try:
+            os.remove(GTK_LOCKOUT_READY)
+        except OSError:
+            pass
         _gnome_restore(_shell_saved)
         Gtk.main_quit()
     win.connect("destroy", _on_lock_destroy)
+    _touch_gtk_ready()
     win.show_all()
     win.present()
+    if os.environ.get("FOCUS_STARTUP_BARRIER") == "1":
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+        _systemd_startup_ready()
     type_btn.grab_focus()
     GLib.timeout_add_seconds(1, tick)
     Gtk.main()
@@ -2368,6 +3001,8 @@ STUDY_INBOX = os.path.expanduser("~/Documents/study-inbox")
 DOWNLOAD_DIR = os.path.expanduser("~/Downloads")
 STUDY_READING_STATE = os.path.join(LEDGER_DIR, "study-reading-state.json")
 STUDY_RECENTS_STATE = os.path.join(LEDGER_DIR, "study-recents.json")
+STUDY_DOWNLOADS_STATE = os.path.join(LEDGER_DIR, "study-downloads.json")
+STUDY_READ_HISTORY_STATE = os.path.join(LEDGER_DIR, "study-read-history.json")
 STUDY_WEB_DATA_DIR = os.path.join(LEDGER_DIR, "study-web-data")
 STUDY_WEB_CACHE_DIR = os.path.join(LEDGER_DIR, "study-web-cache")
 _study_web_context = None
@@ -2379,55 +3014,96 @@ INPUT_FILTER_NAME = "Focus Input Filter"
 STUDY_WEB_COOKIE_DB = os.path.join(STUDY_WEB_DATA_DIR, "cookies.sqlite")
 
 BLOCKED_INPUT_WORDS = [
-    # English / international
-    "porn", "porno", "pornography", "xxx", "xnxx", "xvideo", "xhamster", "pornhub",
-    "sex", "sexy", "sexting", "sexual", "nude", "nudes", "naked", "nsfw",
-    "horny", "aroused", "orgasm", "erotic", "hentai", "milf", "incest",
+    # English / international & slang (including requested: xxx, xnxx, cuda, chudacudi, fuck, nude)
+    "porn", "porno", "pornography", "xxx", "xnxx", "xvideo", "xvideos", "xhamster", "pornhub",
+    "sex", "sexy", "sexting", "sexual", "nude", "nudes", "nudity", "naked", "nsfw",
+    "fuck", "fucking", "fucker", "fucked",
+    "cuda", "cudi", "cudar", "cudan", "cudacudi",
+    "chuda", "choda", "chudi", "chudir", "chudar", "chodar", "chodon",
+    "chudacudi", "chudachudi", "chodachudi", "chudai",
+    "horny", "aroused", "orgasm", "erotic", "erotica", "hentai", "milf", "incest",
     "boobs", "boob", "pussy", "dick", "cock", "penis", "cum", "semen",
     "blowjob", "handjob", "anal", "anus", "masturbate", "masturbation",
     "slut", "whore", "prostitute", "onlyfans", "camgirl", "rapist", "condom",
-    "viagra", "chudai", "chudachudi", "chodachudi",
-    # Bangla script
-    "\u09aa\u09b0\u09cd\u09a8", "\u09aa\u09b0\u09cd\u09a3",
-    "\u09b8\u09c7\u0995\u09cd\u09b8", "\u09b8\u09c7\u0995\u09cd\u09b8\u09bf",
-    "\u09a8\u0997\u09cd\u09a8", "\u0989\u09b2\u0999\u09cd\u0997",
-    "\u09b9\u09b0\u09cd\u09a8\u09bf",
-    "\u09ac\u09cc\u09a6\u09bf", "\u09ad\u09be\u09ac\u09bf",
-    "\u099a\u09c1\u09a6\u09be", "\u099a\u09cb\u09a6\u09be",
-    "\u099a\u09c1\u09a6\u09bf", "\u099a\u09cb\u09a6\u09a8",
-    "\u099a\u09c1\u09a6\u09be\u099a\u09c1\u09a6\u09bf",
-    "\u099a\u09cb\u09a6\u09be\u099a\u09c1\u09a6\u09bf",
-    # Bangla typed in Latin letters
-    "boudi", "bhabi", "chuda", "choda", "chudi", "chudir", "chudar", "chodar",
-    "chodon", "chudacudi", "chudacudir", "chudachudir",
-    # Story / slang terms (single + pair words)
+    "viagra", "rowja", "viral",
+    "boudi", "bhabi",
     "choti", "panu", "jouno", "jounota", "sexstory", "sexstories", "sexvideo",
     "sexchat", "sex golpo", "choti golpo", "panu golpo", "jouno golpo",
     "chudacudir golpo", "chudir golpo", "chodar golpo", "choda chudi golpo",
     "bangla choti", "bangla panu", "desi sex", "desi porn", "desi choti",
-    "kamasutra", "kamsutra", "erotica", "smut", "tits", "titties", "cumshot",
+    "kamasutra", "kamsutra", "smut", "tits", "titties", "cumshot",
     "gangbang", "orgy", "threesome", "dildo", "vibrator", "fetish", "bondage",
     "stripper", "stripclub", "brothel", "magi", "khanki", "randi", "mms",
     "mms video", "blue film", "adult video", "adult story", "sex story",
-    # More Bangla script
-    "\u099a\u099f\u09bf", "\u09aa\u09be\u09a8\u09c1",
-    "\u09af\u09cc\u09a8", "\u09af\u09cc\u09a8\u09a4\u09be",
-    "\u09af\u09cc\u09a8\u0997\u09b2\u09cd\u09aa",
-    "\u09aa\u09b0\u09cd\u09a8\u09cb\u0997\u09cd\u09b0\u09be\u09ab\u09bf",
-    "\u099a\u099f\u09bf \u0997\u09b2\u09cd\u09aa",
-    "\u09aa\u09be\u09a8\u09c1 \u0997\u09b2\u09cd\u09aa",
-    "\u09af\u09cc\u09a8 \u0997\u09b2\u09cd\u09aa",
-    "\u0997\u09c1\u09a6", "\u09ad\u09cb\u09a6\u09be",
-    "\u09af\u09cb\u09a8\u09bf", "\u09b8\u09cd\u09a4\u09a8",
-    "\u09ac\u09c0\u09b0\u09cd\u09af", "\u09b9\u09b8\u09cd\u09a4\u09ae\u09c8\u09a5\u09c1\u09a8",
-    "\u0995\u09be\u09ae\u09c1\u0995", "\u0985\u09b6\u09cd\u09b2\u09c0\u09b2",
-    "\u0996\u09be\u09a8\u0995\u09bf", "\u09ae\u09be\u0997\u09bf",
-    "\u09b0\u09be\u09a8\u09cd\u09a1\u09bf",
+    # Bangla script transliterations & equivalents of English words
+    "পর্ন", "পর্ণ", "পর্নো", "পর্ণো", "পর্নোগ্রাফি", "পর্ণোগ্রাফি",
+    "এক্সএক্সএক্স", "এক্সএনএক্সএক্স", "এক্সভিডিও", "এক্সহ্যামস্টার", "পর্নহাব", "পর্ণহাব",
+    "সেক্স", "সেক্সি", "সেক্সটিং", "সেক্সুয়াল", "সেক্সস্টোরি", "সেক্সভিডিও", "সেক্সচ্যাট", "সেক্স গল্প",
+    "ন্যুড", "ন্যূড", "ন্যুডস", "ন্যূডস", "নেকেড", "নগ্ন", "উলঙ্গ",
+    "ফাক", "ফাকিং", "ফাকার",
+    "কুদা", "কুদি", "কুদাচুদি",
+    "চুদা", "চুদি", "চোদন", "চুদাচুদি", "চোদা", "চোদাচুদি", "চুদাই",
+    "হর্নি", "কামুক", "উত্তেজিত",
+    "অর্গাজম", "বীর্যপাত",
+    "ইরোটিক", "ইরোটিকা",
+    "হেনতাই", "মিল্ফ", "মিলফ", "ইনসেস্ট",
+    "বুবস", "বুব", "স্তন", "দুধ",
+    "পুসি", "যোনি", "গুদ", "ভোদা",
+    "ডিক", "কক", "পেনিস", "লিঙ্গ", "বাড়া", "লেড়া",
+    "কাম", "সিমেন", "বীর্য",
+    "ব্লোজব", "হ্যান্ডজব",
+    "অ্যানাল", "এনাল", "মলদ্বার",
+    "মাস্টারবেশন", "হস্তমৈথুন",
+    "স্লাট", "বেশ্যা", "পতিতা", "মাগি", "খানকি", "রান্ডি",
+    "অনলিফ্যানস", "অনলিফ্যান্স", "ক্যামগার্ল",
+    "ডিলডো", "ভাইব্রেটর",
+    "গ্যাংব্যাং", "অর্জি", "থ্রিসাম",
+    "স্ট্রিপার", "স্ট্রিপক্লাব",
+    "ব্লু ফিল্ম", "ব্লুফিল্ম",
+    "এডাল্ট ভিডিও", "এডাল্ট স্টোরি",
+    "বৌদি", "ভাবি",
+    "চটি", "পানু", "যৌন", "যৌনতা", "যৌনগল্প", "চটি গল্প", "পানু গল্প", "যৌন গল্প",
+    "অশ্লীল", "কামসূত্র"
 ]
+
+CUSTOM_BLOCKED_KEYWORDS_FILE = os.path.join(LEDGER_DIR, "blocked-keywords.json")
+
+
+def _load_custom_blocked_keywords():
+    try:
+        if os.path.isfile(CUSTOM_BLOCKED_KEYWORDS_FILE):
+            with open(CUSTOM_BLOCKED_KEYWORDS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [str(k).strip() for k in data if str(k).strip()]
+    except Exception as e:
+        print(f"Error loading custom blocked keywords: {e}", flush=True)
+    return []
+
+
+def _save_custom_blocked_keywords(keywords_list):
+    try:
+        os.makedirs(LEDGER_DIR, exist_ok=True)
+        tmp = CUSTOM_BLOCKED_KEYWORDS_FILE + f".tmp-{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(keywords_list, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, CUSTOM_BLOCKED_KEYWORDS_FILE)
+        try:
+            os.chmod(CUSTOM_BLOCKED_KEYWORDS_FILE, 0o600)
+        except OSError:
+            pass
+    except Exception as e:
+        print(f"Error saving custom blocked keywords: {e}", flush=True)
+
+
+# Load saved custom keywords
+for _ckw in _load_custom_blocked_keywords():
+    if _ckw.lower() not in [x.lower() for x in BLOCKED_INPUT_WORDS]:
+        BLOCKED_INPUT_WORDS.append(_ckw.lower())
 
 # Tokens too risky for compact (substring) matching -> whole-word match only.
 _BLOCK_WORD_ONLY = {"sex", "anal", "cum", "dick", "cock", "nude", "xxx",
-                    "magi", "randi", "bhabi", "mms"}
+                    "magi", "randi", "bhabi", "mms", "fuck", "cuda"}
 _BLOCK_LEET = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s",
                              "6": "g", "7": "t", "8": "b", "9": "g", "@": "a",
                              "$": "s", "!": "i", "|": "i"})
@@ -2482,12 +3158,19 @@ def _is_bangla(word):
     return any("\u0980" <= ch <= "\u09ff" for ch in word)
 
 
-_BLOCK_NORM = [(w, re.sub(r"[^a-z0-9\u0980-\u09FF]+", " ",
-                          _input_norm(w)).strip()) for w in BLOCKED_INPUT_WORDS]
+def _rebuild_blocked_structures():
+    global _BLOCK_NORM, _BLOCK_COMPACT
+    _BLOCK_NORM = [(w, re.sub(r"[^a-z0-9\u0980-\u09FF]+", " ",
+                              _input_norm(w)).strip()) for w in BLOCKED_INPUT_WORDS]
+    _BLOCK_COMPACT = []
+    for _w in BLOCKED_INPUT_WORDS:
+        for _form in {_compact_map(_w)[0], _compact_map(_w, collapse=True)[0]}:
+            _BLOCK_COMPACT.append((_w, _form))
+
+
+_BLOCK_NORM = []
 _BLOCK_COMPACT = []
-for _w in BLOCKED_INPUT_WORDS:
-    for _form in {_compact_map(_w)[0], _compact_map(_w, collapse=True)[0]}:
-        _BLOCK_COMPACT.append((_w, _form))
+_rebuild_blocked_structures()
 
 
 def _explicit_hit(text):
@@ -2534,37 +3217,32 @@ def _explicit_hit(text):
                         return word
                 start = at + 1
     return None
-    spaced = " " + re.sub(r"[^a-z0-9\u0980-\u09FF]+", " ",
-                          _input_norm(text)).strip() + " "
-    for word, norm in _BLOCK_NORM:
-        if norm and (" " + norm + " ") in spaced:
-            return word
-    comp, gaps = _compact_map(text)
-    for word, comp_word in _BLOCK_COMPACT:
-        if not comp_word:
-            continue
-        if _is_bangla(comp_word):
-            min_len = 2
-        elif word in _BLOCK_WORD_ONLY:
-            min_len = 3
-        else:
-            min_len = 4
-        if len(comp_word) < min_len:
-            continue
-        start = 0
-        while True:
-            at = comp.find(comp_word, start)
-            if at < 0:
-                break
-            if word not in _BLOCK_WORD_ONLY:
-                return word
-            end = at + len(comp_word)
-            internal_gap = any(gaps[k] for k in range(at + 1, end))
-            after_gap = (end >= len(comp)) or gaps[end]
-            if internal_gap or (gaps[at] and after_gap):
-                return word
-            start = at + 1
-    return None
+
+
+def _is_keyword_blocked(raw):
+    raw_lower = (raw or "").strip().lower()
+    if not raw_lower:
+        return False
+    if raw_lower in [x.lower() for x in BLOCKED_INPUT_WORDS]:
+        return True
+    if _explicit_hit(raw_lower):
+        return True
+    return False
+
+
+def _add_blocked_keyword(raw):
+    raw_lower = (raw or "").strip().lower()
+    if not raw_lower:
+        return False
+    if raw_lower not in [x.lower() for x in BLOCKED_INPUT_WORDS]:
+        BLOCKED_INPUT_WORDS.append(raw_lower)
+    saved = _load_custom_blocked_keywords()
+    if raw_lower not in [x.lower() for x in saved]:
+        saved.append(raw_lower)
+        _save_custom_blocked_keywords(saved)
+    _rebuild_blocked_structures()
+    return True
+
 
 def _build_input_filter_js():
     import json as _json
@@ -2614,8 +3292,20 @@ def _build_input_filter_js():
       if (c && !seen[c]) { seen[c] = 1; BANC.push({ w: w, c: c }); }
     });
   });
+  window.__focusAddWord = function (w) {
+    if (!w) { return; }
+    w = String(w).toLowerCase();
+    if (RAW.indexOf(w) === -1) {
+      RAW.push(w);
+      BAN.push(norm(w));
+      var seen = {};
+      [sqMap(w, false).c, sqMap(w, true).c].forEach(function (c) {
+        if (c && !seen[c]) { seen[c] = 1; BANC.push({ w: w, c: c }); }
+      });
+    }
+  };
   var WORD_ONLY = {'sex':1,'anal':1,'cum':1,'dick':1,'cock':1,'nude':1,'xxx':1,
-                   'magi':1,'randi':1,'bhabi':1,'mms':1};
+                   'magi':1,'randi':1,'bhabi':1,'mms':1,'fuck':1,'cuda':1};
   function hit(text) {
     if (!text) { return null; }
     var t = spaced(text);
@@ -2669,6 +3359,11 @@ def _build_input_filter_js():
     d.style.display = 'block';
     clearTimeout(d.__t);
     d.__t = setTimeout(function () { d.style.display = 'none'; }, 2600);
+    try {
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.focusInputBlocked) {
+        window.webkit.messageHandlers.focusInputBlocked.postMessage(msg || 'blocked');
+      }
+    } catch (_) {}
   }
   function editable(el) {
     return !!el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' || el.isContentEditable);
@@ -2749,11 +3444,144 @@ def _build_input_filter_js():
 
 
 INPUT_FILTER_JS = _build_input_filter_js()
+TELEGRAM_KIOSK_JS = r"""
+(function () {
+  'use strict';
+  if (location.hostname.toLowerCase() !== 'web.telegram.org' ||
+      !/^\/(?:k|a)\/?$/.test(location.pathname)) return;
+
+  var targetPeer = '-1004415493319';
+  var targetAlt = '4415493319';
+  var targetName = 'pdf258upload';
+
+  // We keep the left column in the layout for Telegram's JS to render the chat items,
+  // but position it far off-screen so the user NEVER sees the left chat list or search bar!
+  // The center chat column expands to take 100% of the visible viewport!
+  var style = document.createElement('style');
+  style.textContent = [
+    '#column-left, #LeftColumn, .LeftColumn, .sidebar-left, div[class*="LeftColumn"], .chatlist-container {',
+    '    position: fixed !important;',
+    '    left: -9999px !important;',
+    '    top: 0 !important;',
+    '    width: 360px !important;',
+    '    height: 100vh !important;',
+    '    opacity: 0 !important;',
+    '    pointer-events: none !important;',
+    '    z-index: -999 !important;',
+    '}',
+    '#column-center, #MiddleColumn, .MiddleColumn {',
+    '    display: flex !important;',
+    '    width: 100vw !important;',
+    '    max-width: 100vw !important;',
+    '    height: 100vh !important;',
+    '    position: absolute !important;',
+    '    top: 0 !important;',
+    '    left: 0 !important;',
+    '    margin: 0 !important;',
+    '    flex: 1 1 100% !important;',
+    '    z-index: 1 !important;',
+    '}',
+    '#column-right, #RightColumn, .RightColumn,',
+    '.btn-menu-toggle, button.back-button, button[aria-label="Back"], button[title="Back"],',
+    'button.sidebar-close-button, .sidebar-header__btn-back, .Header-left .btn-icon,',
+    '#stories-viewer, .stories-list {',
+    '    display: none !important;',
+    '}',
+    'body, html, #page-chats, #root, #main-columns, .Main {',
+    '    width: 100vw !important;',
+    '    max-width: 100vw !important;',
+    '    overflow: hidden !important;',
+    '}'
+  ].join('\n');
+  (document.head || document.documentElement).appendChild(style);
+
+  function isTargetElement(el) {
+    if (!el) return false;
+    var href = (el.getAttribute('href') || '').toLowerCase();
+    var peer = (el.getAttribute('data-peer-id') || '').toLowerCase();
+    var text = (el.textContent || '').toLowerCase();
+    return (href.indexOf('4415493319') !== -1 ||
+            href.indexOf('pdf258upload') !== -1 ||
+            peer.indexOf('4415493319') !== -1 ||
+            text.indexOf('pdf materials') !== -1 ||
+            text.indexOf('pdf258upload') !== -1);
+  }
+
+  function autoOpenGroup() {
+    var center = document.querySelector('#column-center, #MiddleColumn');
+    var isChatActive = center && (
+      center.querySelector('.bubbles, .bubble, .messages-container, .MessageList, .chat-info, .input-message-container') ||
+      center.classList.contains('active')
+    );
+
+    // If chat is not yet loaded into center column, find and click the chat item:
+    var chats = document.querySelectorAll('a.chatlist-chat, .chat-item-clickable, .ListItem');
+    for (var i = 0; i < chats.length; i++) {
+      if (isTargetElement(chats[i])) {
+        if (!isChatActive || !chats[i].classList.contains('active')) {
+          chats[i].click();
+          try {
+            chats[i].dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
+            chats[i].dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true}));
+          } catch (_) {}
+        }
+        break;
+      }
+    }
+
+    // Ensure the hash stays targeted
+    var h = (location.hash || '').replace(/^#/, '').toLowerCase();
+    if (!h || h === '' || h === 'undefined') {
+      try {
+        history.replaceState(history.state, '', location.pathname + location.search + '#' + targetPeer);
+      } catch (_) {}
+    }
+  }
+
+  setInterval(autoOpenGroup, 400);
+  window.addEventListener('load', autoOpenGroup);
+  setTimeout(autoOpenGroup, 300);
+  setTimeout(autoOpenGroup, 1000);
+  setTimeout(autoOpenGroup, 2500);
+
+  // Disable keyboard navigation away from chat
+  document.addEventListener('keydown', function (event) {
+    if ((event.altKey && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) ||
+        (event.ctrlKey && ['k', 'f'].indexOf(event.key.toLowerCase()) !== -1)) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+  }, true);
+
+  // Guard links
+  document.addEventListener('click', function (event) {
+    var link = event.target && event.target.closest ? event.target.closest('a[href]') : null;
+    if (!link) return;
+    try {
+      var url = new URL(link.href, location.href);
+      var host = url.hostname.toLowerCase();
+      if ((host === 'web.telegram.org' || host === 'telegram.org' || host.endsWith('.telegram.org')) &&
+          /\/file\//i.test(url.pathname)) return;
+      if (url.protocol === 'blob:') return;
+      if (host === 'web.telegram.org') {
+        var hash = url.hash.replace(/^#/, '').toLowerCase();
+        if (hash.indexOf('4415493319') !== -1 || hash.indexOf('pdf258upload') !== -1) return;
+      }
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    } catch (_) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+  }, true);
+  window.open = function () { return null; };
+})();
+"""
 _study_ucm = None
 
 UPLOAD_PASSWORD_PATH = os.path.join(LEDGER_DIR, "phone-upload-password")
 UPLOAD_PUBLIC_URL = "https://upload21.medisparkbd.com/"
-# Public Telegram group: anyone can send PDFs here; Telegram Web handles download.
+# Public Telegram group: anyone can send PDFs here; Study mode only opens this group.
 PHONE_PDF_UPLOAD_URL = "https://t.me/pdf258upload"
 UPLOAD_SERVER_HOST = "127.0.0.1"
 UPLOAD_SERVER_PORT = 8765
@@ -2768,36 +3596,48 @@ _SCAN_SKIP = {
 }
 
 _STUDY_DEFAULTS = {
-    "version": 6,
+    "version": 16,
     "links": [
+        {"title": "PDF Materials (Cloud)", "url": "tg-materials"},
         {"title": "Boimate", "url": "https://boimate.com"},
-        {"title": "Gemini Notebook", "url": "https://notebooklm.google.com"},
+        {"title": "Gemini Notebook", "url": "https://notebook.google.com"},
         {"title": "Medical Contents", "url": "https://medical-contents.abdursakib.workers.dev/0:/"},
         {"title": "MuslimBangla", "url": "https://muslimbangla.com"},
         {"title": "iHadis", "url": "https://ihadis.com/en"},
         {"title": "LiveMCQ", "url": "https://web.livemcq.com/"},
         {"title": "Translate", "url": "https://translate.google.com"},
-        {"title": "Phone PDF Upload", "url": PHONE_PDF_UPLOAD_URL},
     ],
     "allow_hosts": [
         "boimate.com", "www.boimate.com", "*.boimate.com",
         "medical-contents.abdursakib.workers.dev",
         "drive.google.com",
-        "notebooklm.google.com", "notebook.google.com",
-        "*.notebook.google.com", "notebooklm-pa.googleapis.com",
+        "docs.google.com", "sheets.google.com", "slides.google.com",
+        "notebooklm.google.com", "notebook.google.com", "notebook.google",
+        "*.notebook.google.com", "*.notebooklm.google.com", "*.notebook.google",
+        "notebooklm-pa.googleapis.com",
         "content-push.googleapis.com", "csp.withgoogle.com",
         "accounts.google.com", "accounts.youtube.com", "myaccount.google.com",
+        "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
+        "youtubei.googleapis.com", "i.ytimg.com", "*.googlevideo.com",
         "translate.google.com", "translate.googleapis.com", "clients6.google.com",
-        "www.google.com", "google.com", "apis.google.com", "content.googleapis.com",
+        "clients1.google.com", "clients2.google.com", "clients4.google.com",
+        "www.google.com", "google.com", "*.google.com", "*.google",
+        "apis.google.com", "content.googleapis.com",
+        "gemini.google.com", "generativelanguage.googleapis.com",
+        "alkali-coba-pa.googleapis.com", "alkali-pa.googleapis.com",
+        "alkalicoba-pa.googleapis.com",
         "www.gstatic.com", "ssl.gstatic.com", "fonts.gstatic.com", "gstatic.com",
         "fonts.googleapis.com", "font.gstatic.com", "googleusercontent.com",
         "*.googleusercontent.com", "usercontent.google.com",
         "*.usercontent.google.com", "*.gstatic.com", "*.googleapis.com",
+        "*.usercontent.goog", "usercontent.goog", "*.scf.usercontent.goog",
+        "*.goog", "*.ggpht.com", "*.withgoogle.com", "withgoogle.com",
+        "*.appspot.com",
         "muslimbangla.com", "www.muslimbangla.com",
         "ihadis.com", "www.ihadis.com",
         "livemcq.com", "www.livemcq.com", "web.livemcq.com", "*.livemcq.com",
         "127.0.0.1", "localhost", "upload21.medisparkbd.com",
-        "t.me", "telegram.org", "www.telegram.org",
+        "web.telegram.org",
         "cdn.jsdelivr.net", "cdnjs.cloudflare.com", "unpkg.com",
         "*.cloudfront.net", "*.amazonaws.com", "*.b-cdn.net",
         "*.digitaloceanspaces.com", "*.supabase.co", "*.firebaseapp.com",
@@ -2817,23 +3657,71 @@ def _study_config():
             # Add newly shipped study resources to existing user configurations.
             changed = False
             kept_links = []
-            for item in cfg["links"]:
-                uri = item.get("url", "") if isinstance(item, dict) else ""
+            seen_urls = set()
+            for item in cfg.get("links", []):
+                if not isinstance(item, dict):
+                    continue
+                uri = str(item.get("url", "")).strip()
                 host = (urlparse(uri).hostname or "").lower()
-                title = str(item.get("title", "")).strip().lower() \
-                    if isinstance(item, dict) else ""
+                title = str(item.get("title", "")).strip()
+                title_lower = title.lower()
+                uri_lower = uri.lower()
+
+                if (title_lower.replace(" ", "").replace("-", "") == "phonepdfupload"
+                        or uri == PHONE_PDF_UPLOAD_URL):
+                    changed = True
+                    continue
                 if host.endswith("whatsapp.com") or host.endswith("whatsapp.net"):
                     changed = True
                     continue
                 if host.endswith("trycloudflare.com"):
                     changed = True
                     continue
-                if title == "phone pdf upload":
-                    if uri != PHONE_PDF_UPLOAD_URL:
-                        item["url"] = PHONE_PDF_UPLOAD_URL
-                        changed = True
+
+                # User requirement: remove telegram group links from sidebar
+                if ("telegram" in host or host.endswith("t.me") or host == "t.me"
+                        or "web.telegram.org" in uri_lower
+                        or "-1004415493319" in uri_lower
+                        or "group" in title_lower
+                        or "upload" in title_lower):
+                    changed = True
+                    continue
+
+                if title_lower == "gemini notebook" and uri != "https://notebook.google.com":
+                    item["url"] = "https://notebook.google.com"
+                    changed = True
+
+                # User requirement: single PDF Materials (Cloud) entry, deduplicated
+                if title_lower in ("pdf materials upload", "pdf materials (cloud)", "pdf materials cloud", "pdf materials") \
+                        or uri_lower in ("tg-materials", "pdf-materials"):
+                    item["title"] = "PDF Materials (Cloud)"
+                    item["url"] = "tg-materials"
+                    uri = "tg-materials"
+
+                norm_key = uri.lower()
+                if norm_key in seen_urls:
+                    changed = True
+                    continue
+                seen_urls.add(norm_key)
                 kept_links.append(item)
-            if len(kept_links) != len(cfg["links"]):
+
+            # Ensure PDF Materials (Cloud) is placed cleanly at top, with no duplicates
+            tg_item = None
+            other_items = []
+            for item in kept_links:
+                if item.get("url") == "tg-materials":
+                    tg_item = item
+                else:
+                    other_items.append(item)
+            if tg_item is None:
+                tg_item = {"title": "PDF Materials (Cloud)", "url": "tg-materials"}
+                changed = True
+            kept_links = [tg_item] + other_items
+
+            if len(kept_links) != len(cfg.get("links", [])):
+                cfg["links"] = kept_links
+                changed = True
+            else:
                 cfg["links"] = kept_links
             old_hosts = list(cfg["allow_hosts"])
             cfg["allow_hosts"] = [
@@ -2841,9 +3729,8 @@ def _study_config():
                 if "whatsapp.com" not in str(host).lower()
                 and "whatsapp.net" not in str(host).lower()
                 and "trycloudflare.com" not in str(host).lower()
-                and str(host).lower() not in (
-                    "*.t.me", "*.telegram.org", "cdn-telegram.org",
-                    "*.cdn-telegram.org", "telegram.me", "*.telegram.me")]
+                and "telegram" not in str(host).lower()
+                and "t.me" not in str(host).lower()]
             if cfg["allow_hosts"] != old_hosts:
                 changed = True
             for link in _STUDY_DEFAULTS["links"]:
@@ -2895,6 +3782,11 @@ def _ensure_phone_upload_password():
 
 
 def start_phone_upload_server():
+    """Disabled legacy phone upload portal."""
+    return None
+
+
+def _legacy_disabled_start_phone_upload_server():
     """Loopback-only authenticated PDF inbox, intended for an HTTPS tunnel."""
     global _phone_upload_server
     if _phone_upload_server is not None:
@@ -3111,73 +4003,108 @@ def _host_allowed(host, patterns):
     return False
 
 
-# Telegram stays limited to one public group page: no Telegram Web, no other chats.
-TELEGRAM_GROUP_HOSTS = ("t.me", "www.t.me")
-TELEGRAM_GROUP_PATH = "/pdf258upload"
-
-# Temporary "setup mode": lets the user log in to Telegram Web (needed once for
-# downloads), then auto-expires back to the strict single-group rule.
-SETUP_MODE_STATE = os.path.join(LEDGER_DIR, "setup-mode.state")
-SETUP_MODE_MINUTES = 15
-TELEGRAM_SETUP_SUFFIXES = (
-    "t.me", "telegram.org", "telegram.me", "telegram.dog",
-    "cdn-telegram.org", "telesco.pe")
+# Only the PDF Materials Upload conversation is exposed in Telegram Web.
+TELEGRAM_WEB_HOST = "web.telegram.org"
+TELEGRAM_WEB_PATH = "/k"
+TELEGRAM_WEB_PATHS = {"/k", "/a"}
+TELEGRAM_GROUP_HASH = "-1004415493319"
+TELEGRAM_GROUP_URL = (
+    f"https://{TELEGRAM_WEB_HOST}{TELEGRAM_WEB_PATH}/#{TELEGRAM_GROUP_HASH}")
+TELEGRAM_TARGET_PEER_PATH = os.path.join(LEDGER_DIR, "telegram-target-peer")
 
 
-def setup_mode_until():
+def _load_telegram_target_peer():
     try:
-        with open(SETUP_MODE_STATE) as f:
-            return float(f.read().strip())
+        with open(TELEGRAM_TARGET_PEER_PATH) as f:
+            peer = f.read().strip()
+        return peer if re.fullmatch(r"-?\d{5,}", peer) else ""
     except Exception:
-        return 0
+        return ""
 
 
-def setup_mode_active():
-    return setup_mode_until() > time.time()
-
-
-def _setup_host_allowed(host):
-    if not setup_mode_active():
+def _remember_telegram_target_peer(peer):
+    peer = str(peer or "").strip()
+    if not re.fullmatch(r"-?\d{5,}", peer):
         return False
-    return any(host == s or host.endswith("." + s) for s in TELEGRAM_SETUP_SUFFIXES)
-
-
-def enable_setup_mode(minutes=SETUP_MODE_MINUTES):
-    until = time.time() + minutes * 60
     try:
         os.makedirs(LEDGER_DIR, exist_ok=True)
-        with open(SETUP_MODE_STATE, "w") as f:
-            f.write(str(until))
+        fd, temporary = tempfile.mkstemp(prefix=".telegram-peer-", dir=LEDGER_DIR)
+        with os.fdopen(fd, "w") as f:
+            f.write(peer)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, TELEGRAM_TARGET_PEER_PATH)
+        return True
     except Exception as e:
-        print(f"setup mode save error: {e}", flush=True)
-        return 0
-    at = time.strftime("%H:%M", time.localtime(until))
-    notify(f"Telegram setup mode ON for {minutes} min (until {at}).")
-    print(f"Telegram setup mode ON for {minutes} min, auto-off at {at}.", flush=True)
-    return until
+        print(f"Telegram group pin save error: {e}", flush=True)
+        try:
+            if "temporary" in locals() and os.path.exists(temporary):
+                os.remove(temporary)
+        except OSError:
+            pass
+        return False
 
 
-def disable_setup_mode():
+def _telegram_peer_message(_manager, result):
     try:
-        if os.path.exists(SETUP_MODE_STATE):
-            os.remove(SETUP_MODE_STATE)
-    except Exception:
-        pass
-    print("Telegram setup mode OFF — strict single-group rule restored.", flush=True)
+        peer = result.get_js_value().to_string()
+        _remember_telegram_target_peer(peer)
+    except Exception as e:
+        print(f"Telegram group pin message error: {e}", flush=True)
+
+
+def _focus_input_blocked_message(_manager, result):
+    try:
+        try:
+            val = result.get_js_value().to_string()
+        except Exception:
+            val = "blocked"
+        count, suspended = _record_input_violation()
+        print(f"[FocusInputFilter] Keyword block recorded ('{val}'): {count}/10 in 5m (suspended={suspended})", flush=True)
+        if _study_block_count_updater:
+            GLib.idle_add(_study_block_count_updater, count)
+        if suspended:
+            GLib.idle_add(_trigger_study_suspension)
+    except Exception as e:
+        print(f"focusInputBlocked handler error: {e}", flush=True)
 
 
 def _page_allowed(uri, patterns):
-    """Host allowlist plus path lock for Telegram (only the PDF upload group)."""
+    """Host allowlist plus a Telegram Web entry point pinned to one group."""
     try:
-        parsed = urlparse(uri or "")
-        host = (parsed.hostname or "").lower()
-        if _setup_host_allowed(host):
+        if not uri:
+            return False
+        uri_lower = uri.strip().lower()
+        if uri_lower.startswith(("about:", "data:", "javascript:", "file:")):
             return True
+        if "tg-materials" in uri_lower or "telegram-materials" in uri_lower:
+            return True
+        if uri_lower.startswith("blob:"):
+            inner = uri[5:]
+            inner_host = (urlparse(inner).hostname or "").lower()
+            if inner_host:
+                return _host_allowed(inner_host, patterns)
+            return True
+        parsed = urlparse(uri)
+        host = (parsed.hostname or "").lower()
+        if host == TELEGRAM_WEB_HOST:
+            peer = _load_telegram_target_peer()
+            fragment = parsed.fragment.lower()
+            allowed_fragments = {TELEGRAM_GROUP_HASH.lower(), "-1004415493319", "4415493319", "pdf258upload"}
+            if peer:
+                allowed_fragments.add(peer.lower())
+                allowed_fragments.add(peer.replace("-100", "").lower())
+            return ((parsed.path or "/").rstrip("/").lower() in TELEGRAM_WEB_PATHS
+                    and (fragment in allowed_fragments or not fragment)
+                    and _host_allowed(host, patterns))
+        telegram_domains = ("telegram.org", "telegram.me", "telegram.dog",
+                            "cdn-telegram.org", "telesco.pe", "t.me")
+        if any(host == domain or host.endswith("." + domain)
+               for domain in telegram_domains):
+            return False
         if not _host_allowed(host, patterns):
             return False
-        if host in TELEGRAM_GROUP_HOSTS:
-            path = (parsed.path or "/").rstrip("/").lower()
-            return path == TELEGRAM_GROUP_PATH or path.startswith(TELEGRAM_GROUP_PATH + "/")
         return True
     except Exception:
         return False
@@ -3236,27 +4163,38 @@ def _copy_into_inbox(paths, exts):
 
 
 def _import_usb_pdf_uri(uri):
-    """Copy one PDF from a mounted drive or GVfs phone into the Study inbox."""
+    """Copy one PDF or image from storage, USB drive or phone into the Study inbox."""
     scheme = urllib.parse.urlsplit(uri or "").scheme.lower()
     if scheme not in ("file", "mtp", "gphoto2"):
-        return None, "Choose a file from USB storage or a connected phone"
+        return None, "Choose a file from storage, USB drive or a connected phone"
     try:
         source = Gio.File.new_for_uri(uri)
         raw_name = source.get_basename() or ""
-        if not raw_name.lower().endswith(".pdf"):
-            return None, "Only PDF files can be imported from USB/Type-C"
+        lower_name = raw_name.lower()
+        if not lower_name.endswith(tuple(MEDIA_EXTS)):
+            return None, "Only PDF and image files can be imported"
         name = re.sub(r"[^\w .()\-]", "_", raw_name, flags=re.UNICODE).strip(" .")
-        if not name or not name.lower().endswith(".pdf"):
-            return None, "Invalid PDF filename"
+        if not name or not name.lower().endswith(tuple(MEDIA_EXTS)):
+            return None, "Invalid filename"
         os.makedirs(STUDY_INBOX, exist_ok=True)
-        temporary = os.path.join(STUDY_INBOX, ".usb-import-" + secrets.token_hex(8) + ".pdf")
+        _, ext = os.path.splitext(name)
+        ext = ext.lower()
+        temporary = os.path.join(STUDY_INBOX, ".usb-import-" + secrets.token_hex(8) + ext)
         source.copy(Gio.File.new_for_path(temporary), Gio.FileCopyFlags.NONE,
                     None, None, None)
         try:
-            with open(temporary, "rb") as f:
-                signature = f.read(1024)
-            if b"%PDF-" not in signature:
-                return None, "The selected file is not a valid PDF"
+            if ext == ".pdf":
+                with open(temporary, "rb") as f:
+                    signature = f.read(1024)
+                if b"%PDF-" not in signature:
+                    return None, "The selected file is not a valid PDF"
+            else:
+                try:
+                    info = GdkPixbuf.Pixbuf.get_file_info(temporary)
+                    if not info or info[1] <= 0 or info[2] <= 0:
+                        return None, "The selected file is not a valid image"
+                except Exception:
+                    pass
             stem, suffix = os.path.splitext(name)
             target = os.path.join(STUDY_INBOX, name)
             index = 1
@@ -3273,8 +4211,8 @@ def _import_usb_pdf_uri(uri):
                 except OSError:
                     pass
     except Exception as e:
-        print(f"USB PDF import error: {e}", flush=True)
-        return None, "Could not read that PDF from the connected device"
+        print(f"File import error: {e}", flush=True)
+        return None, "Could not read that file from the connected device"
 
 
 def _pdf_metadata(path):
@@ -3345,14 +4283,67 @@ def _render_pdf_page(path, page, zoom=1.0, cancel=None):
     return None
 
 
+def _configure_study_settings(st):
+    if st is None:
+        return
+    try:
+        st.set_enable_developer_extras(False)
+        st.set_enable_html5_local_storage(True)
+        st.set_enable_html5_database(True)
+        st.set_enable_javascript(True)
+        st.set_enable_page_cache(False)
+        st.set_enable_webgl(True)
+        st.set_javascript_can_open_windows_automatically(True)
+    except Exception:
+        pass
+    for method, val in [
+        ("set_enable_2d_canvas_acceleration", True),
+        ("set_enable_accelerated_2d_canvas", True),
+        ("set_enable_webaudio", True),
+        ("set_enable_mediasource", True),
+        ("set_enable_media_stream", True),
+        ("set_enable_media_capabilities", True),
+        ("set_enable_encrypted_media", True),
+        ("set_enable_site_specific_quirks", True),
+        ("set_enable_fullscreen", True),
+        ("set_allow_modal_dialogs", True),
+        ("set_allow_top_navigation_to_data_urls", True),
+        ("set_media_playback_allows_inline", True),
+        ("set_media_playback_requires_user_gesture", False),
+        ("set_enable_smooth_scrolling", True),
+    ]:
+        try:
+            getattr(st, method)(val)
+        except Exception:
+            pass
+
+
 def show_study_window(parent=None, end_ts=None):
-    """Study container inside lockout: whitelisted links, PDF/image library,
-    remote PDF upload, media intake. Suspension keeps running."""
+    """Study container with whitelisted links and a PDF/image library.
+    When opened from lockout, the lockout countdown keeps running."""
     global _study_win, _study_parent, _study_web_context, _study_ucm
+
+    if _is_study_suspended():
+        until = _get_study_suspended_until()
+        rem_m = max(1, int(math.ceil((until - time.time()) / 60.0)))
+        notify(f"Study Mode is temporarily suspended ({rem_m}m remaining).")
+        return
 
     if WebKit2 is None:
         print("WebKit2 unavailable — study view disabled", flush=True)
         return
+
+    if end_ts is None:
+        _saved = _load_suspend_state()
+        if _saved > time.time():
+            end_ts = _saved
+
+    def _touch_study_active():
+        try:
+            with open(STUDY_ACTIVE_FLAG, "w") as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass
 
     cfg = _study_config()
     allow = cfg.get("allow_hosts") or _STUDY_DEFAULTS["allow_hosts"]
@@ -3374,26 +4365,74 @@ def show_study_window(parent=None, end_ts=None):
     css = Gtk.CssProvider()
     css.load_from_data(b"""
     .studywin { background: #0b1220; }
-    .studybar { background: #10264a; padding: 10px 18px; }
-    .studybar entry { background: rgba(8, 20, 39, 0.72); color: #e5eefc;
-                      border: 1px solid rgba(148, 163, 184, 0.24);
-                      border-radius: 8px; padding: 6px 9px; }
+    .studybar { background: #0d1527; border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+                padding: 2px 10px; min-height: 32px; }
+    .studybar entry { background: rgba(15, 23, 42, 0.85); color: #f1f5f9;
+                      border: 1px solid rgba(148, 163, 184, 0.25);
+                      border-radius: 5px; padding: 2px 8px; font-family: Inter, sans-serif;
+                      font-size: 11.5px; min-height: 25px; }
+    .studybar entry:focus { border-color: #3b82f6; background: rgba(15, 23, 42, 0.95); }
+    .topbar-brand { font-family: Inter, sans-serif; font-size: 11.5px; font-weight: 700;
+                    letter-spacing: 0.8px; color: #93c5fd; background: rgba(30, 58, 138, 0.4);
+                    border: 1px solid rgba(96, 165, 250, 0.3); padding: 2px 8px; border-radius: 5px; }
+    .topbar-clock { font-family: monospace; font-size: 11.5px;
+                    font-weight: 700; color: #60a5fa; background: rgba(15, 23, 42, 0.85);
+                    border: 1px solid rgba(96, 165, 250, 0.35); padding: 2px 7px; border-radius: 5px; }
+    .topbar-timer { font-family: monospace; font-size: 11.5px;
+                    font-weight: 700; color: #93c5fd; background: rgba(30, 58, 138, 0.4);
+                    border: 1px solid rgba(96, 165, 250, 0.35); padding: 2px 7px; border-radius: 5px; }
+    .topbar-timer-normal { color: #93c5fd; background: rgba(30, 58, 138, 0.4); border-color: rgba(96, 165, 250, 0.35); }
+    .topbar-timer-lockout { color: #fca5a5; background: rgba(153, 27, 27, 0.45); border-color: rgba(248, 113, 113, 0.45); }
+    .topbar-btn { background: rgba(30, 41, 59, 0.7); border: 1px solid rgba(148, 163, 184, 0.2);
+                  border-radius: 5px; color: #e2e8f0; font-family: Inter, sans-serif;
+                  font-size: 11.5px; font-weight: 600; padding: 2px 8px; min-height: 25px;
+                  box-shadow: none; }
+    .topbar-btn:hover { background: rgba(59, 130, 246, 0.25); border-color: rgba(96, 165, 250, 0.45);
+                        color: #ffffff; }
+    .topbar-btn:active { background: rgba(37, 99, 235, 0.4); }
+    .topbar-stat { font-family: Inter, sans-serif; font-size: 11px; font-weight: 600;
+                   color: #94a3b8; background: rgba(15, 23, 42, 0.7);
+                   border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 5px;
+                   padding: 2px 7px; min-height: 25px; }
     .sidebar { background: #101b2c; border-right: 1px solid rgba(148, 163, 184, 0.16);
-               padding: 12px; }
+               padding: 5px 7px; min-width: 260px; }
     .studyhead { font-family: Inter, sans-serif; font-size: 13px; color: #dbeafe;
-                 letter-spacing: 2px; font-weight: bold; }
-    .studytime { font-family: Inter, sans-serif; font-size: 13px; color: #9ca3af; }
+                 letter-spacing: 1.5px; font-weight: bold; }
+    .studytime { font-family: Inter, sans-serif; font-size: 12.5px; color: #9ca3af; }
     .sidehead { font-family: Inter, sans-serif; font-size: 10px; color: #8fa2bd;
-                letter-spacing: 1.35px; font-weight: 700; padding: 12px 8px 7px 8px; }
-    .sidebar separator { background: rgba(148, 163, 184, 0.16); margin: 10px 4px; }
+                letter-spacing: 1px; font-weight: 700; padding: 3px 4px 2px 4px; }
+    .sidebar separator { background: rgba(148, 163, 184, 0.16); margin: 2px 1px; }
+    .side-paned separator { background: rgba(148, 163, 184, 0.18); min-height: 2px; margin: 2px 0; }
+    .side-paned separator:hover { background: #3b82f6; }
     .sidebtn { background: rgba(255,255,255,0.035); border: 1px solid rgba(148,163,184,0.10);
-               box-shadow: none; padding: 8px 10px; border-radius: 9px; margin: 2px 0; }
+               box-shadow: none; padding: 3px 6px; border-radius: 5px; margin: 0; min-height: 26px; }
     .sidebtn:hover { background: rgba(59, 130, 246, 0.16);
                      border-color: rgba(96,165,250,0.32); }
     .sidebtn label { font-family: Inter, sans-serif; font-size: 12px; color: #e2e8f0; }
     .sidebtn:active { background: rgba(37, 99, 235, 0.30); }
+    .dockpane { background: #101b2c; padding: 2px 1px; }
+    .dockrow { background: rgba(255,255,255,0.035); border: 1px solid rgba(148,163,184,0.10);
+               border-radius: 6px; padding: 2px 3px; margin: 1px 0; }
+    .dockrow:hover { background: rgba(59, 130, 246, 0.16);
+                     border-color: rgba(96,165,250,0.32); }
+    .dockrow-active { background: rgba(37, 99, 235, 0.30);
+                      border-color: rgba(96,165,250,0.55); }
+    .dock-title-btn { background: transparent; border: none; box-shadow: none;
+                      padding: 1px 2px; border-radius: 4px; }
+    .dock-title-btn:hover { background: rgba(59, 130, 246, 0.18); }
+    .dock-title-btn label { font-family: Inter, sans-serif; font-size: 11.5px;
+                            color: #e2e8f0; }
+    .dockbtn { background: transparent; border: none; box-shadow: none;
+               padding: 0; min-width: 20px; min-height: 20px; border-radius: 4px; }
+    .dockbtn label { font-size: 12px; color: #94a3b8; }
+    .dockbtn:hover { background: rgba(59, 130, 246, 0.30); }
+    .dockbtn:hover label { color: #dbeafe; }
+    .dockclose:hover { background: rgba(239, 68, 68, 0.32); }
+    .dockclose:hover label { color: #fca5a5; }
+    .dockempty { font-family: Inter, sans-serif; font-size: 10px; color: #64748b;
+                 padding: 8px 6px; }
     .panel { background: #f8fafc; }
-    .studytip { font-family: Inter, sans-serif; font-size: 12px; color: #9ca3af; }
+    .studytip { font-family: Inter, sans-serif; font-size: 10px; color: #9ca3af; padding: 1px 4px; }
     .homepage { background: #0b1220; padding: 40px; }
     .floatbar { background: rgba(12, 22, 40, 0.92); border-radius: 14px;
                 padding: 7px; border: 1px solid rgba(96, 165, 250, 0.28); }
@@ -3402,6 +4441,14 @@ def show_study_window(parent=None, end_ts=None):
     .floatbtn:hover { background: rgba(37, 99, 235, 0.55); }
     .webnavbtn { min-width: 28px; min-height: 28px; padding: 0; }
     .webnavbtn label { font-size: 17px; }
+    .blockcountbtn { padding: 3px 10px; border-radius: 5px; font-family: Inter, sans-serif;
+                     font-size: 11.5px; font-weight: 700; min-height: 25px; box-shadow: none; }
+    .blockcount-clean { background: rgba(16, 185, 129, 0.12); color: #34d399;
+                        border: 1px solid rgba(52, 211, 153, 0.35); }
+    .blockcount-clean:hover { background: rgba(16, 185, 129, 0.22); }
+    .blockcount-warn { background: rgba(239, 68, 68, 0.22); color: #f87171;
+                       border: 1px solid rgba(248, 113, 113, 0.55); }
+    .blockcount-warn:hover { background: rgba(239, 68, 68, 0.32); }
     .floatbtn-on { background: rgba(59, 130, 246, 0.85); }
     .floatbtn label { font-size: 16px; color: #e5eefc; }
     .floatpage { font-family: Inter, sans-serif; font-size: 10px; color: #93a8c9;
@@ -3427,6 +4474,119 @@ def show_study_window(parent=None, end_ts=None):
                  box-shadow: none; border-radius: 8px; padding: 8px; }
     .recentrow:hover { background: rgba(37,99,235,0.25); }
     .recentrow label { color: #e2e8f0; font-family: Inter, sans-serif; font-size: 11px; }
+    .netpanel { background: #101b2c; padding: 12px; }
+    .nettitle { color: #e5eefc; font-family: Inter, sans-serif; font-weight: 700;
+                font-size: 14px; }
+    .netstatus { color: #9fb1c9; font-family: Inter, sans-serif; font-size: 11px; }
+    .netrow { background: rgba(255,255,255,0.04); border: 1px solid rgba(148,163,184,0.12);
+              border-radius: 9px; padding: 7px; }
+    .netrow:hover { background: rgba(37,99,235,0.18); }
+    .netrowname { color: #e2e8f0; font-family: Inter, sans-serif; font-size: 12px;
+                  font-weight: 600; }
+    .netmeta { color: #9fb1c9; font-family: Inter, sans-serif; font-size: 10px; }
+    .tg-shell { background: #101b2c; border-bottom: 1px solid rgba(96,165,250,0.25);
+                padding: 10px 16px; }
+    .tg-title { color: #e5eefc; font-family: Inter, sans-serif; font-size: 13px;
+                font-weight: 700; letter-spacing: 0.6px; }
+    .tg-subtitle { color: #9fb1c9; font-family: Inter, sans-serif; font-size: 10px; }
+    .tg-action { background: rgba(30,58,95,0.7); border: 1px solid rgba(96,165,250,0.28);
+                 box-shadow: none; border-radius: 8px; padding: 5px 10px; }
+    .tg-action label { color: #e5eefc; font-family: Inter, sans-serif; font-size: 11px;
+                       font-weight: 600; }
+    .dl-popover { background: #0f172a; border: 1px solid rgba(148, 163, 184, 0.25);
+                  border-radius: 12px; padding: 12px; }
+    .dl-head { font-family: Inter, sans-serif; font-size: 12px; font-weight: 700;
+               color: #f1f5f9; letter-spacing: 0.5px; }
+    .dl-row { background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(148, 163, 184, 0.12);
+              border-radius: 8px; padding: 7px 10px; margin: 2px 0; }
+    .dl-row:hover { background: rgba(37, 99, 235, 0.16); }
+    .dl-filename { font-family: Inter, sans-serif; font-size: 11px; font-weight: 600; color: #e2e8f0; }
+    .dl-meta { font-family: 'JetBrains Mono', Inter, monospace; font-size: 10px; color: #94a3b8; }
+    .dl-btn-action { background: rgba(30, 41, 59, 0.7); border: 1px solid rgba(148, 163, 184, 0.2);
+                     border-radius: 5px; color: #cbd5e1; font-size: 10px; font-weight: 600; padding: 2px 8px; }
+    .dl-btn-action:hover { background: rgba(59, 130, 246, 0.4); color: #ffffff; }
+    .dl-progressbar trough { min-height: 4px; border-radius: 2px; background: rgba(148, 163, 184, 0.2); }
+    .dl-progressbar progress { min-height: 4px; border-radius: 2px; background: #3b82f6; }
+    .history-page { background: #0b1220; padding: 14px 18px; }
+    .history-header { background: #101b2c; border: 1px solid rgba(148, 163, 184, 0.16);
+                      border-radius: 9px; padding: 8px 14px; margin-bottom: 10px; }
+    .history-title { font-family: Inter, sans-serif; font-size: 13px; font-weight: 700;
+                     letter-spacing: 0.8px; color: #e2e8f0; }
+    .history-badge { background: rgba(59, 130, 246, 0.2); color: #60a5fa;
+                     border: 1px solid rgba(96, 165, 250, 0.35); font-size: 11px;
+                     font-weight: 600; padding: 2px 8px; border-radius: 12px; }
+    .history-search { background: rgba(15, 23, 42, 0.75); color: #f8fafc;
+                      border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 7px;
+                      padding: 5px 12px; font-size: 12px; }
+    .history-search:focus { border-color: #3b82f6; }
+    .excel-scroll { background: #0b1220; border: 1px solid rgba(148, 163, 184, 0.18);
+                    border-radius: 8px; }
+    .excel-table { background-color: #0b1220; color: #e2e8f0; font-family: Inter, sans-serif;
+                   font-size: 13px; }
+    .excel-table:selected { background-color: #1e3a8a; color: #ffffff; }
+    .excel-table header button { background: #111e33; color: #93c5fd; font-family: Inter, sans-serif;
+                                 font-size: 12px; font-weight: 700; border: none;
+                                 border-bottom: 2px solid #3b82f6;
+                                 border-right: 1px solid rgba(148, 163, 184, 0.15); padding: 7px 10px; }
+    .history-footer { font-family: Inter, sans-serif; font-size: 11px; color: #64748b; padding-top: 6px; }
+    .sidebar-brand-card {
+        background: linear-gradient(135deg, rgba(30, 58, 138, 0.42) 0%, rgba(15, 23, 42, 0.75) 100%);
+        border: 1px solid rgba(96, 165, 250, 0.32);
+        border-radius: 6px;
+        padding: 4px 7px;
+        margin: 0 0 3px 0;
+    }
+    .sidebar-brand-title {
+        font-family: Inter, sans-serif;
+        font-size: 12px;
+        font-weight: 800;
+        color: #93c5fd;
+        letter-spacing: 0.8px;
+    }
+    .sidebar-brand-sub {
+        font-family: Inter, sans-serif;
+        font-size: 9.5px;
+        color: #94a3b8;
+        letter-spacing: 0.2px;
+        margin-top: 1px;
+    }
+    .side-nav-box {
+        margin-top: 0px;
+    }
+    .side-nav-btn {
+        background: rgba(30, 41, 59, 0.6);
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        box-shadow: none;
+        border-radius: 4px;
+        padding: 2px 6px;
+        font-size: 10px;
+        font-weight: 600;
+        color: #cbd5e1;
+    }
+    .side-nav-btn:hover {
+        background: rgba(59, 130, 246, 0.25);
+        border-color: rgba(96, 165, 250, 0.45);
+        color: #ffffff;
+    }
+    .side-nav-btn:disabled {
+        opacity: 0.35;
+    }
+    .extend-btn {
+        background: rgba(37, 99, 235, 0.22);
+        border: 1px solid rgba(96, 165, 250, 0.4);
+        color: #93c5fd;
+        font-weight: 700;
+    }
+    .extend-btn:hover {
+        background: rgba(37, 99, 235, 0.45);
+        color: #ffffff;
+        border-color: rgba(147, 197, 253, 0.7);
+    }
+    .extend-btn:disabled {
+        opacity: 0.4;
+    }
+    .kw-popover { background: #0f172a; border: 1px solid rgba(96, 165, 250, 0.35); border-radius: 8px; padding: 6px; }
+    .kw-feedback { font-size: 14px; font-weight: bold; min-width: 24px; color: #93c5fd; }
     """)
     Gtk.StyleContext.add_provider_for_screen(
         Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -3434,78 +4594,214 @@ def show_study_window(parent=None, end_ts=None):
     win.connect("delete-event", lambda *_: True)  # Alt+F4 blocked
 
     outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-    bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+    bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     bar.get_style_context().add_class("studybar")
-    head = Gtk.Label(label="STUDY MODE \u2014 LOCKED (SUSPENSION CONTINUES)")
-    head.get_style_context().add_class("studyhead")
-    head.set_halign(Gtk.Align.START)
+
+    clock_lbl = Gtk.Label(label=time.strftime("🕒 %I:%M:%S %p"))
+    clock_lbl.get_style_context().add_class("topbar-clock")
+    clock_lbl.set_size_request(130, 26)
+    clock_lbl.set_xalign(0.5)
+    clock_lbl.set_yalign(0.5)
+    clock_lbl.set_tooltip_text(time.strftime("%A, %d %B %Y"))
+    bar.pack_start(clock_lbl, False, False, 0)
+
     time_lbl = Gtk.Label(label="")
-    time_lbl.get_style_context().add_class("studytime")
-    time_lbl.set_halign(Gtk.Align.END)
-    time_lbl.set_hexpand(True)
-    bar.pack_start(head, False, False, 0)
-    bar.pack_start(time_lbl, True, True, 0)
-    usb_import_btn = Gtk.Button(label="Import PDF")
-    usb_import_btn.get_style_context().add_class("webnavbtn")
-    usb_import_btn.get_style_context().add_class("floatbtn")
+    time_lbl.get_style_context().add_class("topbar-timer")
+    time_lbl.set_size_request(132, 26)
+    time_lbl.set_xalign(0.5)
+    time_lbl.set_yalign(0.5)
+    bar.pack_start(time_lbl, False, False, 0)
+
+    extend_btn = Gtk.Button(label="➕ Extend")
+    extend_btn.get_style_context().add_class("topbar-btn")
+    extend_btn.get_style_context().add_class("extend-btn")
+    extend_btn.set_size_request(84, 26)
+    extend_btn.set_tooltip_text("Extend lockout duration (3 days / 7 days)")
+    bar.pack_start(extend_btn, False, False, 0)
+
+    topbar_spacer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+    topbar_spacer.set_hexpand(True)
+    bar.pack_start(topbar_spacer, True, True, 0)
+
+    usb_import_btn = Gtk.Button(label="📂 Open")
+    usb_import_btn.get_style_context().add_class("topbar-btn")
+    usb_import_btn.set_size_request(78, 26)
     usb_import_btn.set_tooltip_text(
-        "Import PDF files from a USB drive or a phone connected by Type-C")
+        "Open a PDF or image directly from storage, USB, or phone")
     bar.pack_start(usb_import_btn, False, False, 0)
-    lib_search_entry = Gtk.Entry()
-    lib_search_entry.set_width_chars(16)
-    lib_search_entry.set_placeholder_text("Search PDF/image…")
-    lib_search_entry.set_tooltip_text("Search PDFs and images in the library")
-    bar.pack_start(lib_search_entry, False, False, 0)
-    battery_lbl = Gtk.Label(label="Battery —")
-    battery_lbl.get_style_context().add_class("studytime")
-    battery_lbl.set_tooltip_text("Live battery charge")
-    bar.pack_start(battery_lbl, False, False, 4)
-    recent_btn = Gtk.Button(label="Recent ▾")
-    recent_btn.get_style_context().add_class("webnavbtn")
-    recent_btn.get_style_context().add_class("floatbtn")
-    recent_btn.set_tooltip_text("Hover to show recently visited sites and documents")
-    bar.pack_start(recent_btn, False, False, 0)
-    split_btn = Gtk.Button(label="Split view")
-    split_btn.get_style_context().add_class("webnavbtn")
-    split_btn.get_style_context().add_class("floatbtn")
+
+    add_kw_btn = Gtk.Button(label="➕ Add Keyword")
+    add_kw_btn.get_style_context().add_class("topbar-btn")
+    add_kw_btn.set_size_request(106, 26)
+    add_kw_btn.set_tooltip_text("Add blocked keyword")
+    bar.pack_start(add_kw_btn, False, False, 0)
+
+    history_btn = Gtk.Button(label="📋 Read History")
+    history_btn.get_style_context().add_class("topbar-btn")
+    history_btn.set_size_request(114, 26)
+    history_btn.set_tooltip_text("Open reading history log (Excel-style table)")
+    bar.pack_start(history_btn, False, False, 0)
+
+    split_btn = Gtk.Button(label="◫ Split View")
+    split_btn.get_style_context().add_class("topbar-btn")
+    split_btn.set_size_request(86, 26)
     split_btn.set_tooltip_text("Show two study pages side by side")
     bar.pack_start(split_btn, False, False, 0)
 
+    # Downloads popover remains supported in background without occupying top bar space
+    dl_btn = Gtk.Button(label="📥 Downloads")
+    dl_btn.get_style_context().add_class("topbar-btn")
+    dl_btn.set_tooltip_text("View active and recent downloads")
+
+    recent_btn = Gtk.Button(label="🕒 Recent ▾")
+    recent_btn.get_style_context().add_class("topbar-btn")
+    recent_btn.set_size_request(82, 26)
+    recent_btn.set_tooltip_text("Click to show recently visited sites and documents")
+    bar.pack_start(recent_btn, False, False, 0)
+
+    battery_lbl = Gtk.Label(label="🔋 —")
+    battery_lbl.get_style_context().add_class("topbar-stat")
+    battery_lbl.set_size_request(78, 26)
+    battery_lbl.set_tooltip_text("Live battery charge")
+    bar.pack_start(battery_lbl, False, False, 0)
+
+    block_counter_btn = Gtk.Button(label="🛡️ 0/10")
+    block_counter_btn.get_style_context().add_class("blockcountbtn")
+    block_counter_btn.get_style_context().add_class("blockcount-clean")
+    block_counter_btn.set_size_request(76, 26)
+    block_counter_btn.set_tooltip_text(
+        "Keyword blocks in last 5 minutes: 0/10. Reaching 10 blocks suspends Study Mode for 30 minutes.")
+    bar.pack_start(block_counter_btn, False, False, 0)
+
     right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-    side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-    side.set_size_request(270, -1)
+    side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+    side.set_size_request(260, -1)
+    side.set_hexpand(False)
+    side.set_halign(Gtk.Align.START)
     side.get_style_context().add_class("sidebar")
 
+    # Study Mode brand header moved to top of sidebar
+    brand_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+    brand_box.get_style_context().add_class("sidebar-brand-card")
+    brand_title = Gtk.Label(label="📚 STUDY MODE")
+    brand_title.get_style_context().add_class("sidebar-brand-title")
+    brand_title.set_halign(Gtk.Align.START)
+    brand_sub = Gtk.Label(label="Focused Learning Environment")
+    brand_sub.get_style_context().add_class("sidebar-brand-sub")
+    brand_sub.set_halign(Gtk.Align.START)
+    brand_box.pack_start(brand_title, False, False, 0)
+    brand_box.pack_start(brand_sub, False, False, 0)
+    side.pack_start(brand_box, False, False, 0)
+
+    # 55% Links / 45% Library split container
+    side_paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+    side_paned.get_style_context().add_class("side-paned")
+
+    # --- Upper pane: Study Links (55%) ---
+    links_pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
     links_head = Gtk.Label(label="STUDY LINKS")
     links_head.get_style_context().add_class("sidehead")
     links_head.set_halign(Gtk.Align.START)
-    links_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    links_pane.pack_start(links_head, False, False, 0)
 
-    lib_head = Gtk.Label(label="YOUR LIBRARY")
-    lib_head.get_style_context().add_class("sidehead")
-    lib_head.set_halign(Gtk.Align.START)
-    lib_title_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-    lib_title_row.pack_start(lib_head, True, True, 0)
-    lib_parent_btn = Gtk.Button(label="↑ Parent")
-    lib_parent_btn.get_style_context().add_class("sidebtn")
-    lib_parent_btn.set_relief(Gtk.ReliefStyle.NONE)
-    lib_parent_btn.set_tooltip_text("Open the parent directory")
-    lib_title_row.pack_end(lib_parent_btn, False, False, 0)
-    lib_count = Gtk.Label(label="PDFs and images on this device")
-    lib_count.get_style_context().add_class("studytip")
-    lib_count.set_halign(Gtk.Align.START)
-    lib_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
-    lib_scroll = Gtk.ScrolledWindow()
-    lib_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-    lib_scroll.set_vexpand(True)
-    lib_scroll.add(lib_box)
+    links_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+    links_scroll = Gtk.ScrolledWindow()
+    links_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    links_scroll.set_vexpand(True)
+    links_scroll.add(links_box)
+    links_pane.pack_start(links_scroll, True, True, 0)
 
-    side.pack_start(links_head, False, False, 0)
-    side.pack_start(links_box, False, False, 0)
-    side.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
-    side.pack_start(lib_title_row, False, False, 0)
-    side.pack_start(lib_count, False, False, 0)
-    side.pack_start(lib_scroll, True, True, 0)
+    # --- Lower pane: Open-page dock (replaces the old file library) ---
+    lib_pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+    lib_pane.get_style_context().add_class("dockpane")
+
+    dock_head = Gtk.Label(label="OPEN PAGES")
+    dock_head.get_style_context().add_class("sidehead")
+    dock_head.set_halign(Gtk.Align.START)
+
+    dock_count = Gtk.Label(label="Nothing open yet")
+    dock_count.get_style_context().add_class("studytip")
+    dock_count.set_halign(Gtk.Align.START)
+    dock_count.set_ellipsize(Pango.EllipsizeMode.END)
+    dock_count.set_max_width_chars(24)
+
+    dock_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+    dock_scroll = Gtk.ScrolledWindow()
+    dock_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    dock_scroll.set_vexpand(True)
+    dock_scroll.add(dock_box)
+
+    lib_pane.pack_start(dock_head, False, False, 0)
+    lib_pane.pack_start(dock_count, False, False, 0)
+    lib_pane.pack_start(dock_scroll, True, True, 0)
+
+    side_paned.pack1(links_pane, resize=True, shrink=False)
+    side_paned.pack2(lib_pane, resize=True, shrink=False)
+    side.pack_start(side_paned, True, True, 0)
+
+    paned_split_done = [False]
+    def _on_side_paned_allocate(_w, alloc):
+        if not paned_split_done[0] and alloc.height > 100:
+            paned_split_done[0] = True
+            side_paned.set_position(int(alloc.height * 0.55))
+    side_paned.connect("size-allocate", _on_side_paned_allocate)
+
+    telegram_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+    telegram_header.get_style_context().add_class("tg-shell")
+    tg_identity = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    tg_title = Gtk.Label(label="PDF MATERIALS")
+    tg_title.get_style_context().add_class("tg-title")
+    tg_title.set_halign(Gtk.Align.START)
+    tg_subtitle = Gtk.Label(label="Single-group view · Telegram Web K")
+    tg_subtitle.get_style_context().add_class("tg-subtitle")
+    tg_subtitle.set_halign(Gtk.Align.START)
+    tg_identity.pack_start(tg_title, False, False, 0)
+    tg_identity.pack_start(tg_subtitle, False, False, 0)
+    telegram_header.pack_start(tg_identity, True, True, 0)
+    tg_reload = Gtk.Button(label="↻  Group")
+    tg_reload.get_style_context().add_class("tg-action")
+    tg_reload.set_tooltip_text("Return to the PDF Materials group")
+    tg_back = Gtk.Button(label="Back to Study")
+    tg_back.get_style_context().add_class("tg-action")
+    tg_block_counter_btn = Gtk.Button(label="🛡️ 0/10")
+    tg_block_counter_btn.get_style_context().add_class("tg-action")
+    tg_block_counter_btn.get_style_context().add_class("blockcountbtn")
+    tg_block_counter_btn.get_style_context().add_class("blockcount-clean")
+    tg_block_counter_btn.set_tooltip_text(
+        "Keyword blocks in last 5 minutes: 0/10. Reaching 10 blocks suspends Study Mode for 30 minutes.")
+    telegram_header.pack_end(tg_block_counter_btn, False, False, 2)
+    telegram_header.pack_end(tg_back, False, False, 0)
+    telegram_header.pack_end(tg_reload, False, False, 0)
+    telegram_header.set_no_show_all(True)
+
+    def _update_block_counter(explicit_count=None):
+        count = _get_recent_violation_count() if explicit_count is None else explicit_count
+        label_text = f"🛡️ {count}/10"
+        for btn in (block_counter_btn, tg_block_counter_btn):
+            try:
+                btn.set_label(label_text)
+                ctx = btn.get_style_context()
+                if count > 0:
+                    ctx.remove_class("blockcount-clean")
+                    ctx.add_class("blockcount-warn")
+                else:
+                    ctx.remove_class("blockcount-warn")
+                    ctx.add_class("blockcount-clean")
+                btn.set_tooltip_text(
+                    f"Keyword blocks in last 5 minutes: {count}/10. Reaching 10 blocks suspends Study Mode for 30 minutes.")
+            except Exception:
+                pass
+
+    def _on_block_counter_click(*_):
+        c = _get_recent_violation_count()
+        _toast(f"Input filter: {c}/10 blocked keywords in last 5 minutes (10 blocks suspends Study Mode for 30m)")
+
+    block_counter_btn.connect("clicked", _on_block_counter_click)
+    tg_block_counter_btn.connect("clicked", _on_block_counter_click)
+
+    global _study_block_count_updater
+    _study_block_count_updater = _update_block_counter
+    _update_block_counter()
 
     stack = Gtk.Stack()
     stack.set_hexpand(True)
@@ -3552,6 +4848,27 @@ def show_study_window(parent=None, end_ts=None):
                 WebKit2.UserContentInjectedFrames.ALL_FRAMES,
                 WebKit2.UserScriptInjectionTime.START,
                 None, None))
+            _study_ucm.add_script(WebKit2.UserScript.new(
+                TELEGRAM_KIOSK_JS,
+                WebKit2.UserContentInjectedFrames.ALL_FRAMES,
+                WebKit2.UserScriptInjectionTime.START,
+                None, None))
+            try:
+                _study_ucm.register_script_message_handler("focusTelegramPeer")
+                _study_ucm.connect(
+                    "script-message-received::focusTelegramPeer",
+                    _telegram_peer_message)
+            except Exception as _bridge_error:
+                print(f"Telegram peer pin bridge unavailable: {_bridge_error}",
+                      flush=True)
+            try:
+                _study_ucm.register_script_message_handler("focusInputBlocked")
+                _study_ucm.connect(
+                    "script-message-received::focusInputBlocked",
+                    _focus_input_blocked_message)
+            except Exception as _bridge_error:
+                print(f"Input blocked bridge unavailable: {_bridge_error}",
+                      flush=True)
         except Exception as _e:
             print(f"input filter script unavailable: {_e}", flush=True)
             _study_ucm = None
@@ -3566,12 +4883,7 @@ def show_study_window(parent=None, end_ts=None):
     except Exception:
         web = WebKit2.WebView()
     try:
-        st = web.get_settings()
-        st.set_enable_developer_extras(False)
-        st.set_enable_html5_local_storage(True)
-        st.set_enable_html5_database(True)
-        st.set_enable_javascript(True)
-        st.set_enable_page_cache(False)
+        _configure_study_settings(web.get_settings())
     except Exception:
         pass
 
@@ -3641,9 +4953,56 @@ def show_study_window(parent=None, end_ts=None):
     web_forward.set_tooltip_text("Forward")
     web_wrap.add_overlay(web_nav)
 
+    # Web pages live in their own internal stack so the sidebar dock can keep
+    # several sites open at once and switch instantly without reloading.
+    web_stack = Gtk.Stack()
+    web_stack.set_hexpand(True)
+    web_stack.set_vexpand(True)
+    web_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+    web_stack.add_named(web_wrap, "web-main")
+    web_host = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    web_host.set_hexpand(True)
+    web_host.set_vexpand(True)
+    web_host.pack_start(web_stack, True, True, 0)
+    web_tabs = []
+    doc_state = {"active": False, "title": "", "icon": "📄"}
+
+    group_ui_state = {"active": False}
+
+    def _set_group_ui(active):
+        active = bool(active)
+        if group_ui_state["active"] == active:
+            return
+        group_ui_state["active"] = active
+        if active:
+            side.hide()
+            bar.hide()
+            telegram_header.set_no_show_all(False)
+            telegram_header.show_all()
+        else:
+            telegram_header.hide()
+            telegram_header.set_no_show_all(True)
+            side.show_all()
+            bar.show_all()
+
+    def _leave_group_view(*_):
+        _set_group_ui(False)
+        stack.set_visible_child_name("home")
+
+    def _return_to_group(*_):
+        _set_group_ui(True)
+        stack.set_visible_child_name("web")
+        web.load_uri(TELEGRAM_GROUP_URL)
+
+    tg_back.connect("clicked", _leave_group_view)
+    tg_reload.connect("clicked", _return_to_group)
+
     def _update_web_nav(*_):
-        web_back.set_sensitive(web.can_go_back())
-        web_forward.set_sensitive(web.can_go_forward())
+        current_host = (urlparse(web.get_uri() or "").hostname or "").lower()
+        telegram_view = current_host == TELEGRAM_WEB_HOST
+        _set_group_ui(telegram_view)
+        web_back.set_sensitive(not telegram_view and web.can_go_back())
+        web_forward.set_sensitive(not telegram_view and web.can_go_forward())
 
     web_back.connect("clicked", lambda *_: web.go_back())
     web_forward.connect("clicked", lambda *_: web.go_forward())
@@ -3670,6 +5029,9 @@ def show_study_window(parent=None, end_ts=None):
             uri = "https://" + uri
         parsed = urlparse(uri)
         host = (parsed.hostname or "").lower()
+        if host == TELEGRAM_WEB_HOST or host.endswith((".telegram.org", ".t.me")):
+            _toast("Telegram is only available in the single-group view")
+            return
         if parsed.scheme not in ("http", "https") or not _page_allowed(uri, allow):
             _toast(f"Blocked: {host or uri} — not in study list")
             return
@@ -3709,11 +5071,7 @@ def show_study_window(parent=None, end_ts=None):
         view.set_hexpand(True)
         view.set_vexpand(True)
         try:
-            settings = view.get_settings()
-            settings.set_enable_developer_extras(False)
-            settings.set_enable_html5_local_storage(True)
-            settings.set_enable_javascript(True)
-            settings.set_enable_page_cache(False)
+            _configure_study_settings(view.get_settings())
         except Exception:
             pass
         scroll = Gtk.ScrolledWindow()
@@ -3772,8 +5130,7 @@ def show_study_window(parent=None, end_ts=None):
                     uri = action.get_request().get_uri() or ""
                     parsed = urlparse(uri)
                     decision.ignore()
-                    if (parsed.scheme in ("http", "https")
-                            and _page_allowed(uri, allow)):
+                    if (_page_allowed(uri, allow) or parsed.scheme in ("about", "blob", "data")):
                         GLib.idle_add(_split_load_uri, view, address, uri)
                     else:
                         _toast("Popup blocked: site is not in the study list")
@@ -3783,11 +5140,18 @@ def show_study_window(parent=None, end_ts=None):
                     mime = (response.get_mime_type() or "").lower().split(";", 1)[0]
                     uri = response.get_uri() or ""
                     parsed = urlparse(uri)
-                    if (_page_allowed(uri, allow)
-                            and (mime == "application/pdf"
-                                 or parsed.path.lower().endswith(".pdf"))):
-                        decision.download()
-                        return True
+                    path = parsed.path.lower()
+                    is_att = bool(response.get_suggested_filename())
+                    unsupported = not decision.is_mime_type_supported()
+                    is_file_ext = path.endswith((".pdf", ".zip", ".rar", ".7z", ".tar", ".gz",
+                                                ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                                                ".mp3", ".m4a", ".wav", ".mp4", ".mkv", ".webm",
+                                                ".epub", ".txt", ".csv"))
+                    if (is_att or unsupported or is_file_ext or mime == "application/pdf"):
+                        if (_page_allowed(uri, allow) or _page_allowed(view.get_uri() or "", allow)
+                                or parsed.scheme in ("blob", "data")):
+                            decision.download()
+                            return True
             except Exception as e:
                 print(f"split view policy error: {e}", flush=True)
             return False
@@ -3803,6 +5167,7 @@ def show_study_window(parent=None, end_ts=None):
         forward_button.connect("clicked", lambda *_: view.go_forward()
                                if view.can_go_forward() else None)
         view.connect("authenticate", _on_web_authenticate)
+        view.connect("permission-request", lambda _v, req: (req.allow(), True)[1])
         view.connect("decide-policy", _policy)
         view.connect("load-changed", _loaded)
         view.connect("context-menu", lambda *_: True)
@@ -3891,6 +5256,179 @@ def show_study_window(parent=None, end_ts=None):
         except Exception as e:
             print(f"study state save error: {e}", flush=True)
 
+    raw_recent_downloads = _load_state_file(STUDY_DOWNLOADS_STATE, [])
+    recent_downloads = [item for item in raw_recent_downloads if isinstance(item, dict)][:30]
+    active_downloads = {}
+
+    def _format_size(num_bytes):
+        if not num_bytes or num_bytes <= 0:
+            return "0 B"
+        size = float(num_bytes)
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024.0:
+                return f"{size:.1f} {unit}" if unit != 'B' else f"{int(size)} B"
+            size /= 1024.0
+        return f"{size:.1f} TB"
+
+    dl_popover = Gtk.Popover.new(dl_btn)
+    dl_popover.set_position(Gtk.PositionType.BOTTOM)
+    dl_popover_scroll = Gtk.ScrolledWindow()
+    dl_popover_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    dl_popover_scroll.set_max_content_height(380)
+    dl_popover_scroll.set_propagate_natural_height(True)
+    dl_popover_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    dl_popover_box.set_size_request(320, -1)
+    dl_popover_box.get_style_context().add_class("dl-popover")
+    dl_popover_scroll.add(dl_popover_box)
+    dl_popover.add(dl_popover_scroll)
+
+    def _render_dl_popover():
+        for ch in dl_popover_box.get_children():
+            dl_popover_box.remove(ch)
+
+        head_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        title = Gtk.Label(label="DOWNLOADS")
+        title.get_style_context().add_class("dl-head")
+        title.set_halign(Gtk.Align.START)
+        head_box.pack_start(title, True, True, 0)
+
+        open_folder_btn = Gtk.Button(label="📁 Folder")
+        open_folder_btn.get_style_context().add_class("dl-btn-action")
+        open_folder_btn.set_tooltip_text(f"Open: {DOWNLOAD_DIR}")
+        def _open_folder(*_):
+            try:
+                os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+                subprocess.Popen(["xdg-open", DOWNLOAD_DIR])
+            except Exception as e:
+                _toast(f"Could not open folder: {e}")
+        open_folder_btn.connect("clicked", _open_folder)
+        head_box.pack_end(open_folder_btn, False, False, 0)
+        dl_popover_box.pack_start(head_box, False, False, 2)
+
+        if active_downloads:
+            active_head = Gtk.Label(label="RUNNING")
+            active_head.get_style_context().add_class("sidehead")
+            active_head.set_halign(Gtk.Align.START)
+            dl_popover_box.pack_start(active_head, False, False, 0)
+
+            for dl, info in list(active_downloads.items()):
+                row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+                row.get_style_context().add_class("dl-row")
+
+                top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                name_lbl = Gtk.Label(label=info["name"])
+                name_lbl.get_style_context().add_class("dl-filename")
+                name_lbl.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+                name_lbl.set_halign(Gtk.Align.START)
+                top.pack_start(name_lbl, True, True, 0)
+
+                cancel_btn = Gtk.Button(label="✕")
+                cancel_btn.get_style_context().add_class("dl-btn-action")
+                cancel_btn.set_tooltip_text("Cancel download")
+                cancel_btn.connect("clicked", lambda *_, d=dl: d.cancel())
+                top.pack_end(cancel_btn, False, False, 0)
+                row.pack_start(top, False, False, 0)
+
+                pbar = Gtk.ProgressBar()
+                pbar.get_style_context().add_class("dl-progressbar")
+                pbar.set_fraction(max(0.0, min(1.0, info["progress"])))
+                row.pack_start(pbar, False, False, 0)
+
+                sub_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+                pct_str = f"{int(info['progress'] * 100)}%"
+                size_str = f"{_format_size(info['received'])}"
+                if info["total"] > 0:
+                    size_str += f" / {_format_size(info['total'])}"
+                meta_lbl = Gtk.Label(label=f"{pct_str} · {size_str}")
+                meta_lbl.get_style_context().add_class("dl-meta")
+                meta_lbl.set_halign(Gtk.Align.START)
+                sub_box.pack_start(meta_lbl, True, True, 0)
+                row.pack_start(sub_box, False, False, 0)
+
+                dl_popover_box.pack_start(row, False, False, 0)
+
+        if recent_downloads:
+            dl_popover_box.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 4)
+            rec_head = Gtk.Label(label="RECENT")
+            rec_head.get_style_context().add_class("sidehead")
+            rec_head.set_halign(Gtk.Align.START)
+            dl_popover_box.pack_start(rec_head, False, False, 0)
+
+            for item in recent_downloads[:10]:
+                rrow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                rrow.get_style_context().add_class("dl-row")
+
+                icon_lbl = Gtk.Label(label="📄" if item["status"] == "completed" else "⚠️")
+                rrow.pack_start(icon_lbl, False, False, 0)
+
+                details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+                fn_lbl = Gtk.Label(label=item["name"])
+                fn_lbl.get_style_context().add_class("dl-filename")
+                fn_lbl.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+                fn_lbl.set_halign(Gtk.Align.START)
+                details.pack_start(fn_lbl, False, False, 0)
+
+                sub_text = _format_size(item.get("size", 0)) if item["status"] == "completed" else "Failed"
+                sub_lbl = Gtk.Label(label=sub_text)
+                sub_lbl.get_style_context().add_class("dl-meta")
+                sub_lbl.set_halign(Gtk.Align.START)
+                details.pack_start(sub_lbl, False, False, 0)
+                rrow.pack_start(details, True, True, 0)
+
+                if item["status"] == "completed" and os.path.isfile(item.get("path", "")):
+                    open_btn = Gtk.Button(label="Open")
+                    open_btn.get_style_context().add_class("dl-btn-action")
+                    fpath = item["path"]
+                    def _open_file(*_, p=fpath):
+                        if p.lower().endswith((".pdf", ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")):
+                            _open_media(p)
+                        else:
+                            try:
+                                subprocess.Popen(["xdg-open", p])
+                            except Exception as e:
+                                _toast(f"Open failed: {e}")
+                    open_btn.connect("clicked", _open_file)
+                    rrow.pack_end(open_btn, False, False, 0)
+
+                dl_popover_box.pack_start(rrow, False, False, 0)
+
+        if not active_downloads and not recent_downloads:
+            empty_lbl = Gtk.Label(label="No downloads yet")
+            empty_lbl.get_style_context().add_class("dl-meta")
+            empty_lbl.set_padding(12, 12)
+            dl_popover_box.pack_start(empty_lbl, False, False, 8)
+
+        dl_popover_box.show_all()
+
+    def _update_download_ui():
+        try:
+            if not active_downloads:
+                dl_btn.set_label("📥 Downloads")
+                dl_btn.set_tooltip_text("View active and recent downloads")
+            elif len(active_downloads) == 1:
+                info = list(active_downloads.values())[0]
+                pct = int(info["progress"] * 100)
+                dl_btn.set_label(f"📥 {pct}%")
+                dl_btn.set_tooltip_text(f"Downloading: {info['name']} ({pct}%)")
+            else:
+                avg_pct = int(sum(info["progress"] for info in active_downloads.values()) / len(active_downloads) * 100)
+                dl_btn.set_label(f"📥 {len(active_downloads)} ({avg_pct}%)")
+                dl_btn.set_tooltip_text(f"{len(active_downloads)} active downloads ({avg_pct}%)")
+            if dl_popover.get_visible():
+                _render_dl_popover()
+        except Exception:
+            pass
+
+    def _toggle_dl_popover(*_):
+        if dl_popover.get_visible():
+            dl_popover.popdown()
+        else:
+            _render_dl_popover()
+            dl_popover.show_all()
+            dl_popover.popup()
+
+    dl_btn.connect("clicked", _toggle_dl_popover)
+
     def _record_recent(kind, key, title, page=None):
         if not key:
             return
@@ -3926,6 +5464,48 @@ def show_study_window(parent=None, end_ts=None):
     def _record_recent_document(path, page=1):
         _record_recent("doc", path, os.path.basename(path), page)
 
+    def _load_read_history():
+        raw = _load_state_file(STUDY_READ_HISTORY_STATE, [])
+        items = []
+        if isinstance(raw, list):
+            for entry in raw:
+                if isinstance(entry, dict) and "book" in entry:
+                    items.append({
+                        "id": str(entry.get("id") or secrets.token_hex(4)),
+                        "date": str(entry.get("date") or time.strftime("%Y-%m-%d %H:%M")),
+                        "book": str(entry.get("book") or "").strip(),
+                        "page": str(entry.get("page") or "1").strip()
+                    })
+        return items
+
+    def _save_read_history(items):
+        try:
+            _write_state_file(STUDY_READ_HISTORY_STATE, items)
+        except Exception as e:
+            print(f"save read history error: {e}", flush=True)
+
+    def _record_read_history_entry(book_name, page_no):
+        try:
+            items = _load_read_history()
+            now_str = time.strftime("%Y-%m-%d %H:%M")
+            found = False
+            for it in items:
+                if it["book"].strip().lower() == book_name.strip().lower():
+                    it["page"] = str(page_no)
+                    it["date"] = now_str
+                    found = True
+                    break
+            if not found:
+                items.insert(0, {
+                    "id": secrets.token_hex(4),
+                    "date": now_str,
+                    "book": book_name,
+                    "page": str(page_no)
+                })
+            _save_read_history(items)
+        except Exception as e:
+            print(f"record read history error: {e}", flush=True)
+
     def _save_reading_page(path, page):
         if not path or not path.lower().endswith(".pdf"):
             return
@@ -3933,6 +5513,8 @@ def show_study_window(parent=None, end_ts=None):
         reading_pages[key] = max(1, int(page))
         _write_state_file(STUDY_READING_STATE, reading_pages)
         _record_recent_document(key, page)
+        book_title = os.path.splitext(os.path.basename(path))[0]
+        _record_read_history_entry(book_title, page)
 
     def _battery_text():
         for supply in glob.glob("/sys/class/power_supply/*"):
@@ -3944,10 +5526,17 @@ def show_study_window(parent=None, end_ts=None):
                     continue
                 with open(os.path.join(supply, "capacity")) as f:
                     percent = max(0, min(100, int(f.read().strip())))
-                return f"Battery {percent}%"
+                status = ""
+                try:
+                    with open(os.path.join(supply, "status")) as f:
+                        status = f.read().strip().lower()
+                except Exception:
+                    pass
+                icon = "⚡" if "charg" in status else "🔋"
+                return f"{icon} {percent}%"
             except (OSError, ValueError):
                 continue
-        return "Battery N/A"
+        return "🔋 N/A"
 
     def _refresh_battery():
         try:
@@ -3959,31 +5548,78 @@ def show_study_window(parent=None, end_ts=None):
     _refresh_battery()
     battery_timer = GLib.timeout_add_seconds(30, _refresh_battery)
 
+    def _telegram_group_file_uri(uri):
+        try:
+            page = urlparse(web.get_uri() or "")
+            file = urlparse(uri or "")
+            host = (file.hostname or "").lower()
+            return (page.hostname == "web.telegram.org"
+                    and (page.path or "").rstrip("/").lower() in TELEGRAM_WEB_PATHS
+                    and _page_allowed(web.get_uri() or "", allow)
+                    and (host == "web.telegram.org" or host == "telegram.org"
+                         or host.endswith(".telegram.org"))
+                    and ("/file/" in (file.path or "").lower()
+                         or (file.path or "").lower().endswith(".pdf")))
+        except Exception:
+            return False
+
     def _on_decide_policy(_view, decision, dtype):
         try:
             if dtype == WebKit2.PolicyDecisionType.RESPONSE:
                 response = decision.get_response()
                 uri = response.get_uri() or ""
                 mime = (response.get_mime_type() or "").lower().split(";", 1)[0].strip()
-                host = (urlparse(uri).hostname or "").lower()
                 path = urlparse(uri).path.lower()
-                if (_page_allowed(uri, allow)
-                        and (mime == "application/pdf" or path.endswith(".pdf"))):
-                    decision.download()
-                    return True
+                is_attachment = bool(response.get_suggested_filename())
+                unsupported_mime = not decision.is_mime_type_supported()
+                is_file_ext = path.endswith((".pdf", ".zip", ".rar", ".7z", ".tar", ".gz",
+                                             ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                                             ".mp3", ".m4a", ".wav", ".mp4", ".mkv", ".webm",
+                                             ".epub", ".txt", ".csv"))
+                is_tg = _telegram_group_file_uri(uri)
+                current_allowed = _page_allowed(web.get_uri() or "", allow)
+                uri_allowed = _page_allowed(uri, allow)
+                if (is_attachment or unsupported_mime or is_file_ext or mime == "application/pdf" or is_tg):
+                    if uri_allowed or current_allowed or uri.startswith(("blob:", "data:")) or is_tg:
+                        decision.download()
+                        return True
             if dtype == WebKit2.PolicyDecisionType.NAVIGATION_ACTION:
                 uri = decision.get_navigation_action().get_request().get_uri()
-                if uri and uri.startswith(("file://", "blob:", "data:", "about:")):
+                if uri and uri.startswith("file://"):
+                    local_path = os.path.realpath(
+                        urllib.parse.unquote(urlparse(uri).path))
+                    media_ext = os.path.splitext(local_path)[1].lower()
+                    trusted_dirs = [os.path.realpath(p) for p in
+                                    (DOWNLOAD_DIR, STUDY_INBOX)]
+                    if (media_ext in MEDIA_EXTS and os.path.isfile(local_path)
+                            and any(local_path.startswith(d + os.sep)
+                                    for d in trusted_dirs)):
+                        decision.ignore()
+                        GLib.idle_add(_open_media, local_path)
+                        return True
+                    return False
+                if uri and uri.startswith(("blob:", "data:", "about:")):
                     return False  # in-page PDF/blob from an already-allowed page
                 host = (urlparse(uri).hostname or "").lower() if uri else ""
+                if uri and _telegram_group_file_uri(uri):
+                    decision.ignore()
+                    try:
+                        web.download_uri(uri)
+                    except Exception as e:
+                        print(f"Telegram document download error: {e}", flush=True)
+                        _toast("Telegram download failed; try the document again")
+                    return True
                 if uri and _page_allowed(uri, allow):
-                    if uri.lower().split("?")[0].endswith(".pdf"):
-                        # fetch into inbox and open in the built-in reader
+                    clean_path = uri.lower().split("?")[0]
+                    if clean_path.endswith((".pdf", ".zip", ".rar", ".7z", ".tar", ".gz",
+                                            ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                                            ".mp3", ".m4a", ".wav", ".mp4", ".mkv", ".webm",
+                                            ".epub", ".txt", ".csv")):
                         decision.ignore()
                         try:
                             web.download_uri(uri)
                         except Exception as e:
-                            print(f"pdf download error: {e}", flush=True)
+                            print(f"file download error: {e}", flush=True)
                         return True
                     return False
                 decision.ignore()
@@ -3993,90 +5629,274 @@ def show_study_window(parent=None, end_ts=None):
                 uri = decision.get_navigation_action().get_request().get_uri()
                 host = (urlparse(uri).hostname or "").lower() if uri else ""
                 decision.ignore()
-                if uri and _page_allowed(uri, allow):
-                    # BoiMate and file hosts sometimes target a new window. Reuse
-                    # the current view so its normal download policy can handle it.
-                    GLib.idle_add(web.load_uri, uri)
+                if uri:
+                    clean_path = uri.lower().split("?")[0]
+                    if clean_path.endswith((".pdf", ".zip", ".rar", ".7z", ".tar", ".gz",
+                                            ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                                            ".mp3", ".m4a", ".wav", ".mp4", ".mkv", ".webm",
+                                            ".epub", ".txt", ".csv")):
+                        try:
+                            web.download_uri(uri)
+                        except Exception:
+                            pass
+                        return True
+                if uri and (_page_allowed(uri, allow) or uri.startswith(("blob:", "data:", "about:"))):
+                    GLib.idle_add(_open_popup, uri)
                 else:
+                    print(f"popup blocked: {uri}", flush=True)
                     _toast("Popup blocked: site is not in the study list")
                 return True
         except Exception as e:
             print(f"policy error: {e}", flush=True)
         return False
 
-    def _on_create(*_a):
-        _toast("Popup blocked")
+    def _on_create(web_view, navigation_action):
+        try:
+            req = navigation_action.get_request() if navigation_action else None
+            uri = req.get_uri() if req else None
+            if uri and uri != "about:blank":
+                clean_path = uri.lower().split("?")[0]
+                if clean_path.endswith((".pdf", ".zip", ".rar", ".7z", ".tar", ".gz",
+                                        ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                                        ".mp3", ".m4a", ".wav", ".mp4", ".mkv", ".webm",
+                                        ".epub", ".txt", ".csv")):
+                    web_view.download_uri(uri)
+                    return None
+                if _page_allowed(uri, allow) or uri.startswith(("blob:", "data:")):
+                    GLib.idle_add(_open_popup, uri)
+                    return None
+
+            temp_view = WebKit2.WebView.new_with_context(web_view.get_context())
+            try:
+                _configure_study_settings(temp_view.get_settings())
+            except Exception:
+                pass
+
+            def _temp_policy(_v, decision, dtype):
+                try:
+                    if dtype == WebKit2.PolicyDecisionType.RESPONSE:
+                        resp = decision.get_response()
+                        resp_uri = resp.get_uri() or ""
+                        mime = (resp.get_mime_type() or "").lower().split(";", 1)[0].strip()
+                        rpath = urlparse(resp_uri).path.lower()
+                        is_att = bool(resp.get_suggested_filename())
+                        unsupported = not decision.is_mime_type_supported()
+                        is_file_dl = (mime == "application/pdf" or rpath.endswith(
+                            (".pdf", ".zip", ".rar", ".7z", ".tar", ".gz",
+                             ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                             ".mp3", ".m4a", ".wav", ".mp4", ".mkv", ".webm",
+                             ".epub", ".txt", ".csv")))
+                        if is_att or unsupported or is_file_dl:
+                            decision.download()
+                            GLib.idle_add(temp_view.destroy)
+                            return True
+                    if dtype == WebKit2.PolicyDecisionType.NAVIGATION_ACTION:
+                        nuri = decision.get_navigation_action().get_request().get_uri() or ""
+                        npath = urlparse(nuri).path.lower()
+                        if npath.endswith((".pdf", ".zip", ".rar", ".7z", ".tar", ".gz",
+                                           ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                                           ".mp3", ".m4a", ".wav", ".mp4", ".mkv", ".webm",
+                                           ".epub", ".txt", ".csv")):
+                            decision.ignore()
+                            web_view.download_uri(nuri)
+                            GLib.idle_add(temp_view.destroy)
+                            return True
+                        if _page_allowed(nuri, allow):
+                            decision.ignore()
+                            web_view.load_uri(nuri)
+                            GLib.idle_add(temp_view.destroy)
+                            return True
+                except Exception as e:
+                    print(f"temp view policy error: {e}", flush=True)
+                return False
+
+            temp_view.connect("decide-policy", _temp_policy)
+            temp_view.connect("close", lambda *_: temp_view.destroy())
+            GLib.timeout_add_seconds(60, lambda: (temp_view.destroy(), False)[1])
+            return temp_view
+        except Exception as e:
+            print(f"create popup error: {e}", flush=True)
         return None
 
     def _on_context_menu(*_a):
         return True
 
     def _on_download(download):
+        req = download.get_request()
+        init_uri = req.get_uri() if req else ""
+        init_name = os.path.basename(urlparse(init_uri).path) if init_uri else ""
+        if not init_name:
+            init_name = "download"
+        init_name = os.path.basename(urllib.parse.unquote(init_name.replace("\\", "/")))
+
+        active_downloads[download] = {
+            "name": init_name,
+            "path": "",
+            "progress": 0.0,
+            "received": 0,
+            "total": 0,
+            "status": "downloading",
+        }
+        _update_download_ui()
+
+        def _on_progress_changed(dl, _pspec):
+            if dl in active_downloads:
+                active_downloads[dl]["progress"] = dl.get_estimated_progress()
+                active_downloads[dl]["received"] = dl.get_received_data_length()
+                resp = dl.get_response()
+                if resp:
+                    active_downloads[dl]["total"] = resp.get_content_length()
+                _update_download_ui()
+
+        download.connect("notify::estimated-progress", _on_progress_changed)
+
+        def _on_decide_destination(dl, suggested_filename):
+            try:
+                response = dl.get_response()
+                name = suggested_filename or ""
+                if not name and response:
+                    try:
+                        name = response.get_suggested_filename() or ""
+                    except Exception:
+                        pass
+                if not name:
+                    req_dl = dl.get_request()
+                    if req_dl and req_dl.get_uri():
+                        name = os.path.basename(urlparse(req_dl.get_uri()).path)
+                if not name:
+                    name = "download"
+                name = os.path.basename(urllib.parse.unquote(name.replace("\\", "/")))
+                ext = os.path.splitext(name)[1].lower()
+                mime = (response.get_mime_type() or "").lower().split(";", 1)[0].strip() \
+                    if response else ""
+                inferred_ext = {
+                    "application/pdf": ".pdf",
+                    "image/jpeg": ".jpg",
+                    "image/jpg": ".jpg",
+                    "image/png": ".png",
+                    "image/webp": ".webp",
+                    "image/gif": ".gif",
+                    "image/bmp": ".bmp",
+                    "image/svg+xml": ".svg",
+                    "image/heic": ".heic",
+                    "image/heif": ".heif",
+                    "application/zip": ".zip",
+                    "application/x-zip-compressed": ".zip",
+                    "application/msword": ".doc",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+                    "application/vnd.ms-excel": ".xls",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+                    "application/vnd.ms-powerpoint": ".ppt",
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+                    "audio/mpeg": ".mp3",
+                    "video/mp4": ".mp4",
+                    "text/plain": ".txt",
+                }.get(mime, "")
+                if not ext and inferred_ext:
+                    name = name + inferred_ext
+                    ext = inferred_ext
+
+                try:
+                    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+                    if not os.access(DOWNLOAD_DIR, os.W_OK):
+                        raise OSError("Downloads folder is not writable")
+                    download_dir = DOWNLOAD_DIR
+                except OSError:
+                    os.makedirs(STUDY_INBOX, exist_ok=True)
+                    download_dir = STUDY_INBOX
+                    _toast("Downloads folder unavailable; saving to Study Inbox")
+
+                dst = os.path.join(download_dir, name)
+                if os.path.exists(dst):
+                    stem, e = os.path.splitext(name)
+                    i = 1
+                    while os.path.exists(os.path.join(download_dir, f"{stem} ({i}){e}")):
+                        i += 1
+                    dst = os.path.join(download_dir, f"{stem} ({i}){e}")
+                    name = os.path.basename(dst)
+
+                if dl in active_downloads:
+                    active_downloads[dl]["name"] = name
+                    active_downloads[dl]["path"] = dst
+
+                dest_uri = GLib.filename_to_uri(os.path.abspath(dst), None)
+                dl.set_destination(dest_uri)
+                try:
+                    dl.set_allow_overwrite(True)
+                except Exception:
+                    pass
+
+                def _done(_dl):
+                    info = active_downloads.pop(_dl, None)
+                    final_path = dst
+                    dest = _dl.get_destination()
+                    if dest and dest.startswith("file://"):
+                        try:
+                            final_path, _ = GLib.filename_from_uri(dest)
+                        except Exception:
+                            pass
+                    f_name = os.path.basename(final_path)
+                    f_size = os.path.getsize(final_path) if os.path.isfile(final_path) else 0
+                    if not os.path.isfile(final_path) or f_size <= 0:
+                        _toast("Download did not finish; try downloading again")
+                        recent_downloads.insert(0, {
+                            "name": f_name or (info["name"] if info else "Download"),
+                            "path": final_path,
+                            "size": 0,
+                            "status": "failed",
+                            "time": time.time(),
+                        })
+                    else:
+                        location = "Downloads" if download_dir == DOWNLOAD_DIR else "Study Inbox"
+                        _toast(f"Downloaded to {location}: {f_name}")
+                        recent_downloads.insert(0, {
+                            "name": f_name,
+                            "path": final_path,
+                            "size": f_size,
+                            "status": "completed",
+                            "time": time.time(),
+                        })
+                        if f_name.lower().endswith((".pdf", ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")):
+                            _open_media(final_path)
+                    del recent_downloads[30:]
+                    _write_state_file(STUDY_DOWNLOADS_STATE, recent_downloads)
+                    _update_download_ui()
+
+                def _failed(_dl, error):
+                    info = active_downloads.pop(_dl, None)
+                    f_name = info["name"] if info else "Download"
+                    recent_downloads.insert(0, {
+                        "name": f_name,
+                        "path": info.get("path", "") if info else "",
+                        "size": 0,
+                        "status": "failed",
+                        "time": time.time(),
+                    })
+                    del recent_downloads[30:]
+                    _write_state_file(STUDY_DOWNLOADS_STATE, recent_downloads)
+                    print(f"download failed: {error}", flush=True)
+                    _toast(f"Download failed: {error}")
+                    _update_download_ui()
+
+                dl.connect("finished", _done)
+                dl.connect("failed", _failed)
+                _update_download_ui()
+                return True
+            except Exception as e:
+                print(f"decide destination error: {e}", flush=True)
+                active_downloads.pop(dl, None)
+                _update_download_ui()
+                return False
+
         try:
-            name = download.get_suggested_filename() or "download"
-            name = os.path.basename(urllib.parse.unquote(name.replace("\\", "/")))
-            ext = os.path.splitext(name)[1].lower()
-            response = download.get_response()
-            mime = (response.get_mime_type() or "").lower().split(";", 1)[0].strip() \
-                if response else ""
-            inferred_ext = {
-                "application/pdf": ".pdf", "image/jpeg": ".jpg",
-                "image/png": ".png", "image/webp": ".webp",
-                "image/gif": ".gif", "image/bmp": ".bmp",
-            }.get(mime, "")
-            page_host = (urlparse(web.get_uri() or "").hostname or "").lower()
-            if not inferred_ext and mime in ("", "application/octet-stream", "application/pdf") \
-                    and _host_allowed(page_host, ("boimate.com", "*.boimate.com")):
-                inferred_ext = ".pdf"
-            allowed_exts = set(dl_exts) | {".pdf"}
-            if ext not in allowed_exts and inferred_ext in allowed_exts:
-                name = (os.path.splitext(name)[0] or "boimate-book") + inferred_ext
-                ext = inferred_ext
-            if ext not in allowed_exts:
-                download.cancel()
-                _toast(f"File type not supported: {name}")
-                return
-            try:
-                os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-                if not os.access(DOWNLOAD_DIR, os.W_OK):
-                    raise OSError("Downloads folder is not writable")
-                download_dir = DOWNLOAD_DIR
-            except OSError:
-                os.makedirs(STUDY_INBOX, exist_ok=True)
-                download_dir = STUDY_INBOX
-                _toast("Downloads folder unavailable; saving to Study Inbox")
-            dst = os.path.join(download_dir, name)
-            if os.path.exists(dst):
-                stem, e = os.path.splitext(dst)
-                dst = f"{stem}-{int(time.time())}{e}"
-            download.set_destination("file://" + urllib.parse.quote(dst))
-
-            def _done(*_a):
-                if not os.path.isfile(dst) or os.path.getsize(dst) <= 0:
-                    _toast("Download did not finish; try the book link again")
-                    return
-                location = "Downloads" if download_dir == DOWNLOAD_DIR else "Study Inbox"
-                _toast(f"Downloaded to {location}: {os.path.basename(dst)}")
-                refresh_library()
-                if dst.lower().endswith(".pdf"):
-                    _open_media(dst)
-
-            def _failed(_download, error):
-                print(f"download failed: {error}", flush=True)
-                _toast(f"Download failed: {error}")
-
-            download.connect("finished", _done)
-            download.connect("failed", _failed)
+            download.connect("decide-destination", _on_decide_destination)
         except Exception as e:
-            print(f"download error: {e}", flush=True)
-            try:
-                download.cancel()
-            except Exception:
-                pass
+            print(f"download connect error: {e}", flush=True)
 
     web.connect("decide-policy", _on_decide_policy)
     web.connect("create", _on_create)
     web.connect("context-menu", _on_context_menu)
+    web.connect("permission-request", lambda _v, req: (req.allow(), True)[1])
     download_context = None
     download_handler_id = 0
     try:
@@ -4212,9 +6032,228 @@ def show_study_window(parent=None, end_ts=None):
     for _tool in floatbar.get_children():
         _tool.connect("enter-notify-event", _toolbar_enter)
         _tool.connect("leave-notify-event", _toolbar_leave)
-    stack.add_named(web_wrap, "web")
+    stack.add_named(web_host, "web")
     stack.add_named(reader, "reader")
     stack.add_named(split_panel, "split")
+
+    # ---------- Read History Page (Excel / Spreadsheet style) ----------
+    history_return_page = {"name": "home"}
+    history_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    history_panel.get_style_context().add_class("history-page")
+
+    history_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+    history_header.get_style_context().add_class("history-header")
+
+    hist_title = Gtk.Label(label="📖 READING HISTORY")
+    hist_title.get_style_context().add_class("history-title")
+    history_header.pack_start(hist_title, False, False, 0)
+
+    history_count_lbl = Gtk.Label(label="0 records")
+    history_count_lbl.get_style_context().add_class("history-badge")
+    history_header.pack_start(history_count_lbl, False, False, 0)
+
+    hist_spacer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+    hist_spacer.set_hexpand(True)
+    history_header.pack_start(hist_spacer, True, True, 0)
+
+    history_search_entry = Gtk.Entry()
+    history_search_entry.set_width_chars(24)
+    history_search_entry.set_placeholder_text("🔍 Search history…")
+    history_search_entry.set_tooltip_text("Search across Book Name, Page, Date or SL No")
+    history_search_entry.get_style_context().add_class("history-search")
+    history_header.pack_start(history_search_entry, False, False, 0)
+
+    add_row_btn = Gtk.Button(label="+ Add Entry")
+    add_row_btn.get_style_context().add_class("topbar-btn")
+    add_row_btn.set_tooltip_text("Add a new book or reading record")
+    history_header.pack_start(add_row_btn, False, False, 0)
+
+    delete_row_btn = Gtk.Button(label="🗑 Delete")
+    delete_row_btn.get_style_context().add_class("topbar-btn")
+    delete_row_btn.set_tooltip_text("Delete selected reading log entry")
+    history_header.pack_start(delete_row_btn, False, False, 0)
+
+    close_history_btn = Gtk.Button(label="← Back to Study")
+    close_history_btn.get_style_context().add_class("topbar-btn")
+    close_history_btn.set_tooltip_text("Return to previous study view")
+    history_header.pack_start(close_history_btn, False, False, 0)
+
+    history_panel.pack_start(history_header, False, False, 0)
+
+    history_store = Gtk.ListStore(str, str, str, str, str)
+
+    def _history_search_filter(model, it, _data):
+        q = (history_search_entry.get_text() or "").strip().lower()
+        if not q:
+            return True
+        sl = (model.get_value(it, 0) or "").lower()
+        dt = (model.get_value(it, 1) or "").lower()
+        bk = (model.get_value(it, 2) or "").lower()
+        pg = (model.get_value(it, 3) or "").lower()
+        return q in bk or q in pg or q in dt or q in sl
+
+    history_filter = history_store.filter_new()
+    history_filter.set_visible_func(_history_search_filter)
+
+    history_search_entry.connect("changed", lambda *_: history_filter.refilter())
+
+    history_tree = Gtk.TreeView(model=history_filter)
+    history_tree.set_rules_hint(True)
+    history_tree.set_grid_lines(Gtk.TreeViewGridLines.BOTH)
+    history_tree.get_style_context().add_class("excel-table")
+
+    def _save_history_from_store():
+        items = []
+        for idx, row in enumerate(history_store, start=1):
+            row[0] = str(idx)
+            items.append({
+                "id": row[4],
+                "date": row[1],
+                "book": row[2],
+                "page": row[3]
+            })
+        _save_read_history(items)
+        history_count_lbl.set_text(f"{len(items)} records")
+
+    def _reload_history_store():
+        history_store.clear()
+        items = _load_read_history()
+        for idx, it in enumerate(items, start=1):
+            history_store.append([
+                str(idx),
+                str(it.get("date") or time.strftime("%Y-%m-%d %H:%M")),
+                str(it.get("book") or ""),
+                str(it.get("page") or "1"),
+                str(it.get("id") or secrets.token_hex(4))
+            ])
+        history_count_lbl.set_text(f"{len(items)} records")
+        history_filter.refilter()
+
+    sl_col = Gtk.TreeViewColumn("SL (ক্রমিক)")
+    sl_col.set_fixed_width(75)
+    sl_col.set_alignment(0.5)
+    sl_cell = Gtk.CellRendererText()
+    sl_cell.set_alignment(0.5, 0.5)
+    sl_col.pack_start(sl_cell, False)
+    sl_col.add_attribute(sl_cell, "text", 0)
+    history_tree.append_column(sl_col)
+
+    date_col = Gtk.TreeViewColumn("Date (তারিখ)")
+    date_col.set_fixed_width(170)
+    date_col.set_alignment(0.5)
+    date_cell = Gtk.CellRendererText()
+    date_cell.set_alignment(0.5, 0.5)
+    date_col.pack_start(date_cell, False)
+    date_col.add_attribute(date_cell, "text", 1)
+    history_tree.append_column(date_col)
+
+    book_col = Gtk.TreeViewColumn("Book Name (বইয়ের নাম) ✎")
+    book_col.set_expand(True)
+    book_col.set_min_width(220)
+    book_cell = Gtk.CellRendererText()
+    book_cell.set_property("editable", True)
+    book_col.pack_start(book_cell, True)
+    book_col.add_attribute(book_cell, "text", 2)
+
+    def _on_book_cell_edited(_cell, path_str, new_text):
+        new_text = str(new_text or "").strip()
+        if not new_text:
+            return
+        try:
+            f_iter = history_filter.get_iter(path_str)
+            c_iter = history_filter.convert_iter_to_child_iter(f_iter)
+            if history_store[c_iter][2] != new_text:
+                history_store[c_iter][2] = new_text
+                history_store[c_iter][1] = time.strftime("%Y-%m-%d %H:%M")
+                _save_history_from_store()
+                _toast(f"Updated '{new_text}' (Date auto-synced)")
+        except Exception as e:
+            print(f"book cell edit error: {e}", flush=True)
+
+    book_cell.connect("edited", _on_book_cell_edited)
+    history_tree.append_column(book_col)
+
+    page_col = Gtk.TreeViewColumn("Page (পৃষ্ঠা) ✎")
+    page_col.set_fixed_width(120)
+    page_col.set_alignment(0.5)
+    page_cell = Gtk.CellRendererText()
+    page_cell.set_alignment(0.5, 0.5)
+    page_cell.set_property("editable", True)
+    page_col.pack_start(page_cell, False)
+    page_col.add_attribute(page_cell, "text", 3)
+
+    def _on_page_cell_edited(_cell, path_str, new_text):
+        new_text = str(new_text or "").strip()
+        if not new_text:
+            return
+        try:
+            f_iter = history_filter.get_iter(path_str)
+            c_iter = history_filter.convert_iter_to_child_iter(f_iter)
+            if history_store[c_iter][3] != new_text:
+                history_store[c_iter][3] = new_text
+                history_store[c_iter][1] = time.strftime("%Y-%m-%d %H:%M")
+                _save_history_from_store()
+                _toast(f"Page set to {new_text} (Date auto-synced)")
+        except Exception as e:
+            print(f"page cell edit error: {e}", flush=True)
+
+    page_cell.connect("edited", _on_page_cell_edited)
+    history_tree.append_column(page_col)
+
+    def _add_history_row(*_):
+        now_str = time.strftime("%Y-%m-%d %H:%M")
+        new_id = secrets.token_hex(4)
+        history_store.insert(0, ["1", now_str, "New Book Title", "1", new_id])
+        _save_history_from_store()
+        try:
+            history_tree.set_cursor(Gtk.TreePath.new_first(), book_col, True)
+        except Exception:
+            pass
+        _toast("New book entry added — click to edit")
+
+    add_row_btn.connect("clicked", _add_history_row)
+
+    def _delete_history_row(*_):
+        selection = history_tree.get_selection()
+        model, f_iter = selection.get_selected()
+        if f_iter:
+            c_iter = history_filter.convert_iter_to_child_iter(f_iter)
+            bk_name = history_store[c_iter][2]
+            history_store.remove(c_iter)
+            _save_history_from_store()
+            _toast(f"Deleted '{bk_name or 'entry'}'")
+
+    delete_row_btn.connect("clicked", _delete_history_row)
+
+    close_history_btn.connect("clicked", lambda *_: stack.set_visible_child_name(
+        history_return_page.get("name") or "home"))
+
+    history_scroll = Gtk.ScrolledWindow()
+    history_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+    history_scroll.set_hexpand(True)
+    history_scroll.set_vexpand(True)
+    history_scroll.get_style_context().add_class("excel-scroll")
+    history_scroll.add(history_tree)
+    history_panel.pack_start(history_scroll, True, True, 0)
+
+    history_footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+    history_footer_lbl = Gtk.Label(
+        label="ℹ️ Click on Book Name or Page to edit inline. Date auto-syncs on edit. All changes are saved locally.")
+    history_footer_lbl.get_style_context().add_class("history-footer")
+    history_footer.pack_start(history_footer_lbl, False, False, 4)
+    history_panel.pack_start(history_footer, False, False, 4)
+
+    _reload_history_store()
+    stack.add_named(history_panel, "history")
+
+    def _open_read_history(*_):
+        cur = stack.get_visible_child_name()
+        if cur != "history":
+            history_return_page["name"] = cur or "home"
+        _reload_history_store()
+        stack.set_visible_child_name("history")
+
+    history_btn.connect("clicked", _open_read_history)
 
     import cairo as _pcairo  # pycairo: pixbuf filter + annotation PDF surface
 
@@ -4556,7 +6595,7 @@ def show_study_window(parent=None, end_ts=None):
     def _on_reader_resize(_widget, _allocation):
         if pdf_layout["active"] and pdf_layout["fit_width"]:
             new_zoom = _fit_zoom()
-            if abs(new_zoom - state["zoom"]) > 0.01:
+            if abs(new_zoom - state["zoom"]) > 0.05:
                 pdf_layout["restore_page"] = state["page"]
                 pdf_layout["restoring"] = True
                 page_request["id"] += 1
@@ -4582,6 +6621,22 @@ def show_study_window(parent=None, end_ts=None):
 
     def _open_media(path):
         ext = os.path.splitext(path)[1].lower()
+        if ext in (".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv",
+                   ".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac",
+                   ".zip", ".rar", ".7z", ".tar", ".gz",
+                   ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods"):
+            try:
+                subprocess.Popen(["xdg-open", path])
+                _toast(f"Opening {os.path.basename(path)}…")
+            except Exception as e:
+                _toast(f"Could not open: {e}")
+            return
+        doc_state.update(active=True, title=os.path.basename(path),
+                         icon="📄" if ext == ".pdf" else "🖼️")
+        try:
+            _render_dock()
+        except Exception:
+            pass
         state.update(backup_done=False)
         page_request["id"] += 1
         request_id = page_request["id"]
@@ -4895,210 +6950,596 @@ def show_study_window(parent=None, end_ts=None):
     fit_btn.connect("clicked", _fit_page)
     actual_size_btn.connect("clicked", _actual_size)
 
-    def _load_link(url):
-        if url.startswith("file://") or _page_allowed(url, allow):
-            stack.set_visible_child_name("web")
-            web.load_uri(url)
-        else:
-            _toast("Blocked: not in study list")
+    FILE_DL_EXTS = (".pdf", ".zip", ".rar", ".7z", ".tar", ".gz",
+                    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                    ".mp3", ".m4a", ".wav", ".mp4", ".mkv", ".webm",
+                    ".epub", ".txt", ".csv")
+    _tab_seq = [0]
+    _popup_seen = {}
 
-    for item in cfg.get("links", []):
-        b = Gtk.Button(label="\u2197  " + str(item.get("title", "Link")))
-        b.get_style_context().add_class("sidebtn")
-        b.set_relief(Gtk.ReliefStyle.NONE)
-        b.set_halign(Gtk.Align.FILL)
-        b.set_tooltip_text(str(item.get("url", "")))
-        b.connect("clicked", lambda _b, u=item.get("url", ""): _load_link(u))
-        links_box.pack_start(b, False, False, 0)
+    def _tab_icon(url, title=""):
+        raw = f"{urlparse(url or '').hostname or ''} {title}".lower()
+        if "notebook" in raw or "gemini" in raw:
+            return "🧠"
+        if "medical" in raw:
+            return "🩺"
+        if "boimate" in raw:
+            return "📘"
+        if "muslimbangla" in raw:
+            return "🕌"
+        if "ihadis" in raw or "hadith" in raw:
+            return "📖"
+        if "livemcq" in raw:
+            return "🧪"
+        if "translate" in raw:
+            return "🔤"
+        if "telegram" in raw:
+            return "✈️"
+        if "youtube" in raw or "youtu.be" in raw:
+            return "▶️"
+        if "drive.google" in raw or "docs.google" in raw:
+            return "📚"
+        return "🌐"
 
-    lib_sig = {"n": 0}
-    lib_state = {
-        "cwd": os.path.expanduser("~"),
-        "home": os.path.expanduser("~"),
-        "dirs": {},          # dirpath -> [(mtime, path)]
-        "roots": [os.path.expanduser(r) for r in
-                  (cfg.get("scan_roots") or _STUDY_DEFAULTS["scan_roots"])],
-    }
-    MAX_ROWS = 400
+    def _tab_label(tab):
+        title = (tab.get("title") or "").strip()
+        if not title or title.startswith(("http://", "https://")):
+            title = (urlparse(tab.get("url") or "").hostname or "New page")
+        return title
 
-    def _crumb(path):
-        home = lib_state["home"]
-        return "~" if path == home else (
-            "~" + path[len(home):] if path.startswith(home + "/") else path)
+    def _new_dock_row(icon, title, active, on_open, on_min=None,
+                      on_close=None, minimized=False):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=1)
+        row.get_style_context().add_class("dockrow")
+        if active:
+            row.get_style_context().add_class("dockrow-active")
+        open_btn = Gtk.Button()
+        open_btn.get_style_context().add_class("dock-title-btn")
+        open_btn.set_relief(Gtk.ReliefStyle.NONE)
+        open_btn.set_hexpand(True)
+        open_btn.set_tooltip_text(title)
+        inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        icon_lbl = Gtk.Label(label=icon)
+        icon_lbl.set_size_request(18, -1)
+        title_lbl = Gtk.Label(label=("▁ " if minimized else "") + title)
+        title_lbl.set_xalign(0.0)
+        title_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        title_lbl.set_max_width_chars(17)
+        inner.pack_start(icon_lbl, False, False, 0)
+        inner.pack_start(title_lbl, True, True, 0)
+        open_btn.add(inner)
+        open_btn.connect("clicked", lambda *_: on_open())
+        row.pack_start(open_btn, True, True, 0)
+        if on_close is not None:
+            close_btn = Gtk.Button(label="×")
+            close_btn.get_style_context().add_class("dockbtn")
+            close_btn.get_style_context().add_class("dockclose")
+            close_btn.set_tooltip_text("Close")
+            close_btn.connect("clicked", lambda *_: on_close())
+            row.pack_end(close_btn, False, False, 0)
+        if on_min is not None:
+            min_btn = Gtk.Button(label="▣" if minimized else "—")
+            min_btn.get_style_context().add_class("dockbtn")
+            min_btn.set_tooltip_text("Restore" if minimized else "Minimize")
+            min_btn.connect("clicked", lambda *_: on_min())
+            row.pack_end(min_btn, False, False, 0)
+        return row
 
-    def _subfolders(dirs, cwd):
-        """Immediate sub-folders under cwd with total media counts."""
-        prefix = cwd.rstrip("/") + "/"
-        counts = {}
-        for d, files in dirs.items():
-            if d == cwd or not d.startswith(prefix):
-                continue
-            top = d[len(prefix):].split("/")[0]
-            counts[top] = counts.get(top, 0) + len(files)
-        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower()))
-
-    def _render_library():
-        for ch in lib_box.get_children():
-            lib_box.remove(ch)
-        cwd = lib_state["cwd"]
-        dirs = lib_state["dirs"]
-        query = lib_search_entry.get_text().strip().lower()
-        rows = 0
-
-        parent = os.path.dirname(cwd.rstrip("/")) or "/"
-        lib_parent_btn.set_sensitive(cwd.rstrip("/") != "/")
-
-        for name, count in (() if query else _subfolders(dirs, cwd)):
-            b = Gtk.Button(label=f"\U0001F4C1 {name}  ({count})")
-            b.get_style_context().add_class("sidebtn")
-            b.set_relief(Gtk.ReliefStyle.NONE)
-            b.set_halign(Gtk.Align.FILL)
-            b.set_tooltip_text(os.path.join(cwd, name))
-            b.connect("clicked", lambda _b, n=name: _goto(os.path.join(cwd, n)))
-            lib_box.pack_start(b, False, False, 0)
-            rows += 1
-            if rows >= MAX_ROWS:
-                break
-
-        # other drive/volume roots reachable from home
-        if not query and cwd.rstrip("/") == lib_state["home"].rstrip("/"):
-            for r in lib_state["roots"]:
-                r = os.path.abspath(r)
-                if r.rstrip("/") == cwd.rstrip("/") or not os.path.isdir(r):
-                    continue
-                cnt = sum(len(v) for d, v in dirs.items()
-                          if d == r or d.startswith(r.rstrip("/") + "/"))
-                if not cnt:
-                    continue
-                b = Gtk.Button(label=f"\U0001F5B4 {r}  ({cnt})")
-                b.get_style_context().add_class("sidebtn")
-                b.set_relief(Gtk.ReliefStyle.NONE)
-                b.set_halign(Gtk.Align.FILL)
-                b.connect("clicked", lambda _b, rr=r: _goto(rr))
-                lib_box.pack_start(b, False, False, 0)
-                rows += 1
-
-        if query:
-            files = sorted(
-                (_mt, path)
-                for folder_files in dirs.values()
-                for _mt, path in folder_files
-                if query in os.path.basename(path).lower())
-        else:
-            files = dirs.get(cwd, [])
-        for _mt, path in files[:max(0, MAX_ROWS - rows)]:
-            icon = "\U0001F4C4" if path.lower().endswith(".pdf") else "\U0001F5BC"
-            label = os.path.basename(path)
-            if len(label) > 28:
-                label = label[:25] + "\u2026"
-            if query:
-                label = f"{label}  ·  {_crumb(os.path.dirname(path))}"
-            b = Gtk.Button(label=f"{icon} {label}")
-            b.get_style_context().add_class("sidebtn")
-            b.set_relief(Gtk.ReliefStyle.NONE)
-            b.set_halign(Gtk.Align.FILL)
-            b.set_tooltip_text(path)
-            b.connect("clicked", lambda _b, p=path: _open_media(p))
-            lib_box.pack_start(b, False, False, 0)
-            rows += 1
-        if query and not files:
-            empty = Gtk.Label(label="No matching PDF or image")
-            empty.get_style_context().add_class("studytip")
-            empty.set_halign(Gtk.Align.START)
-            lib_box.pack_start(empty, False, False, 6)
-
-        total = sum(len(v) for v in dirs.values())
-        lib_head.set_text(f"LIBRARY \u2022 {_crumb(cwd)}")
-        if query:
-            lib_count.set_text(f"{len(files)} match(es) across {total} files")
-        else:
-            lib_count.set_text(f"{total} files \u2022 {len(_subfolders(dirs, cwd))} folder(s) here")
+    def _render_dock(*_):
         try:
-            lib_box.show_all()
+            for child in dock_box.get_children():
+                dock_box.remove(child)
+            current = stack.get_visible_child_name()
+            active_web = (web_stack.get_visible_child_name()
+                          if current == "web" else None)
+            count = 0
+            for tab in list(web_tabs):
+                url = tab.get("url") or tab["view"].get_uri() or ""
+                tab["url"] = url
+                if tab["view"].get_title():
+                    tab["title"] = tab["view"].get_title()
+                row = _new_dock_row(
+                    _tab_icon(url, tab.get("title", "")),
+                    _tab_label(tab),
+                    bool(active_web == tab["name"]),
+                    lambda t=tab: _show_tab(t),
+                    on_min=(lambda t=tab: _minimize_tab(t)),
+                    on_close=(lambda t=tab: _close_tab(t)),
+                    minimized=bool(tab.get("minimized")))
+                dock_box.pack_start(row, False, False, 0)
+                count += 1
+            if doc_state.get("active"):
+                doc_title = doc_state.get("title") or "Document"
+                row = _new_dock_row(
+                    doc_state.get("icon") or "📄",
+                    doc_title,
+                    current == "reader",
+                    on_open=_show_doc,
+                    on_min=_minimize_doc,
+                    on_close=_close_doc,
+                    minimized=bool(doc_state.get("minimized")))
+                dock_box.pack_start(row, False, False, 0)
+                count += 1
+            if count == 0:
+                empty = Gtk.Label(label="Open a study link or a PDF/image.\n"
+                                        "Everything you open stays here.")
+                empty.get_style_context().add_class("dockempty")
+                empty.set_halign(Gtk.Align.START)
+                empty.set_line_wrap(True)
+                dock_box.pack_start(empty, False, False, 0)
+                dock_count.set_text("Nothing open yet")
+            else:
+                dock_count.set_text(f"{count} open — click to switch")
+            dock_box.show_all()
+        except Exception as e:
+            print(f"dock render error: {e}", flush=True)
+
+    def _show_tab(tab):
+        try:
+            tab["minimized"] = False
+            stack.set_visible_child_name("web")
+            web_stack.set_visible_child_name(tab["name"])
+            host = (urlparse(tab["view"].get_uri() or tab.get("url") or "")
+                    .hostname or "").lower()
+            _set_group_ui(host == TELEGRAM_WEB_HOST)
+            _render_dock()
+        except Exception as e:
+            print(f"dock switch error: {e}", flush=True)
+
+    def _minimize_tab(tab):
+        tab["minimized"] = True
+        try:
+            if (stack.get_visible_child_name() == "web"
+                    and web_stack.get_visible_child_name() == tab["name"]):
+                stack.set_visible_child_name("home")
+            _render_dock()
         except Exception:
             pass
 
-    lib_search_entry.connect("changed", lambda *_: _render_library())
+    def _close_tab(tab):
+        try:
+            was_current = (stack.get_visible_child_name() == "web"
+                           and web_stack.get_visible_child_name() == tab["name"])
+            if tab.get("main"):
+                try:
+                    tab["view"].stop_loading()
+                    tab["view"].load_uri("about:blank")
+                except Exception:
+                    pass
+            else:
+                try:
+                    web_stack.remove(tab["wrap"])
+                except Exception:
+                    pass
+                try:
+                    tab["view"].destroy()
+                except Exception:
+                    pass
+            if tab in web_tabs:
+                web_tabs.remove(tab)
+            if was_current:
+                remaining = [t for t in web_tabs if not t.get("minimized")]
+                if remaining:
+                    _show_tab(remaining[-1])
+                elif doc_state.get("active") and not doc_state.get("minimized"):
+                    _show_doc()
+                else:
+                    stack.set_visible_child_name("home")
+            _render_dock()
+        except Exception as e:
+            print(f"dock close error: {e}", flush=True)
 
-    def _goto(path):
-        path = os.path.abspath(path)
-        known = set(lib_state["dirs"].keys())
-        for d in known:
-            if d.startswith(path.rstrip("/") + "/"):
-                known.add(path)
-                break
-        if path in known or path == "/" or os.path.isdir(path):
-            lib_state["cwd"] = path
-            _render_library()
+    def _show_doc():
+        try:
+            doc_state["minimized"] = False
+            stack.set_visible_child_name("reader")
+            _set_group_ui(False)
+            _render_dock()
+        except Exception:
+            pass
 
-    lib_parent_btn.connect(
-        "clicked", lambda *_: _goto(os.path.dirname(lib_state["cwd"].rstrip("/")) or "/"))
+    def _minimize_doc():
+        doc_state["minimized"] = True
+        try:
+            if stack.get_visible_child_name() == "reader":
+                stack.set_visible_child_name("home")
+            _render_dock()
+        except Exception:
+            pass
 
-    def refresh_library():
-        lib_sig["n"] += 1
-        token = lib_sig["n"]
+    def _close_doc():
+        try:
+            if state.get("path") and str(state["path"]).lower().endswith(".pdf"):
+                _save_reading_page(state["path"], state.get("page", 1))
+        except Exception:
+            pass
+        doc_state.update(active=False, title="", icon="📄", minimized=False)
+        try:
+            if stack.get_visible_child_name() == "reader":
+                stack.set_visible_child_name("home")
+            _render_dock()
+        except Exception:
+            pass
 
-        def _work():
-            dirs = {}
-            for _m, p in _scan_media(lib_state["roots"]):
-                dirs.setdefault(os.path.dirname(p), []).append((_m, p))
-            GLib.idle_add(lambda: _apply(dirs, token))
+    def _tab_policy(view, decision, dtype):
+        try:
+            if dtype == WebKit2.PolicyDecisionType.RESPONSE:
+                response = decision.get_response()
+                uri = response.get_uri() or ""
+                mime = (response.get_mime_type() or "").lower().split(";", 1)[0].strip()
+                path = urlparse(uri).path.lower()
+                is_attachment = bool(response.get_suggested_filename())
+                unsupported = not decision.is_mime_type_supported()
+                is_file = path.endswith(FILE_DL_EXTS)
+                if (is_attachment or unsupported or is_file
+                        or mime == "application/pdf"):
+                    if (_page_allowed(uri, allow)
+                            or _page_allowed(view.get_uri() or "", allow)
+                            or uri.startswith(("blob:", "data:"))):
+                        decision.download()
+                        return True
+            if dtype == WebKit2.PolicyDecisionType.NAVIGATION_ACTION:
+                uri = decision.get_navigation_action().get_request().get_uri() or ""
+                parsed = urlparse(uri)
+                if parsed.scheme in ("about", "blob", "data"):
+                    return False
+                if parsed.scheme == "file":
+                    local_path = os.path.realpath(
+                        urllib.parse.unquote(parsed.path))
+                    media_ext = os.path.splitext(local_path)[1].lower()
+                    trusted = [os.path.realpath(p) for p in
+                               (DOWNLOAD_DIR, STUDY_INBOX)]
+                    if (media_ext in MEDIA_EXTS and os.path.isfile(local_path)
+                            and any(local_path.startswith(d + os.sep)
+                                    for d in trusted)):
+                        decision.ignore()
+                        GLib.idle_add(_open_media, local_path)
+                        return True
+                    return False
+                if _page_allowed(uri, allow):
+                    if uri.lower().split("?")[0].endswith(FILE_DL_EXTS):
+                        decision.ignore()
+                        try:
+                            view.download_uri(uri)
+                        except Exception:
+                            pass
+                        return True
+                    return False
+                decision.ignore()
+                print(f"nav blocked (tab): {uri}", flush=True)
+                _toast(f"Blocked: {parsed.hostname or uri} — not in study list")
+                return True
+            if dtype == WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION:
+                uri = decision.get_navigation_action().get_request().get_uri() or ""
+                decision.ignore()
+                if uri:
+                    if uri.lower().split("?")[0].endswith(FILE_DL_EXTS):
+                        try:
+                            view.download_uri(uri)
+                        except Exception:
+                            pass
+                        return True
+                    if (_page_allowed(uri, allow)
+                            or uri.startswith(("about:", "blob:", "data:"))):
+                        GLib.idle_add(_open_popup, uri)
+                    else:
+                        print(f"popup blocked: {uri}", flush=True)
+                        _toast("Popup blocked: site is not in the study list")
+                return True
+        except Exception as e:
+            print(f"tab policy error: {e}", flush=True)
+        return False
 
-        def _apply(dirs, tok):
-            if tok != lib_sig["n"]:
-                return False
-            lib_state["dirs"] = dirs
-            _render_library()
-            return False
+    def _tab_create(parent_view, navigation_action):
+        try:
+            req = navigation_action.get_request() if navigation_action else None
+            uri = req.get_uri() if req else ""
+            if uri:
+                if uri.lower().split("?")[0].endswith(FILE_DL_EXTS):
+                    parent_view.download_uri(uri)
+                    return None
+                if (_page_allowed(uri, allow)
+                        or uri.startswith(("about:", "blob:", "data:"))):
+                    GLib.idle_add(_open_popup, uri)
+                else:
+                    print(f"popup blocked (create): {uri}", flush=True)
+                    _toast("Popup blocked: site is not in the study list")
+        except Exception as e:
+            print(f"popup create error: {e}", flush=True)
+        try:
+            tmp = WebKit2.WebView.new_with_context(parent_view.get_context())
+            GLib.timeout_add_seconds(10, lambda: (tmp.destroy(), False)[1])
+            return tmp
+        except Exception:
+            return None
 
-        threading.Thread(target=_work, daemon=True).start()
+    def _open_popup(uri):
+        now = time.time()
+        if _popup_seen.get(uri, 0) > now - 2:
+            return
+        _popup_seen[uri] = now
+        _open_web_url(uri, force_new=True, allow_special=True)
 
-    refresh_library()
+    def _create_web_tab(url, main=False):
+        if main:
+            name = "web-main"
+            view, wrap = web, web_wrap
+        else:
+            _tab_seq[0] += 1
+            name = f"web-tab-{_tab_seq[0]}"
+            try:
+                if _study_web_context is not None and _study_ucm is not None:
+                    view = WebKit2.WebView(
+                        web_context=_study_web_context,
+                        user_content_manager=_study_ucm)
+                elif _study_web_context is not None:
+                    view = WebKit2.WebView.new_with_context(_study_web_context)
+                else:
+                    view = WebKit2.WebView()
+            except Exception:
+                view = WebKit2.WebView()
+            try:
+                _configure_study_settings(view.get_settings())
+            except Exception:
+                pass
+            view.set_hexpand(True)
+            view.set_vexpand(True)
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+            scroll.add(view)
+            wrap = Gtk.Overlay()
+            wrap.add(scroll)
+            nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            nav.get_style_context().add_class("floatbar")
+            nav.set_halign(Gtk.Align.END)
+            nav.set_valign(Gtk.Align.START)
+            nav.set_margin_top(10)
+            nav.set_margin_end(12)
+            back_b = Gtk.Button(label="‹")
+            fwd_b = Gtk.Button(label="›")
+            for nav_btn in (back_b, fwd_b):
+                nav_btn.get_style_context().add_class("floatbtn")
+                nav_btn.get_style_context().add_class("webnavbtn")
+                nav_btn.set_size_request(30, 30)
+                nav.pack_start(nav_btn, False, False, 0)
+            back_b.set_tooltip_text("Back")
+            fwd_b.set_tooltip_text("Forward")
+            back_b.connect("clicked", lambda *_: view.go_back()
+                           if view.can_go_back() else None)
+            fwd_b.connect("clicked", lambda *_: view.go_forward()
+                          if view.can_go_forward() else None)
+            wrap.add_overlay(nav)
+            web_stack.add_named(wrap, name)
+            view.connect("authenticate", _on_web_authenticate)
+            view.connect("permission-request",
+                         lambda _v, req: (req.allow(), True)[1])
+            view.connect("context-menu", lambda *_: True)
+            view.connect("decide-policy",
+                         lambda _v, d, t: _tab_policy(view, d, t))
+            view.connect("create", lambda _v, nav_a: _tab_create(view, nav_a))
+            view.connect("load-changed",
+                         lambda _v, ev: _on_tab_load(tab, ev))
+        tab = {"id": name, "name": name, "view": view, "wrap": wrap,
+               "url": url, "title": "", "minimized": False, "main": main}
+        web_tabs.append(tab)
+        return tab
 
-    def _import_usb_pdfs(*_):
+    def _on_tab_load(tab, event):
+        try:
+            if event == WebKit2.LoadEvent.STARTED:
+                tab["url"] = tab["view"].get_uri() or tab["url"]
+                _show_loading()
+            elif event == WebKit2.LoadEvent.FINISHED:
+                tab["url"] = tab["view"].get_uri() or tab["url"]
+                title = tab["view"].get_title()
+                if title:
+                    tab["title"] = title
+                _hide_loading()
+                _record_recent_website(tab["url"], title)
+                _render_dock()
+        except Exception as e:
+            print(f"tab load event error: {e}", flush=True)
+
+    def _open_web_url(url, force_new=False, allow_special=False, title=""):
+        raw = str(url or "").strip()
+        if not raw:
+            return None
+        if raw.startswith(("about:", "blob:", "data:")):
+            if not allow_special:
+                return None
+        else:
+            if "://" not in raw:
+                raw = "https://" + raw
+            parsed = urlparse(raw)
+            host = (parsed.hostname or "").lower()
+            if host == TELEGRAM_WEB_HOST or host.endswith((".telegram.org", ".t.me")):
+                main_tab = next((t for t in web_tabs if t.get("main")), None)
+                if main_tab is None:
+                    main_tab = _create_web_tab(TELEGRAM_GROUP_URL, main=True)
+                _show_tab(main_tab)
+                try:
+                    web.load_uri(TELEGRAM_GROUP_URL)
+                except Exception:
+                    pass
+                return main_tab
+            if not _page_allowed(raw, allow):
+                print(f"nav blocked: {raw}", flush=True)
+                _toast(f"Blocked: {host or raw} — not in study list")
+                return None
+        if not force_new:
+            for tab in web_tabs:
+                current = tab.get("url") or tab["view"].get_uri() or ""
+                if current == raw:
+                    _show_tab(tab)
+                    return tab
+            for tab in web_tabs:
+                if (tab["view"].get_uri() or "") == raw:
+                    _show_tab(tab)
+                    return tab
+        main = not any(t.get("main") for t in web_tabs)
+        tab = _create_web_tab(raw, main=main)
+        if title:
+            tab["title"] = title
+        _show_tab(tab)
+        _show_loading()
+        try:
+            tab["view"].load_uri(raw)
+        except Exception as e:
+            print(f"tab load error: {e}", flush=True)
+        _render_dock()
+        return tab
+
+    def _load_link(url):
+        url_clean = str(url or "").strip().lower()
+        if (url_clean in ("tg-materials", "pdf-materials", "pdf materials (cloud)", "pdf materials cloud")
+                or "telegram-materials" in url_clean
+                or (urlparse(url or "").hostname or "").lower() == TELEGRAM_WEB_HOST
+                or str(url).strip() == TELEGRAM_GROUP_URL):
+            _open_web_url(TELEGRAM_GROUP_URL)
+            return
+        if url.startswith("file://") or _page_allowed(url, allow):
+            _open_web_url(url)
+        else:
+            _toast("Blocked: not in study list")
+
+    def _make_side_btn(icon_text, tooltip, on_click):
+        btn = Gtk.Button()
+        btn.get_style_context().add_class("sidebtn")
+        btn.set_relief(Gtk.ReliefStyle.NONE)
+        btn.set_halign(Gtk.Align.FILL)
+        btn.set_hexpand(False)
+        lbl = Gtk.Label(label=icon_text)
+        lbl.set_xalign(0.0)
+        lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        lbl.set_max_width_chars(21)
+        btn.add(lbl)
+        if tooltip:
+            btn.set_tooltip_text(str(tooltip))
+        btn.connect("clicked", on_click)
+        return btn
+
+    for item in cfg.get("links", []):
+        t = str(item.get("title", "Link"))
+        u = str(item.get("url", ""))
+        b = _make_side_btn(f"↗  {t}", f"{t}\n{u}", lambda _b, target=u: _load_link(target))
+        links_box.pack_start(b, False, False, 0)
+
+
+    def _open_files(*_):
         chooser = Gtk.FileChooserDialog(
-            title="Import PDF from USB/Type-C",
+            title="Open PDF / Image",
             parent=win,
             action=Gtk.FileChooserAction.OPEN)
         chooser.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        chooser.add_button("Import PDFs", Gtk.ResponseType.ACCEPT)
+        chooser.add_button("Open", Gtk.ResponseType.ACCEPT)
         chooser.set_select_multiple(True)
-        pdf_filter = Gtk.FileFilter()
-        pdf_filter.set_name("PDF files only")
-        pdf_filter.add_mime_type("application/pdf")
-        pdf_filter.add_pattern("*.pdf")
-        pdf_filter.add_pattern("*.PDF")
-        chooser.add_filter(pdf_filter)
+        if os.path.isdir(STUDY_INBOX):
+            try:
+                chooser.set_current_folder(STUDY_INBOX)
+            except Exception:
+                pass
+
+        all_filter = Gtk.FileFilter()
+        all_filter.set_name("PDF and Images (*.pdf, *.png, *.jpg…)")
+        all_filter.add_mime_type("application/pdf")
+        for ext_p in ("*.pdf", "*.PDF", "*.jpg", "*.jpeg", "*.png", "*.webp", "*.gif", "*.bmp",
+                      "*.JPG", "*.JPEG", "*.PNG", "*.WEBP", "*.GIF", "*.BMP"):
+            all_filter.add_pattern(ext_p)
+        chooser.add_filter(all_filter)
+
         response = chooser.run()
         uris = chooser.get_uris() if response == Gtk.ResponseType.ACCEPT else []
         chooser.destroy()
         if not uris:
             return
-        copied = 0
-        last_error = None
+        opened = None
+        rejected = 0
         for uri in uris:
-            path, error = _import_usb_pdf_uri(uri)
-            if path:
-                copied += 1
-            elif error:
-                last_error = error
-        if copied:
-            lib_state["cwd"] = STUDY_INBOX
-            refresh_library()
-            _toast(f"Imported {copied} PDF(s) into Study Inbox")
-        elif last_error:
-            _toast(last_error)
+            if not uri.startswith("file://"):
+                rejected += 1
+                continue
+            path = os.path.realpath(urllib.parse.unquote(uri[7:]))
+            if (os.path.isfile(path)
+                    and os.path.splitext(path)[1].lower() in MEDIA_EXTS):
+                opened = path
+            else:
+                rejected += 1
+        if opened:
+            _open_media(opened)
+            if rejected:
+                _toast(f"Opened last file; {rejected} not supported")
         else:
-            _toast("No PDFs were imported")
+            _toast("Only PDF/image files can be opened")
 
-    usb_import_btn.connect("clicked", _import_usb_pdfs)
+    usb_import_btn.connect("clicked", _open_files)
 
-    back_btn = Gtk.Button(label="\u2190 Back to Lockout")
+    kw_popover = Gtk.Popover.new(add_kw_btn)
+    kw_popover.set_position(Gtk.PositionType.BOTTOM)
+
+    kw_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    kw_box.get_style_context().add_class("kw-popover")
+    kw_box.set_margin_top(6)
+    kw_box.set_margin_bottom(6)
+    kw_box.set_margin_start(8)
+    kw_box.set_margin_end(8)
+
+    kw_entry = Gtk.Entry()
+    kw_entry.set_width_chars(20)
+    kw_entry.set_placeholder_text("Add blocked keyword…")
+    kw_box.pack_start(kw_entry, True, True, 0)
+
+    kw_submit_btn = Gtk.Button(label="Add")
+    kw_submit_btn.get_style_context().add_class("topbar-btn")
+    kw_box.pack_start(kw_submit_btn, False, False, 0)
+
+    kw_feedback_lbl = Gtk.Label(label="")
+    kw_feedback_lbl.get_style_context().add_class("kw-feedback")
+    kw_box.pack_start(kw_feedback_lbl, False, False, 0)
+
+    kw_popover.add(kw_box)
+
+    def _submit_kw(*_):
+        raw = (kw_entry.get_text() or "").strip()
+        if not raw:
+            return
+        kw_entry.set_text("")
+        if _is_keyword_blocked(raw):
+            kw_feedback_lbl.set_text("👍")
+            _toast("👍")
+        else:
+            _add_blocked_keyword(raw)
+            if web:
+                try:
+                    web.run_javascript(
+                        f"if (window.__focusAddWord) window.__focusAddWord({json.dumps(raw.lower())});"
+                    )
+                except Exception:
+                    pass
+            kw_feedback_lbl.set_text("✔ Done")
+            _toast("✔ Done")
+        GLib.idle_add(kw_entry.grab_focus)
+
+    def _toggle_kw_popover(*_):
+        if kw_popover.get_visible():
+            kw_popover.popdown()
+        else:
+            kw_entry.set_text("")
+            kw_feedback_lbl.set_text("")
+            kw_popover.show_all()
+            kw_popover.popup()
+            GLib.idle_add(kw_entry.grab_focus)
+
+    kw_entry.connect("activate", _submit_kw)
+    kw_submit_btn.connect("clicked", _submit_kw)
+    add_kw_btn.connect("clicked", _toggle_kw_popover)
+
+    back_btn = Gtk.Button(label="\u2190 Back to Lockout" if end_ts else "\u2190 Back to Work")
     back_btn.get_style_context().add_class("backbtn")
-    back_btn.set_size_request(-1, 42)
-    side.pack_start(back_btn, False, False, 4)
+    back_btn.set_size_request(-1, 30)
+    side.pack_start(back_btn, False, False, 2)
 
     right.pack_start(bar, False, False, 0)
+    right.pack_start(telegram_header, False, False, 0)
     right.pack_start(stack_wrap, True, True, 0)
     outer.pack_start(side, False, False, 0)
     outer.pack_start(right, True, True, 0)
@@ -5200,6 +7641,8 @@ def show_study_window(parent=None, end_ts=None):
                 _toast("That document is no longer available at its saved location")
         elif item.get("kind") == "web":
             url = item.get("url", "")
+            if (urlparse(url).hostname or "").lower() == TELEGRAM_WEB_HOST:
+                url = TELEGRAM_GROUP_URL
             if url and _page_allowed(url, allow):
                 stack.set_visible_child_name("web")
                 web.load_uri(url)
@@ -5225,8 +7668,6 @@ def show_study_window(parent=None, end_ts=None):
         recent_panel.set_no_show_all(True)
         return False
 
-    recent_btn.connect("enter-notify-event", _show_recent_panel)
-    recent_panel.connect("enter-notify-event", _show_recent_panel)
     recent_close_btn.connect("clicked", _hide_recent_panel)
     recent_btn.connect("clicked", lambda *_: _hide_recent_panel()
                        if recent_panel.get_visible() else _show_recent_panel())
@@ -5241,7 +7682,7 @@ def show_study_window(parent=None, end_ts=None):
     load_inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     load_inner.set_halign(Gtk.Align.END)
     load_inner.set_valign(Gtk.Align.START)
-    load_head = Gtk.Label(label="Opening page…")
+    load_head = Gtk.Label(label="Please Don't Waste Your Time")
     load_head.get_style_context().add_class("loadhead")
     load_inner.pack_start(load_head, False, False, 0)
     load_screen.pack_start(load_inner, True, True, 0)
@@ -5286,6 +7727,7 @@ def show_study_window(parent=None, end_ts=None):
                 elif ev == WebKit2.LoadEvent.FINISHED:
                     _hide_loading()
                     _record_recent_website(web.get_uri(), web.get_title())
+                    _render_dock()
             except Exception:
                 pass
 
@@ -5309,10 +7751,24 @@ def show_study_window(parent=None, end_ts=None):
             uris = data.get_uris()
             paths = [urllib.parse.unquote(u[7:]) for u in uris if u.startswith("file://")]
             n = _copy_into_inbox(paths, MEDIA_EXTS)
-            _toast(f"Saved {n} file(s) to study inbox" if n else
-                   "Only PDF/image files are accepted")
             if n:
-                refresh_library()
+                newest = None
+                try:
+                    candidates = [os.path.join(STUDY_INBOX, name)
+                                  for name in os.listdir(STUDY_INBOX)]
+                    media = [p for p in candidates
+                             if os.path.isfile(p)
+                             and os.path.splitext(p)[1].lower() in MEDIA_EXTS]
+                    if media:
+                        newest = max(media, key=os.path.getmtime)
+                except Exception:
+                    pass
+                if newest:
+                    _open_media(newest)
+                else:
+                    _toast(f"Saved {n} file(s) to study inbox")
+            else:
+                _toast("Only PDF/image files are accepted")
         except Exception as e:
             print(f"drop error: {e}", flush=True)
         return True
@@ -5330,8 +7786,8 @@ def show_study_window(parent=None, end_ts=None):
             dst = os.path.join(STUDY_INBOX,
                                time.strftime("clipboard-%Y%m%d-%H%M%S.png"))
             pb.savev(dst, "png", [], [])
-            _toast(f"Saved {os.path.basename(dst)}")
-            refresh_library()
+            _toast(f"Opened {os.path.basename(dst)}")
+            _open_media(dst)
         except Exception as e:
             print(f"paste error: {e}", flush=True)
 
@@ -5341,6 +7797,20 @@ def show_study_window(parent=None, end_ts=None):
             mods = st & Gtk.accelerator_get_default_mod_mask()
             ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
             if kv == Gdk.KEY_Escape:
+                if _study_parent is not None:
+                    try:
+                        _study_parent.show()
+                        _study_parent.present()
+                        while Gtk.events_pending():
+                            Gtk.main_iteration_do(False)
+                    except Exception:
+                        pass
+                else:
+                    if _load_suspend_state() > time.time():
+                        try:
+                            os.remove(STUDY_ACTIVE_FLAG)
+                        except OSError:
+                            pass
                 win.destroy()
                 return True
             if ctrl and kv in (Gdk.KEY_l, Gdk.KEY_t, Gdk.KEY_n, Gdk.KEY_w,
@@ -5413,28 +7883,221 @@ def show_study_window(parent=None, end_ts=None):
     for _kw in [canvas, img_scroll, floatbar, *floatbar.get_children()]:
         _kw.connect("key-press-event", _on_key)
 
-    back_btn.connect("clicked", lambda *_: win.destroy())
+    def _on_back_clicked(*_):
+        if _study_parent is not None:
+            try:
+                _study_parent.show()
+                _study_parent.present()
+                while Gtk.events_pending():
+                    Gtk.main_iteration_do(False)
+            except Exception:
+                pass
+        else:
+            if _load_suspend_state() > time.time():
+                try:
+                    os.remove(STUDY_ACTIVE_FLAG)
+                except OSError:
+                    pass
+        win.destroy()
+
+    back_btn.connect("clicked", _on_back_clicked)
+
+    def _get_current_lockout_info():
+        nonlocal end_ts
+        cur_end = max(float(end_ts or 0), _load_suspend_state())
+        schedule = _load_lockout_schedule(cur_end)
+        stage_seconds = None
+        extra_days = None
+        can_extend = False
+        if schedule:
+            stage = int(schedule.get("stage", 0))
+            segments = schedule.get("segments", [])
+            if 0 <= stage < len(segments):
+                stage_seconds = int(segments[stage])
+                can_extend = len(segments) <= stage + 1
+                if stage_seconds in (3 * 86400, 7 * 86400):
+                    extra_days = 3 if stage_seconds == 7 * 86400 else 7
+        return cur_end, schedule, stage_seconds, extra_days, can_extend
+
+    def _update_extend_btn():
+        cur_end, schedule, stage_seconds, extra_days, can_extend = _get_current_lockout_info()
+        now = time.time()
+        if cur_end > now:
+            if stage_seconds in (3 * 86400, 7 * 86400):
+                extend_btn.set_label(f"➕ Extend (+{extra_days}d)")
+                extend_btn.set_sensitive(can_extend)
+                if can_extend:
+                    extend_btn.set_tooltip_text(f"Extend lockout by {extra_days} days (Rule: 3d ↔ 7d)")
+                else:
+                    extend_btn.set_tooltip_text("Already extended for this cycle")
+            else:
+                extend_btn.set_label("➕ Extend (+3d/7d)")
+                extend_btn.set_sensitive(True)
+                extend_btn.set_tooltip_text("Extend lockout by 3 days or 7 days")
+        else:
+            extend_btn.set_label("➕ Extend (3d/7d)")
+            extend_btn.set_sensitive(True)
+            extend_btn.set_tooltip_text("Start or extend lockout by 3 days or 7 days")
+
+    def _on_extend_clicked(*_):
+        global suspend_until
+        nonlocal end_ts
+        cur_end, schedule, stage_seconds, extra_days, can_extend = _get_current_lockout_info()
+        now = time.time()
+
+        if cur_end > now and stage_seconds in (3 * 86400, 7 * 86400):
+            if not can_extend:
+                notify("Lockout has already been extended for this cycle.")
+                return
+            extra_sec = extra_days * 86400
+            dlg = Gtk.MessageDialog(
+                transient_for=win, modal=True, message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.OK_CANCEL,
+                text=f"Extend Lockout by {extra_days} Days?"
+            )
+            dlg.format_secondary_text(
+                f"Current stage is {stage_seconds // 86400} days.\n"
+                f"Policy rule extends by {extra_days} days.\n"
+                f"Device unlock countdown will be adjusted automatically."
+            )
+            resp = dlg.run()
+            dlg.destroy()
+            if resp != Gtk.ResponseType.OK:
+                return
+
+            if schedule is None:
+                schedule = {"segments": [stage_seconds], "stage": 0,
+                            "stage_start": time.time(), "origin_start": time.time()}
+            schedule["segments"].append(extra_sec)
+            _save_lockout_schedule(schedule)
+            new_end = _schedule_end(schedule)
+            _save_suspend_state(new_end)
+            suspend_until = new_end
+            end_ts = new_end
+            notify(f"Lockout extended by {extra_days} days.")
+            _update_extend_btn()
+            _tick()
+        else:
+            dlg = Gtk.Dialog(
+                title="Extend Lockout Time", transient_for=win, modal=True
+            )
+            dlg.set_default_size(360, 160)
+            c_area = dlg.get_content_area()
+            c_area.set_spacing(12)
+            c_area.set_border_width(16)
+
+            lbl = Gtk.Label(label="Choose lockout extension duration:\n(Device stays locked in study/emergency mode)")
+            lbl.set_line_wrap(True)
+            lbl.set_halign(Gtk.Align.CENTER)
+            c_area.pack_start(lbl, False, False, 0)
+
+            btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            btn_box.set_halign(Gtk.Align.CENTER)
+            b3 = Gtk.Button(label="➕ 3 Days")
+            b7 = Gtk.Button(label="➕ 7 Days")
+            b_cancel = Gtk.Button(label="Cancel")
+
+            b3.get_style_context().add_class("topbar-btn")
+            b3.get_style_context().add_class("extend-btn")
+            b7.get_style_context().add_class("topbar-btn")
+            b7.get_style_context().add_class("extend-btn")
+            b_cancel.get_style_context().add_class("topbar-btn")
+
+            b3.connect("clicked", lambda *_: dlg.response(3))
+            b7.connect("clicked", lambda *_: dlg.response(7))
+            b_cancel.connect("clicked", lambda *_: dlg.response(Gtk.ResponseType.CANCEL))
+
+            btn_box.pack_start(b3, False, False, 0)
+            btn_box.pack_start(b7, False, False, 0)
+            btn_box.pack_start(b_cancel, False, False, 0)
+            c_area.pack_start(btn_box, True, True, 0)
+
+            dlg.show_all()
+            resp = dlg.run()
+            dlg.destroy()
+
+            if resp in (3, 7):
+                chosen_days = resp
+                extra_sec = chosen_days * 86400
+                if schedule is None or cur_end <= now:
+                    now_ts = time.time()
+                    schedule = {"segments": [extra_sec], "stage": 0,
+                                "stage_start": now_ts, "origin_start": now_ts}
+                else:
+                    schedule["segments"].append(extra_sec)
+                _save_lockout_schedule(schedule)
+                new_end = _schedule_end(schedule)
+                _save_suspend_state(new_end, mode="active")
+                suspend_until = new_end
+                end_ts = new_end
+                notify(f"Lockout extended by {chosen_days} days.")
+                _update_extend_btn()
+                _tick()
+
+    extend_btn.connect("clicked", _on_extend_clicked)
 
     def _tick():
-        if end_ts:
-            left = max(0, int(end_ts - time.time()))
+        _touch_study_active()
+        if _is_study_suspended():
+            _trigger_study_suspension()
+            return False
+        _update_block_counter()
+        _update_extend_btn()
+        clock_lbl.set_text(time.strftime("🕒 %I:%M:%S %p"))
+        clock_lbl.set_tooltip_text(time.strftime("%A, %d %B %Y"))
+        nonlocal end_ts
+        cur_end = max(float(end_ts or 0), _load_suspend_state())
+        now = time.time()
+        ctx = time_lbl.get_style_context()
+        if cur_end > now:
+            left = max(0, int(cur_end - now))
             d, rem = divmod(left, 86400)
             h, rem = divmod(rem, 3600)
             m, s = divmod(rem, 60)
-            time_lbl.set_text(f"\u23f3 {d}d {h:02d}:{m:02d}:{s:02d} left" if d
-                              else f"\u23f3 {h:02d}:{m:02d}:{s:02d} left")
-            if left <= 0:
-                win.destroy()
-                return False
+            time_lbl.set_text(f"⏳ {d}d {h:02d}:{m:02d}:{s:02d} left" if d
+                              else f"⏳ {h:02d}:{m:02d}:{s:02d} left")
+            ctx.remove_class("topbar-timer-normal")
+            ctx.add_class("topbar-timer-lockout")
+        else:
+            next_alert = _load_next_alert()
+            if next_alert <= now or next_alert > now + FOCUS_MINUTES * 60 + 60:
+                next_alert = now + FOCUS_MINUTES * 60
+                _save_next_alert(next_alert)
+            left = max(0, int(next_alert - now))
+            m, s = divmod(left, 60)
+            time_lbl.set_text(f"⏳ {m:02d}:{s:02d} left")
+            ctx.remove_class("topbar-timer-lockout")
+            ctx.add_class("topbar-timer-normal")
+        time_lbl.show()
         return True
+
+    _tick()
     GLib.timeout_add_seconds(1, _tick)
 
     # start on the bismillah home page (no auto-load of a link)
     stack.set_visible_child_name("home")
 
+    _study_sweep = None
+    if end_ts or _load_suspend_state() > time.time():
+        _study_sigs = _lockout_exe_signatures()
+        _lockout_proc_sweep(_study_sigs)
+        _study_sweep = GLib.timeout_add_seconds(
+            1, lambda: (_lockout_proc_sweep(_study_sigs), True)[1])
+
     def _on_destroy(*_a):
         global _study_win, _study_parent
         global _study_auto_closing
+        global _study_block_count_updater
+        _study_block_count_updater = None
+        try:
+            os.remove(STUDY_ACTIVE_FLAG)
+        except OSError:
+            pass
+        if _study_sweep:
+            try:
+                GLib.source_remove(_study_sweep)
+            except Exception:
+                pass
         if download_context is not None and download_handler_id:
             try:
                 download_context.disconnect(download_handler_id)
@@ -5465,7 +8128,17 @@ def show_study_window(parent=None, end_ts=None):
     win.show_all()
     win.present()
     win.grab_focus()
+    _touch_study_active()
+    while Gtk.events_pending():
+        Gtk.main_iteration_do(False)
     Gtk.main()
+    if _is_study_suspended() and _study_parent is None:
+        suspend_deadline = _get_study_suspended_until()
+        rem_m = max(1, int(math.ceil((suspend_deadline - time.time()) / 60.0)))
+        do_pseudo_lockout(rem_m, "Study Mode Suspended")
+    elif _load_suspend_state() > time.time() and _study_parent is None:
+        rem_m = max(1, int(math.ceil((_load_suspend_state() - time.time()) / 60.0)))
+        do_pseudo_lockout(rem_m, "Focus lockout")
 
 
 def show_study_or_typing(parent, end_ts):
@@ -5483,8 +8156,7 @@ def main():
     except OSError:
         print("Another instance is already running — exiting.", flush=True)
         raise SystemExit(0)
-    start_phone_upload_server()
-    print(f"Focus Reminder chalu. Proti {FOCUS_MINUTES} min por alert (study cholle skip).", flush=True)
+    print("Focus Reminder chalu. Automatic reminder off; lockout + Study mode active.", flush=True)
     tr = start_tracker()
 
     def _bye(*_):
@@ -5493,66 +8165,35 @@ def main():
             tr.flush()
         except Exception:
             pass
-        raise SystemExit(0)
+        # Never leave systemd/GNOME waiting on a nested GTK loop: a stop request
+        # used to hang for 10s and then get SIGKILLed ("force quit" prompt).
+        os._exit(0)
 
     signal.signal(signal.SIGTERM, _bye)
     signal.signal(signal.SIGINT, _bye)
     global suspend_until
     suspend_until = 0
-    pending = _restore_suspend_checkpoint()
+    pending = max(_restore_suspend_checkpoint(), _consume_pam_lock_flag())
     if pending > time.time():
         print("Unfinished suspension found — enforcing until countdown ends.", flush=True)
         enforce_suspension_until(pending)
     else:
         _clear_suspend_state()
         _gnome_heal()  # no lockout active: undo any stale shell lockdown
-    next_alert = _load_next_alert()
-    if next_alert <= 0:
-        next_alert = time.time() + FOCUS_MINUTES * 60
-        _save_next_alert(next_alert)
-    elif next_alert <= time.time():
-        print("Reminder overdue from before power-off — showing immediately.", flush=True)
+        _systemd_startup_ready()
+    # The automatic 10-minute fullscreen reminder was removed by request: after
+    # a lockout ends there must be no second timer screen. The lockout screen,
+    # Study Mode and the manual tray reminder remain available.
+    _sigs = _lockout_exe_signatures()
     while True:
-        while time.time() < suspend_until:
-            time.sleep(20)
-        while time.time() < next_alert and not tr.limit_pending:
-            time.sleep(20)
-        # Persist the next cycle BEFORE showing, so a reboot cannot buy free time.
-        next_alert = time.time() + FOCUS_MINUTES * 60
-        _save_next_alert(next_alert)
+        while time.time() < suspend_until or _load_suspend_state() > time.time():
+            _lockout_proc_sweep(_sigs)
+            time.sleep(0.5)
         if tr.limit_pending:
             tr.limit_pending = False
             notify(f"Daily waste limit ({DAILY_WASTE_LIMIT_MIN}m) exceeded!")
-            print("Daily waste limit exceeded — alert shown now.", flush=True)
-        if time.time() < suspend_until:
-            continue
-        if _load_suspend_state() > time.time():
-            print("External suspension active — alert deferred.", flush=True)
-            time.sleep(20)
-            continue
-        if study_app_running() or study_site_recent():
-            print("Study/Deen (app or site) in use — alert skipped.", flush=True)
-            continue
-        if must_alert():
-            print("OpenCode/browser running — alert shown (must).", flush=True)
-        try:
-            action = show_alert()
-        except Exception as e:
-            print(f"alert display error (no screen?) — skipped: {e}", flush=True)
-            continue
-        print(f"action={action}", flush=True)
-        if action == "suspend":
-            do_suspend(_take_chosen_minutes())
-        elif action == "lockout":
-            do_pseudo_lockout(SUSPEND_MINUTES)
-        elif action == "poweroff":
-            power_off()
-            return
-        elif action == "goal":
-            try:
-                show_goal_manager()
-            except Exception as e:
-                print(f"goal manager error: {e}", flush=True)
+            print("Daily waste limit exceeded — notification sent.", flush=True)
+        time.sleep(1)
 
 def show_now_once():
     """One-shot reminder (app-menu entry). Full actions, no tracker, no locks."""
@@ -5565,8 +8206,8 @@ def show_now_once():
         print(f"show-now action={action}", flush=True)
         if action == "suspend":
             do_suspend(_take_chosen_minutes())
-        elif action == "lockout":
-            do_pseudo_lockout(SUSPEND_MINUTES)
+        elif action == "study":
+            show_study_window()
         elif action == "poweroff":
             power_off()
             return
@@ -5583,17 +8224,6 @@ if __name__ == "__main__":
     import sys
     if "--show-upload-password" in sys.argv:
         print(_ensure_phone_upload_password(), flush=True)
-    elif "--setup-telegram" in sys.argv:
-        _minutes = SETUP_MODE_MINUTES
-        _i = sys.argv.index("--setup-telegram")
-        if len(sys.argv) > _i + 1:
-            try:
-                _minutes = max(1, min(120, int(sys.argv[_i + 1])))
-            except ValueError:
-                pass
-        enable_setup_mode(_minutes)
-    elif "--setup-telegram-off" in sys.argv:
-        disable_setup_mode()
     elif "--lockout" in sys.argv:
         # One-shot pseudo lockout: locks now, stays on, no sleep.
         _mins = SUSPEND_MINUTES
@@ -5603,15 +8233,27 @@ if __name__ == "__main__":
                 _mins = max(1, min(24 * 60, int(sys.argv[_idx + 1])))
             except ValueError:
                 pass
-        while not _has_display():
+        while not _has_display() or not _gtk_display_ready():
             print("Lockout waiting for display…", flush=True)
-            time.sleep(10)
+            time.sleep(0.5)
         do_pseudo_lockout(_mins)
     elif "--show-now" in sys.argv:
-        while not _has_display():
+        while not _has_display() or not _gtk_display_ready():
             print("Show-now waiting for display…", flush=True)
-            time.sleep(10)
+            time.sleep(0.5)
         show_now_once()
+    elif "--study" in sys.argv:
+        while not _has_display() or not _gtk_display_ready():
+            print("Study waiting for display…", flush=True)
+            time.sleep(0.5)
+        if _is_study_suspended():
+            until = _get_study_suspended_until()
+            rem_m = max(1, int(math.ceil((until - time.time()) / 60.0)))
+            notify(f"Study Mode is temporarily suspended ({rem_m}m remaining).")
+            if _load_suspend_state() > time.time():
+                do_pseudo_lockout(max(1, int(math.ceil((_load_suspend_state() - time.time()) / 60.0))))
+            sys.exit(0)
+        show_study_window()
     elif "--tray" in sys.argv or "--emergency-button" in sys.argv:
         # single instance for the tray process too (separate lock from main)
         try:

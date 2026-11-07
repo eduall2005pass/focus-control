@@ -1,0 +1,63 @@
+#!/bin/sh
+set -e
+fc-cache -f >/dev/null 2>&1 || true
+update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+gtk-update-icon-cache -f -q /usr/share/icons/hicolor >/dev/null 2>&1 || true
+
+chmod +x /usr/local/bin/focus-boot-enforce.sh /usr/local/bin/focus-pam-lock.sh 2>/dev/null || true
+chmod +x /usr/local/bin/focus-session-start.sh 2>/dev/null || true
+chmod +x /usr/local/bin/focus-tray-start.sh 2>/dev/null || true
+
+# Older installs linked the app-menu launcher (--show-now) into user
+# autostart. That opened the normal reminder after boot even during lockout.
+for old_autostart in /home/*/.config/autostart/focus-reminder.desktop; do
+  [ -L "$old_autostart" ] || continue
+  target=$(readlink -f "$old_autostart" 2>/dev/null || true)
+  if [ "$target" = /usr/share/applications/focus-reminder.desktop ]; then
+    rm -f "$old_autostart"
+  fi
+done
+
+# Remove the legacy gate: it rejected valid graphical logins during lockout.
+for pamfile in /etc/pam.d/gdm-password /etc/pam.d/gdm-autologin \
+               /etc/pam.d/gdm-fingerprint /etc/pam.d/gdm-smartcard \
+               /etc/pam.d/gdm-smartcard-sssd-or-password /etc/pam.d/lightdm; do
+  [ -f "$pamfile" ] || continue
+  sed -i '\|pam_exec.so quiet /usr/local/bin/focus-login-gate.py|d' "$pamfile"
+done
+rm -f /usr/local/bin/focus-login-gate.py
+
+# Keep the boot daemon and PAM hook from the 2.0 release. Both only write
+# the existing per-user lockout timestamp/flag; neither locks the login screen.
+PAM_LINE="session optional pam_exec.so seteuid /usr/local/bin/focus-pam-lock.sh"
+if [ -f /etc/pam.d/common-session ] \
+   && ! grep -qF "focus-pam-lock.sh" /etc/pam.d/common-session; then
+  printf '%s\n' "$PAM_LINE" >> /etc/pam.d/common-session
+fi
+
+# Remove the startup barrier that launched GTK before GNOME had a display.
+# The XDG session hook now imports the live display environment, then starts
+# both services after the graphical session is ready.
+rm -f /etc/systemd/user/default.target.wants/focus-reminder.service
+rm -f /etc/systemd/user/default.target.wants/focus-tray.service
+rm -f /etc/systemd/user/default.target.wants/xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service
+rm -f /etc/systemd/user/default.target.wants/xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service
+rm -f /etc/systemd/user/focus-reminder.service /etc/systemd/user/focus-tray.service
+systemctl --global disable focus-reminder.service focus-tray.service >/dev/null 2>&1 || true
+systemctl --global enable xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service \
+  xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service >/dev/null 2>&1 || true
+for session in gnome ubuntu ubuntu-xorg ubuntu-wayland; do
+  rm -f "/etc/systemd/user/gnome-session@${session}.target.d/focus-reminder.conf"
+done
+
+# Re-enable the system boot enforcer carried forward from 2.0.
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl enable --now focus-boot-enforce.service >/dev/null 2>&1 || true
+# Extra persistence: hold against upgrades/removal + immutable files.
+apt-mark hold focus-reminder >/dev/null 2>&1 || true
+chattr +i /opt/focus-reminder/focus-reminder.py 2>/dev/null || true
+chattr +i /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service 2>/dev/null || true
+chattr +i /etc/systemd/system/focus-boot-enforce.service 2>/dev/null || true
+chattr +i /usr/local/bin/focus-boot-enforce.sh /usr/local/bin/focus-pam-lock.sh 2>/dev/null || true
+chattr +i /usr/share/applications/focus-reminder.desktop 2>/dev/null || true
+exit 0
