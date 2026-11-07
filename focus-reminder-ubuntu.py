@@ -2026,6 +2026,18 @@ def tray_loop():
     while not _has_display() or not _gtk_display_ready():
         print("Tray waiting for a usable graphical display…", flush=True)
         time.sleep(3)
+
+    def _tray_bye(*_):
+        # Exit immediately instead of waiting for systemd's 10s stop timeout.
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _tray_bye)
+    signal.signal(signal.SIGINT, _tray_bye)
+    try:
+        # Keep a Python callback ticking so the handler runs inside Gtk.main().
+        GLib.timeout_add(200, lambda: True)
+    except Exception:
+        pass
     _AI = None
     while True:
         if _AI is None:
@@ -8171,6 +8183,14 @@ def main():
 
     signal.signal(signal.SIGTERM, _bye)
     signal.signal(signal.SIGINT, _bye)
+    # Python signal handlers cannot run while the main thread sits inside the C
+    # Gtk.main() loop (study/typing/lockout), which made systemd SIGKILL us
+    # after 10s and show the "force quit" prompt. This lightweight GTK
+    # heartbeat gives CPython a chance to run the pending handler every 200ms.
+    try:
+        GLib.timeout_add(200, lambda: True)
+    except Exception as e:
+        print(f"signal heartbeat unavailable: {e}", flush=True)
     global suspend_until
     suspend_until = 0
     pending = max(_restore_suspend_checkpoint(), _consume_pam_lock_flag())
