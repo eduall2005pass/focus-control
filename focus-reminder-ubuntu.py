@@ -5486,7 +5486,8 @@ def show_study_window(parent=None, end_ts=None):
                         "id": str(entry.get("id") or secrets.token_hex(4)),
                         "date": str(entry.get("date") or time.strftime("%Y-%m-%d %H:%M")),
                         "book": str(entry.get("book") or "").strip(),
-                        "page": str(entry.get("page") or "1").strip()
+                        "page": str(entry.get("page") or "1").strip(),
+                        "path": str(entry.get("path") or "")
                     })
         return items
 
@@ -5496,15 +5497,18 @@ def show_study_window(parent=None, end_ts=None):
         except Exception as e:
             print(f"save read history error: {e}", flush=True)
 
-    def _record_read_history_entry(book_name, page_no):
+    def _record_read_history_entry(book_name, page_no, path=None):
         try:
             items = _load_read_history()
             now_str = time.strftime("%Y-%m-%d %H:%M")
+            real_path = os.path.realpath(path) if path else ""
             found = False
             for it in items:
                 if it["book"].strip().lower() == book_name.strip().lower():
                     it["page"] = str(page_no)
                     it["date"] = now_str
+                    if real_path:
+                        it["path"] = real_path
                     found = True
                     break
             if not found:
@@ -5512,7 +5516,8 @@ def show_study_window(parent=None, end_ts=None):
                     "id": secrets.token_hex(4),
                     "date": now_str,
                     "book": book_name,
-                    "page": str(page_no)
+                    "page": str(page_no),
+                    "path": real_path
                 })
             _save_read_history(items)
         except Exception as e:
@@ -5526,7 +5531,7 @@ def show_study_window(parent=None, end_ts=None):
         _write_state_file(STUDY_READING_STATE, reading_pages)
         _record_recent_document(key, page)
         book_title = os.path.splitext(os.path.basename(path))[0]
-        _record_read_history_entry(book_title, page)
+        _record_read_history_entry(book_title, page, key)
 
     def _battery_text():
         for supply in glob.glob("/sys/class/power_supply/*"):
@@ -6092,7 +6097,7 @@ def show_study_window(parent=None, end_ts=None):
 
     history_panel.pack_start(history_header, False, False, 0)
 
-    history_store = Gtk.ListStore(str, str, str, str, str)
+    history_store = Gtk.ListStore(str, str, str, str, str, str)
 
     def _history_search_filter(model, it, _data):
         q = (history_search_entry.get_text() or "").strip().lower()
@@ -6122,7 +6127,8 @@ def show_study_window(parent=None, end_ts=None):
                 "id": row[4],
                 "date": row[1],
                 "book": row[2],
-                "page": row[3]
+                "page": row[3],
+                "path": row[5]
             })
         _save_read_history(items)
         history_count_lbl.set_text(f"{len(items)} records")
@@ -6136,7 +6142,8 @@ def show_study_window(parent=None, end_ts=None):
                 str(it.get("date") or time.strftime("%Y-%m-%d %H:%M")),
                 str(it.get("book") or ""),
                 str(it.get("page") or "1"),
-                str(it.get("id") or secrets.token_hex(4))
+                str(it.get("id") or secrets.token_hex(4)),
+                str(it.get("path") or "")
             ])
         history_count_lbl.set_text(f"{len(items)} records")
         history_filter.refilter()
@@ -6185,6 +6192,107 @@ def show_study_window(parent=None, end_ts=None):
     book_cell.connect("edited", _on_book_cell_edited)
     history_tree.append_column(book_col)
 
+    def _find_history_book_path(book, stored_path, deep=False):
+        """Resolve a history book name to a real file on disk."""
+        if stored_path and os.path.isfile(stored_path):
+            return stored_path
+        name = str(book or "").strip().lower()
+        if not name:
+            return ""
+        for item in list(recent_items):
+            if item.get("kind") != "doc":
+                continue
+            p = item.get("path") or ""
+            if not p or not os.path.isfile(p):
+                continue
+            stem = os.path.splitext(os.path.basename(p))[0].strip().lower()
+            title = str(item.get("title") or "").strip().lower()
+            if name in (stem, title):
+                return p
+        roots = [STUDY_INBOX, DOWNLOAD_DIR]
+        for root in roots:
+            try:
+                for entry in os.scandir(root):
+                    if not entry.is_file():
+                        continue
+                    if os.path.splitext(entry.name)[1].lower() not in MEDIA_EXTS:
+                        continue
+                    if os.path.splitext(entry.name)[0].strip().lower() == name:
+                        return entry.path
+            except Exception:
+                pass
+        if deep:
+            try:
+                scan_roots = roots + [os.path.expanduser(r) for r in
+                                      (cfg.get("scan_roots") or [])]
+                for _mtime, p in _scan_media(scan_roots):
+                    if (os.path.splitext(os.path.basename(p))[0]
+                            .strip().lower() == name):
+                        return p
+            except Exception:
+                pass
+        return ""
+
+    def _open_history_row(path_str):
+        try:
+            f_iter = history_filter.get_iter(path_str)
+            c_iter = history_filter.convert_iter_to_child_iter(f_iter)
+            book = history_store[c_iter][2]
+            stored = history_store[c_iter][5]
+            target = _find_history_book_path(book, stored)
+            if target:
+                if target != stored:
+                    history_store[c_iter][5] = target
+                    _save_history_from_store()
+                _open_media(target)
+                return
+
+            _toast(f"Looking for '{book}'…")
+            def _finish(found):
+                if found:
+                    _open_media(found)
+                else:
+                    _toast(f"File not found for '{book}'. Use 📂 Open to select it.")
+                return False
+
+            def _worker():
+                found = _find_history_book_path(book, "", deep=True)
+                GLib.idle_add(_finish, found)
+
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception as e:
+            print(f"history open error: {e}", flush=True)
+            _toast("Could not open this book")
+
+    open_col = Gtk.TreeViewColumn("")
+    open_col.set_fixed_width(104)
+    open_col.set_alignment(0.5)
+    open_cell = Gtk.CellRendererText()
+    open_cell.set_property("markup", "<b>📂 Open</b>")
+    open_cell.set_property("foreground", "#ffffff")
+    open_cell.set_property("cell-background", "#2563eb")
+    open_cell.set_property("xpad", 8)
+    open_cell.set_property("ypad", 4)
+    open_col.pack_start(open_cell, False)
+    history_tree.append_column(open_col)
+
+    def _on_history_click(_tree, event):
+        if event.button != 1 or event.type != Gdk.EventType.BUTTON_PRESS:
+            return False
+        try:
+            pos = history_tree.get_path_at_pos(int(event.x), int(event.y))
+        except Exception:
+            pos = None
+        if not pos:
+            return False
+        path, column, _cx, _cy = pos
+        if column is open_col:
+            _open_history_row(path)
+            return True
+        return False
+
+    history_tree.connect("button-press-event", _on_history_click)
+
     page_col = Gtk.TreeViewColumn("Page (পৃষ্ঠা) ✎")
     page_col.set_fixed_width(120)
     page_col.set_alignment(0.5)
@@ -6215,7 +6323,7 @@ def show_study_window(parent=None, end_ts=None):
     def _add_history_row(*_):
         now_str = time.strftime("%Y-%m-%d %H:%M")
         new_id = secrets.token_hex(4)
-        history_store.insert(0, ["1", now_str, "New Book Title", "1", new_id])
+        history_store.insert(0, ["1", now_str, "New Book Title", "1", new_id, ""])
         _save_history_from_store()
         try:
             history_tree.set_cursor(Gtk.TreePath.new_first(), book_col, True)
@@ -6250,7 +6358,7 @@ def show_study_window(parent=None, end_ts=None):
 
     history_footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
     history_footer_lbl = Gtk.Label(
-        label="ℹ️ Click on Book Name or Page to edit inline. Date auto-syncs on edit. All changes are saved locally.")
+        label="ℹ️ Click 📂 Open beside a book to read it instantly. Click Book Name or Page to edit inline. Date auto-syncs on edit.")
     history_footer_lbl.get_style_context().add_class("history-footer")
     history_footer.pack_start(history_footer_lbl, False, False, 4)
     history_panel.pack_start(history_footer, False, False, 4)
