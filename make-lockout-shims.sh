@@ -16,7 +16,7 @@ make_shim() {
 NAME=\$(basename "\$0")
 NOW=\$(date +%s)
 locked=0
-for f in /home/*/.local/share/focus-reminder/suspend.state; do
+for f in /home/*/.local/share/focus-reminder/suspend.state /root/.local/share/focus-reminder/suspend.state; do
   [ -f "\$f" ] || continue
   END=\$(cat "\$f" 2>/dev/null)
   case "\$END" in ''|*[!0-9.]*) continue;; esac

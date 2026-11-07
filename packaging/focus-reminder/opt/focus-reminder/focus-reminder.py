@@ -49,7 +49,7 @@ try:
 except Exception:  # WebKit not available -> study view disabled, app still runs
     WebKit2 = None
 
-FOCUS_VERSION = "2.0.27"
+FOCUS_VERSION = "2.0.36"
 
 FOCUS_MINUTES = 10
 SUSPEND_MINUTES = 30

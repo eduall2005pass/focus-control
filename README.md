@@ -1,4 +1,4 @@
-# Focus Control (v1.0) — Whole-Device Focus Protection for Ubuntu
+# Focus Control (v2.0.36) — Whole-Device Focus Protection for Ubuntu
 
 Fullscreen focus reminders, goal manager, typing practice, waste-time
 ledger, emergency suspend (minutes / hours / days) with reboot-proof
@@ -30,7 +30,7 @@ lockout, and a persistent system tray. Runs automatically for every user.
 ## Install
 
 ```bash
-sudo dpkg -i packaging/focus-reminder_2.0.11_all.deb
+sudo dpkg -i packaging/focus-reminder_2.0.36_all.deb
 ```
 
 Alternative (script, same contents): `sudo bash install-systemwide.sh`
