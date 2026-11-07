@@ -245,13 +245,25 @@ export default class FocusLockoutExtension extends Extension {
     }
 
     _applyLockdown() {
-        // 1. Save original panels & dock state to persistent disk backup if not already saved
+        // 1. Save original panels, dock, overview & hot corners state to persistent disk backup if not already saved
         try {
             let backup = this._loadPanelsBackup();
             if (!backup) {
                 const dockUuid = (this._env && this._env.dockUuid) || this._detectDockUuid();
                 const isDockEnabled = this._isExtensionEnabled(dockUuid);
                 const isDingEnabled = this._isExtensionEnabled('ding@rastersoft.com');
+                const act = Main.panel?.statusArea?.activities;
+                let mutterOverlayKey = 'Super_L';
+                let hotCornersEnabled = false;
+                try {
+                    const ms = new Gio.Settings({schema_id: 'org.gnome.mutter'});
+                    mutterOverlayKey = ms.get_string('overlay-key');
+                } catch (_) {}
+                try {
+                    const is = new Gio.Settings({schema_id: 'org.gnome.desktop.interface'});
+                    hotCornersEnabled = is.get_boolean('enable-hot-corners');
+                } catch (_) {}
+
                 backup = {
                     savedAt: Math.floor(Date.now() / 1000),
                     dockUuid,
@@ -263,6 +275,11 @@ export default class FocusLockoutExtension extends Extension {
                     panelBoxVisible: Main.layoutManager.panelBox ? Main.layoutManager.panelBox.visible : true,
                     panelBoxReactive: Main.layoutManager.panelBox ? Main.layoutManager.panelBox.reactive : true,
                     panelBoxOpacity: Main.layoutManager.panelBox ? Main.layoutManager.panelBox.opacity : 255,
+                    actVisible: act ? act.visible : true,
+                    actReactive: act ? act.reactive : true,
+                    actOpacity: act ? act.opacity : 255,
+                    mutterOverlayKey,
+                    hotCornersEnabled,
                 };
                 this._savePanelsBackup(backup);
             }
@@ -270,7 +287,33 @@ export default class FocusLockoutExtension extends Extension {
             logError(e, 'FocusLockout error backing up panel state');
         }
 
-        // 2. Completely hide Top Bar (Main.panel & panelBox) and remove struts
+        // 2. Completely hide GNOME Activities Button & guard against re-reveal
+        try {
+            const act = Main.panel?.statusArea?.activities;
+            if (act) {
+                act.visible = false;
+                act.reactive = false;
+                act.opacity = 0;
+                if (act.container) {
+                    act.container.visible = false;
+                    act.container.reactive = false;
+                    act.container.opacity = 0;
+                }
+                if (!this._actNotifyHook) {
+                    this._actNotifyHook = act.connect('notify::visible', () => {
+                        if (this._lockdownActive && act.visible) {
+                            act.visible = false;
+                            act.reactive = false;
+                            act.opacity = 0;
+                        }
+                    });
+                }
+            }
+        } catch (e) {
+            logError(e, 'FocusLockout Activities button hide error');
+        }
+
+        // 3. Completely hide Top Bar (Main.panel & panelBox) and remove struts
         try {
             if (Main.panel) {
                 Main.panel.visible = false;
@@ -307,7 +350,7 @@ export default class FocusLockoutExtension extends Extension {
             logError(e, 'FocusLockout Top Bar hide error');
         }
 
-        // 3. Completely hide and disable Ubuntu Dock & eliminate edge reveal
+        // 4. Completely hide and disable Ubuntu Dock & eliminate edge reveal
         try {
             const dockUuid = (this._env && this._env.dockUuid) || 'ubuntu-dock@ubuntu.com';
             // Disable extension: removes dock actor, eliminates pressure barriers & auto-hide edge reveal
@@ -339,19 +382,56 @@ export default class FocusLockoutExtension extends Extension {
             logError(e, 'FocusLockout Dock hide error');
         }
 
-        // 4. Block Activities Overview & hot corners
+        // 5. Completely neutralize Activities Overview (clicks, hot corners, Super key, gestures)
         try {
-            if (Main.overview && !this._overviewBlocked) {
-                Main.overview.block();
-                this._overviewBlocked = true;
+            if (Main.overview) {
+                if (Main.overview.visible) {
+                    Main.overview.hide();
+                }
+                if (!this._origOverviewShow) {
+                    this._origOverviewShow = Main.overview.show ? Main.overview.show.bind(Main.overview) : null;
+                    this._origOverviewToggle = Main.overview.toggle ? Main.overview.toggle.bind(Main.overview) : null;
+                    this._origOverviewShowApps = Main.overview.showApps ? Main.overview.showApps.bind(Main.overview) : null;
+                    this._origOverviewIsDummy = Main.overview.isDummy;
+                }
+                Main.overview.isDummy = true;
+                Main.overview.show = () => {};
+                Main.overview.toggle = () => {};
+                Main.overview.showApps = () => {};
             }
         } catch (e) {
-            logError(e, 'FocusLockout overview block error');
+            logError(e, 'FocusLockout overview neutralize error');
         }
+
+        // 6. Disable Hot Corners pressure barriers & interface setting
+        try {
+            if (Main.layoutManager && Main.layoutManager.hotCorners) {
+                for (const hc of Main.layoutManager.hotCorners) {
+                    if (hc && typeof hc.setBarrierSize === 'function') {
+                        hc.setBarrierSize(0);
+                    }
+                }
+            }
+            const is = new Gio.Settings({schema_id: 'org.gnome.desktop.interface'});
+            is.set_boolean('enable-hot-corners', false);
+        } catch (_) {}
+
+        // 7. Neutralize Super key in Mutter
+        try {
+            const ms = new Gio.Settings({schema_id: 'org.gnome.mutter'});
+            ms.set_string('overlay-key', '');
+        } catch (_) {}
     }
 
     _restoreDesktopPanels() {
-        // 1. Unhook Top Bar notify guards
+        // 1. Unhook Top Bar and Activities notify guards
+        if (this._actNotifyHook) {
+            try {
+                const act = Main.panel?.statusArea?.activities;
+                if (act) act.disconnect(this._actNotifyHook);
+            } catch (_) {}
+            this._actNotifyHook = 0;
+        }
         if (this._panelNotifyHook && Main.panel) {
             try { Main.panel.disconnect(this._panelNotifyHook); } catch (_) {}
             this._panelNotifyHook = 0;
@@ -364,7 +444,24 @@ export default class FocusLockoutExtension extends Extension {
         // 2. Load original state from persistent backup (or fallback to defaults)
         const backup = this._loadPanelsBackup();
 
-        // 3. Restore Top Bar
+        // 3. Restore GNOME Activities Button
+        try {
+            const act = Main.panel?.statusArea?.activities;
+            if (act) {
+                act.visible = backup ? (backup.actVisible ?? true) : true;
+                act.reactive = backup ? (backup.actReactive ?? true) : true;
+                act.opacity = backup ? (backup.actOpacity ?? 255) : 255;
+                if (act.container) {
+                    act.container.visible = true;
+                    act.container.reactive = true;
+                    act.container.opacity = 255;
+                }
+            }
+        } catch (e) {
+            logError(e, 'FocusLockout Activities button restore error');
+        }
+
+        // 4. Restore Top Bar
         try {
             if (Main.panel) {
                 Main.panel.visible = backup ? backup.panelVisible : true;
@@ -383,7 +480,7 @@ export default class FocusLockoutExtension extends Extension {
             logError(e, 'FocusLockout Top Bar restore error');
         }
 
-        // 4. Restore Ubuntu Dock & Desktop Icons without modifying user preferences
+        // 5. Restore Ubuntu Dock & Desktop Icons without modifying user preferences
         try {
             const dockUuid = (backup && backup.dockUuid) || (this._env && this._env.dockUuid) || 'ubuntu-dock@ubuntu.com';
             const shouldEnableDock = backup ? backup.dockEnabled : true;
@@ -414,17 +511,39 @@ export default class FocusLockoutExtension extends Extension {
             logError(e, 'FocusLockout Dock restore error');
         }
 
-        // 5. Unblock Activities Overview
+        // 6. Restore Activities Overview methods and state
         try {
-            if (Main.overview && this._overviewBlocked) {
-                Main.overview.unblock();
-                this._overviewBlocked = false;
+            if (Main.overview) {
+                if (this._origOverviewShow) Main.overview.show = this._origOverviewShow;
+                if (this._origOverviewToggle) Main.overview.toggle = this._origOverviewToggle;
+                if (this._origOverviewShowApps) Main.overview.showApps = this._origOverviewShowApps;
+                Main.overview.isDummy = this._origOverviewIsDummy !== undefined
+                    ? this._origOverviewIsDummy
+                    : !Main.sessionMode.hasOverview;
+                this._origOverviewShow = null;
+                this._origOverviewToggle = null;
+                this._origOverviewShowApps = null;
             }
         } catch (e) {
-            logError(e, 'FocusLockout overview unblock error');
+            logError(e, 'FocusLockout overview restore error');
         }
 
-        // 6. Clean up backup file
+        // 7. Restore Hot Corners and Mutter overlay-key from backup
+        try {
+            if (backup && backup.hotCornersEnabled !== undefined) {
+                const is = new Gio.Settings({schema_id: 'org.gnome.desktop.interface'});
+                is.set_boolean('enable-hot-corners', backup.hotCornersEnabled);
+            }
+            if (Main.layoutManager && typeof Main.layoutManager._updateHotCorners === 'function') {
+                Main.layoutManager._updateHotCorners();
+            }
+            if (backup && backup.mutterOverlayKey !== undefined) {
+                const ms = new Gio.Settings({schema_id: 'org.gnome.mutter'});
+                ms.set_string('overlay-key', backup.mutterOverlayKey);
+            }
+        } catch (_) {}
+
+        // 8. Clean up backup file
         this._deletePanelsBackup();
     }
 
