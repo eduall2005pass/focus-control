@@ -7322,6 +7322,7 @@ def show_study_window(parent=None, end_ts=None):
                           if view.can_go_forward() else None)
             wrap.add_overlay(nav)
             web_stack.add_named(wrap, name)
+            wrap.show_all()
             view.connect("authenticate", _on_web_authenticate)
             view.connect("permission-request",
                          lambda _v, req: (req.allow(), True)[1])
