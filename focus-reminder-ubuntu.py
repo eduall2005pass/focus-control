@@ -2328,7 +2328,7 @@ def show_alert():
     for b in (close_btn, goal_btn, suspend_btn, study_btn, power_btn):
         row_all.pack_start(b, False, False, 0)
 
-    hint = Gtk.Label(label="Study opens study links and your PDF library without locking this device. "
+    hint = Gtk.Label(label="Study opens whitelisted links and your own PDFs without locking this device. "
                            "Emergency Lockout keeps this device on and countdown-locked.")
     hint.get_style_context().add_class("caption")
     hint.set_halign(Gtk.Align.CENTER)
@@ -3895,7 +3895,7 @@ def _legacy_disabled_start_phone_upload_server():
             if not rows:
                 rows = "<li>No PDFs uploaded yet.</li>"
             body = ("<section class='card'><h1>Study PDF Inbox</h1>"
-                    "<p>Upload PDFs from your phone. They appear in the Study library.</p>"
+                    "<p>Upload PDFs from your phone. They are saved to Study downloads.</p>"
                     "<form action='/upload' method='post' enctype='multipart/form-data'>"
                     "<input class='upload' type='file' name='files' accept='application/pdf,.pdf' "
                     "multiple required><button type='submit'>Upload PDF files</button></form></section>"
@@ -4331,7 +4331,7 @@ def _configure_study_settings(st):
 
 
 def show_study_window(parent=None, end_ts=None):
-    """Study container with whitelisted links and a PDF/image library.
+    """Study container with whitelisted links, a PDF/image reader and a page dock.
     When opened from lockout, the lockout countdown keeps running."""
     global _study_win, _study_parent, _study_web_context, _study_ucm
 
@@ -4705,7 +4705,7 @@ def show_study_window(parent=None, end_ts=None):
     brand_box.pack_start(brand_sub, False, False, 0)
     side.pack_start(brand_box, False, False, 0)
 
-    # 55% Links / 45% Library split container
+    # 55% Study links / 45% Open pages split container
     side_paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
     side_paned.get_style_context().add_class("side-paned")
 
