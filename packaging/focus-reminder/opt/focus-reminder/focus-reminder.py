@@ -2777,26 +2777,33 @@ def show_wifi_dialog(parent=None):
         ogtk.initialized = True
     except Exception:
         pass
+    _touch_wifi_active()
     dialog = Gtk.Dialog(title="Wi-Fi Networks", parent=parent, modal=True)
-    dialog.set_default_size(360, 480)
-    dialog.set_position(Gtk.WindowPosition.CENTER_ON_PARENT if parent else Gtk.WindowPosition.CENTER)
-    dialog.set_keep_above(True)
-    dialog.set_skip_taskbar_hint(True)
-    _apply_css(dialog)
-    box = dialog.get_content_area()
-    box.set_spacing(10)
-    box.set_margin_start(16)
-    box.set_margin_end(16)
-    box.set_margin_top(16)
-    box.set_margin_bottom(16)
-    panel, scan_fn = _build_network_panel(parent_win=dialog, toast_fn=lambda msg: notify(msg))
-    box.pack_start(panel, True, True, 0)
-    close_btn = dialog.add_button("✕ Close", Gtk.ResponseType.CLOSE)
-    close_btn.get_style_context().add_class("btn-primary")
-    dialog.show_all()
-    scan_fn()
-    dialog.run()
-    dialog.destroy()
+    try:
+        dialog.set_default_size(360, 480)
+        dialog.set_position(Gtk.WindowPosition.CENTER_ON_PARENT if parent else Gtk.WindowPosition.CENTER)
+        dialog.set_keep_above(True)
+        dialog.set_skip_taskbar_hint(True)
+        _apply_css(dialog)
+        box = dialog.get_content_area()
+        box.set_spacing(10)
+        box.set_margin_start(16)
+        box.set_margin_end(16)
+        box.set_margin_top(16)
+        box.set_margin_bottom(16)
+        panel, scan_fn = _build_network_panel(parent_win=dialog, toast_fn=lambda msg: notify(msg))
+        box.pack_start(panel, True, True, 0)
+        close_btn = dialog.add_button("✕ Close", Gtk.ResponseType.CLOSE)
+        close_btn.get_style_context().add_class("btn-primary")
+        dialog.show_all()
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+        dialog.present()
+        scan_fn()
+        dialog.run()
+    finally:
+        dialog.destroy()
+        _clear_wifi_active()
 
 
 def show_lockout_window(minutes, pseudo=False):
@@ -4456,18 +4463,12 @@ def show_study_window(parent=None, end_ts=None):
         if _saved > time.time():
             end_ts = _saved
 
-    _touch_study_active()
-
     cfg = _study_config()
     allow = cfg.get("allow_hosts") or _STUDY_DEFAULTS["allow_hosts"]
     dl_exts = set(x.lower() for x in (cfg.get("download_exts") or MEDIA_EXTS))
 
     if parent is not None:
         _study_parent = parent
-        try:
-            parent.hide()
-        except Exception:
-            pass
 
     win = _new_fullscreen("Study")
     _study_win = win
@@ -8092,15 +8093,7 @@ def show_study_window(parent=None, end_ts=None):
             mods = st & Gtk.accelerator_get_default_mod_mask()
             ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
             if kv == Gdk.KEY_Escape:
-                if _study_parent is not None:
-                    try:
-                        _study_parent.show()
-                        _study_parent.present()
-                        while Gtk.events_pending():
-                            Gtk.main_iteration_do(False)
-                    except Exception:
-                        pass
-                else:
+                if _study_parent is None:
                     if _load_suspend_state() > time.time():
                         try:
                             os.remove(STUDY_ACTIVE_FLAG)
@@ -8179,15 +8172,6 @@ def show_study_window(parent=None, end_ts=None):
         _kw.connect("key-press-event", _on_key)
 
     def _on_back_clicked(*_):
-        _clear_study_active()
-        if _study_parent is not None:
-            try:
-                _study_parent.show()
-                _study_parent.present()
-                while Gtk.events_pending():
-                    Gtk.main_iteration_do(False)
-            except Exception:
-                pass
         win.destroy()
 
     back_btn.connect("clicked", _on_back_clicked)
@@ -8405,12 +8389,6 @@ def show_study_window(parent=None, end_ts=None):
         if state.get("path") and str(state["path"]).lower().endswith(".pdf"):
             _save_reading_page(state["path"], state["page"])
         _study_win = None
-        if not auto and _study_parent is not None:
-            try:
-                _study_parent.show()
-                _study_parent.present()
-            except Exception:
-                pass
         _study_parent = None
         _study_auto_closing = False
         Gtk.main_quit()
@@ -8422,9 +8400,9 @@ def show_study_window(parent=None, end_ts=None):
     except Exception:
         win.present()
     win.grab_focus()
-    _touch_study_active()
     while Gtk.events_pending():
         Gtk.main_iteration_do(False)
+    _touch_study_active()
     Gtk.main()
     # Lockout screen is maintained by GNOME Shell extension overlay. Clean exit.
 

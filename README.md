@@ -93,6 +93,12 @@ Submit path (Flathub requires a PR from you):
 - Suspend confirmations require the system (sudo) password; it is never stored.
 - Power Off needs confirmation; shutdown itself may ask for auth (system policy).
 - Uninstall is blocked by design (prerm + hold + immutable files).
+- On GNOME Shell, the lockout extension provides the compositor-level overlay
+  used on both X11 and Wayland. It blocks overview/app switching, hides the
+  dock, suppresses notification banners, and keeps the lockout surface below
+  the mapped Study window during transitions. Other Wayland compositors do not
+  expose an equivalent privileged overlay API, so ordinary application windows
+  cannot guarantee zero desktop exposure there.
 
 ## Optional OS / boot security policy
 
