@@ -218,10 +218,7 @@ export default class FocusLockoutExtension extends Extension {
                 return false;
             const ts = Number(new TextDecoder().decode(bytes).trim());
             const age = Date.now() / 1000 - ts;
-            if (!Number.isFinite(ts) || age < 0 || age >= 8)
-                return false;
-            const wins = global.display.get_tab_list(Meta.TabList.NORMAL_ALL, null);
-            return wins.some(w => w && (w.get_title() === 'Study' || (w.get_wm_class && w.get_wm_class() === 'focus-reminder')));
+            return Number.isFinite(ts) && age >= 0 && age < 6;
         } catch (_) {
             return false;
         }
@@ -273,19 +270,17 @@ export default class FocusLockoutExtension extends Extension {
                     } catch (_) {}
                     this._grab = null;
                 }
-                // 2. Position this._root BELOW global.top_window_group (Study Mode window is in top_window_group).
-                // BUT DO NOT HIDE this._root! this._root stays permanently visible behind Study Mode!
-                if (this._root && Main.layoutManager.uiGroup.contains(global.top_window_group)) {
-                    try {
-                        Main.layoutManager.uiGroup.set_child_below_sibling(this._root, global.top_window_group);
-                    } catch (_) {}
+                // 2. Hide overlay root so Study Mode is fully visible in fullscreen:
+                if (this._root) {
+                    this._root.hide();
                 }
                 return;
             }
 
             // Study Mode is NOT active (or just closed):
-            // 1. Move this._root to the very TOP of uiGroup:
+            // 1. Make this._root visible and move it to the very TOP of uiGroup:
             if (this._root) {
+                this._root.show();
                 try {
                     Main.layoutManager.uiGroup.set_child_above_sibling(this._root, null);
                 } catch (_) {}
@@ -368,9 +363,29 @@ export default class FocusLockoutExtension extends Extension {
             style: 'background-color: rgba(5, 13, 29, 0.99); padding: 48px;',
         });
 
-        // Block all keyboard bypass
-        this._root.connect('key-press-event', () => Clutter.EVENT_STOP);
-        this._root.connect('key-release-event', () => Clutter.EVENT_STOP);
+        // Block all keyboard bypass, but allow typing in wifi password entry
+        this._root.connect('key-press-event', (actor, event) => {
+            const focus = global.stage.get_key_focus();
+            if (this._wifiPassEntry) {
+                if (focus === this._wifiPassEntry ||
+                    focus === this._wifiPassEntry.clutter_text ||
+                    (this._wifiPassEntry.contains && this._wifiPassEntry.contains(focus))) {
+                    return Clutter.EVENT_PROPAGATE;
+                }
+            }
+            return Clutter.EVENT_STOP;
+        });
+        this._root.connect('key-release-event', (actor, event) => {
+            const focus = global.stage.get_key_focus();
+            if (this._wifiPassEntry) {
+                if (focus === this._wifiPassEntry ||
+                    focus === this._wifiPassEntry.clutter_text ||
+                    (this._wifiPassEntry.contains && this._wifiPassEntry.contains(focus))) {
+                    return Clutter.EVENT_PROPAGATE;
+                }
+            }
+            return Clutter.EVENT_STOP;
+        });
 
         const topSpace = new St.Widget({y_expand: true});
         const bottomSpace = new St.Widget({y_expand: true});
@@ -448,7 +463,8 @@ export default class FocusLockoutExtension extends Extension {
                 return GLib.SOURCE_REMOVE;
             });
             try {
-                GLib.spawn_command_line_async('python3 /opt/focus-reminder/focus-reminder.py --study');
+                const script = this._getScriptPath();
+                GLib.spawn_command_line_async(`python3 ${script} --study`);
             } catch (err) {
                 logError(err, 'Could not spawn study mode');
                 this._studyLaunching = false;
@@ -604,11 +620,19 @@ export default class FocusLockoutExtension extends Extension {
             style: 'color: #f1f5f9; font-weight: bold; font-size: 13px;',
         });
         this._wifiPassEntry = new St.Entry({
-            hint_text: 'Enter Wi-Fi Password',
+            hint_text: 'Enter Wi-Fi Password (leave empty if saved)',
             can_focus: true,
             style: 'background-color: #0f172a; color: #ffffff; border: 1px solid #3b82f6; border-radius: 6px; padding: 8px 12px; font-size: 14px;',
         });
         this._wifiPassEntry.clutter_text.set_password_char('\u25cf');
+        this._wifiPassEntry.clutter_text.connect('key-press-event', (o, e) => {
+            if (e.get_key_symbol() === Clutter.KEY_Escape) {
+                this._wifiPassBox.hide();
+                global.stage.set_key_focus(this._root);
+                return Clutter.EVENT_STOP;
+            }
+            return Clutter.EVENT_PROPAGATE;
+        });
 
         const passBtnBox = new St.BoxLayout({
             vertical: false,
@@ -641,6 +665,7 @@ export default class FocusLockoutExtension extends Extension {
         });
         cancelBtn.connect('clicked', () => {
             this._wifiPassBox.hide();
+            global.stage.set_key_focus(this._root);
         });
 
         passBtnBox.add_child(connectBtn);
@@ -658,6 +683,20 @@ export default class FocusLockoutExtension extends Extension {
         if (!this._wifiStatusLbl || !this._wifiListBox) return;
         this._wifiStatusLbl.set_text('Scanning for Wi-Fi networks…');
         this._wifiListBox.destroy_all_children();
+
+        const savedConns = new Set();
+        try {
+            const [savedOk, savedOut] = GLib.spawn_command_line_sync('nmcli -t -f NAME,TYPE connection show');
+            if (savedOk && savedOut) {
+                const text = new TextDecoder().decode(savedOut);
+                for (const line of text.split('\n')) {
+                    const parts = line.trim().split(':');
+                    if (parts.length >= 2 && parts[1] === '802-11-wireless') {
+                        savedConns.add(parts[0]);
+                    }
+                }
+            }
+        } catch (_) {}
 
         const proc = new Gio.Subprocess({
             argv: ['nmcli', '-t', '-f', 'IN-USE,SSID,SIGNAL,SECURITY', 'dev', 'wifi', 'list'],
@@ -689,12 +728,15 @@ export default class FocusLockoutExtension extends Extension {
                     if (inUse) connectedSsid = ssid;
                     const signal = parseInt(parts[2], 10) || 0;
                     const security = parts.slice(3).join(':').trim();
-                    networks.push({ inUse, ssid, signal, security });
+                    const isSaved = savedConns.has(ssid);
+                    networks.push({ inUse, ssid, signal, security, isSaved });
                 }
 
                 networks.sort((a, b) => {
                     if (a.inUse) return -1;
                     if (b.inUse) return 1;
+                    if (a.isSaved && !b.isSaved) return -1;
+                    if (!a.isSaved && b.isSaved) return 1;
                     return b.signal - a.signal;
                 });
 
@@ -725,9 +767,10 @@ export default class FocusLockoutExtension extends Extension {
                     const signalBars = net.signal > 70 ? '▂▄▆█' : (net.signal > 40 ? '▂▄▆_' : '▂▄__');
                     const lockIcon = net.security ? '🔒 ' : '';
                     const inUseIcon = net.inUse ? '✓ ' : '';
+                    const savedTag = net.isSaved ? ' (Saved)' : '';
 
                     const ssidBtn = new St.Button({
-                        label: `${inUseIcon}${lockIcon}${net.ssid}`,
+                        label: `${inUseIcon}${lockIcon}${net.ssid}${savedTag}`,
                         style_class: 'button',
                         reactive: !net.inUse,
                         can_focus: !net.inUse,
@@ -741,10 +784,14 @@ export default class FocusLockoutExtension extends Extension {
                         ssidBtn.connect('clicked', () => {
                             if (net.security) {
                                 this._wifiTargetSsid = net.ssid;
-                                this._wifiTargetSsidLbl.set_text(`Connect to: ${net.ssid} (${net.security})`);
+                                this._wifiTargetSsidLbl.set_text(
+                                    net.isSaved
+                                        ? `Connect to: ${net.ssid} (Saved — leave password blank or enter new)`
+                                        : `Connect to: ${net.ssid} (${net.security})`
+                                );
                                 this._wifiPassEntry.set_text('');
                                 this._wifiPassBox.show();
-                                global.stage.set_key_focus(this._wifiPassEntry);
+                                this._wifiPassEntry.clutter_text.grab_key_focus();
                             } else {
                                 this._connectWifi(net.ssid, '');
                             }
@@ -784,15 +831,34 @@ export default class FocusLockoutExtension extends Extension {
         });
     }
 
+    _getScriptPath() {
+        const optPath = '/opt/focus-reminder/focus-reminder.py';
+        const localPath = '/home/prof21/MediSparkBD/focus-control/focus-reminder-ubuntu.py';
+        try {
+            if (GLib.file_test(localPath, GLib.FileTest.EXISTS)) {
+                const fOpt = Gio.File.new_for_path(optPath);
+                const fLoc = Gio.File.new_for_path(localPath);
+                const infoOpt = fOpt.query_info('time::modified', Gio.FileQueryInfoFlags.NONE, null);
+                const infoLoc = fLoc.query_info('time::modified', Gio.FileQueryInfoFlags.NONE, null);
+                if (infoLoc.get_modification_date_time().compare(infoOpt.get_modification_date_time()) > 0) {
+                    return localPath;
+                }
+            }
+        } catch (_) {}
+        return optPath;
+    }
+
     _connectWifi(ssid, password) {
         if (!ssid) return;
         if (this._wifiPassBox) this._wifiPassBox.hide();
+        global.stage.set_key_focus(this._root);
         if (this._wifiStatusLbl) {
             this._wifiStatusLbl.set_text(`⏳ Connecting to "${ssid}"…`);
         }
+        const script = this._getScriptPath();
         const argv = password
-            ? ['nmcli', 'dev', 'wifi', 'connect', ssid, 'password', password]
-            : ['nmcli', 'dev', 'wifi', 'connect', ssid];
+            ? ['python3', script, '--connect-wifi', ssid, password]
+            : ['python3', script, '--connect-wifi', ssid];
 
         const proc = new Gio.Subprocess({
             argv,
@@ -811,9 +877,9 @@ export default class FocusLockoutExtension extends Extension {
                         return GLib.SOURCE_REMOVE;
                     });
                 } else {
-                    const msg = (stderr || stdout || 'Unknown error').trim();
+                    const msg = (stdout || stderr || 'Unknown error').trim().replace(/^ERROR:\s*/, '');
                     if (this._wifiStatusLbl) {
-                        this._wifiStatusLbl.set_text(`❌ Connection failed: ${msg}`);
+                        this._wifiStatusLbl.set_text(`❌ ${msg}`);
                     }
                 }
             } catch (err) {

@@ -8086,27 +8086,30 @@ def show_study_window(parent=None, end_ts=None):
         except Exception as e:
             print(f"paste error: {e}", flush=True)
 
+    def _on_back_clicked(*_):
+        _clear_study_active()
+        t_end = time.time() + 0.15
+        while time.time() < t_end:
+            while Gtk.events_pending():
+                Gtk.main_iteration_do(False)
+            time.sleep(0.01)
+        if _study_parent is not None:
+            try:
+                _study_parent.show()
+                _study_parent.present()
+                while Gtk.events_pending():
+                    Gtk.main_iteration_do(False)
+            except Exception:
+                pass
+        win.destroy()
+
     def _handle_key(kv, state_mask):
         try:
             st = state_mask
             mods = st & Gtk.accelerator_get_default_mod_mask()
             ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
             if kv == Gdk.KEY_Escape:
-                if _study_parent is not None:
-                    try:
-                        _study_parent.show()
-                        _study_parent.present()
-                        while Gtk.events_pending():
-                            Gtk.main_iteration_do(False)
-                    except Exception:
-                        pass
-                else:
-                    if _load_suspend_state() > time.time():
-                        try:
-                            os.remove(STUDY_ACTIVE_FLAG)
-                        except OSError:
-                            pass
-                win.destroy()
+                _on_back_clicked()
                 return True
             if ctrl and kv in (Gdk.KEY_l, Gdk.KEY_t, Gdk.KEY_n, Gdk.KEY_w,
                                Gdk.KEY_p, Gdk.KEY_j, Gdk.KEY_u):
@@ -8177,18 +8180,6 @@ def show_study_window(parent=None, end_ts=None):
     win.connect("key-press-event", _on_key)
     for _kw in [canvas, img_scroll, floatbar, *floatbar.get_children()]:
         _kw.connect("key-press-event", _on_key)
-
-    def _on_back_clicked(*_):
-        _clear_study_active()
-        if _study_parent is not None:
-            try:
-                _study_parent.show()
-                _study_parent.present()
-                while Gtk.events_pending():
-                    Gtk.main_iteration_do(False)
-            except Exception:
-                pass
-        win.destroy()
 
     back_btn.connect("clicked", _on_back_clicked)
 
@@ -8516,10 +8507,61 @@ def show_now_once():
             return
 
 
+def connect_wifi_cli(ssid, password=None):
+    if not ssid:
+        print("ERROR: SSID required", flush=True)
+        sys.exit(1)
+
+    try:
+        res = subprocess.run(['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show'],
+                             capture_output=True, text=True, timeout=5)
+        existing_wifi = set()
+        for line in res.stdout.strip().splitlines():
+            parts = line.split(':')
+            if len(parts) >= 2 and parts[1] == '802-11-wireless':
+                existing_wifi.add(parts[0])
+    except Exception:
+        existing_wifi = set()
+
+    if ssid in existing_wifi:
+        if password:
+            subprocess.run([
+                'nmcli', 'connection', 'modify', ssid,
+                'wifi-sec.key-mgmt', 'wpa-psk',
+                'wifi-sec.psk', password
+            ], capture_output=True, text=True, timeout=5)
+        up = subprocess.run(['nmcli', 'connection', 'up', 'id', ssid],
+                            capture_output=True, text=True, timeout=15)
+        if up.returncode == 0:
+            print(f"SUCCESS: Connected to {ssid}", flush=True)
+            sys.exit(0)
+        if not password:
+            print("ERROR: Saved connection failed or requires password.", flush=True)
+            sys.exit(1)
+
+    cmd = ['nmcli', 'dev', 'wifi', 'connect', ssid]
+    if password:
+        cmd.extend(['password', password])
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    if proc.returncode == 0:
+        print(f"SUCCESS: Connected to {ssid}", flush=True)
+        sys.exit(0)
+    else:
+        err = (proc.stderr or proc.stdout or "Connection failed").strip()
+        print(f"ERROR: {err}", flush=True)
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     import sys
     if "--show-upload-password" in sys.argv:
         print(_ensure_phone_upload_password(), flush=True)
+    elif "--connect-wifi" in sys.argv:
+        idx = sys.argv.index("--connect-wifi")
+        ssid = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else ""
+        password = sys.argv[idx + 2] if len(sys.argv) > idx + 2 else None
+        connect_wifi_cli(ssid, password)
+        sys.exit(0)
     elif "--lockout" in sys.argv:
         # One-shot pseudo lockout: locks now, stays on, no sleep.
         _mins = SUSPEND_MINUTES
