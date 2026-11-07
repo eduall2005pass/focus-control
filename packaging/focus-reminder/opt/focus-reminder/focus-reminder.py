@@ -1304,6 +1304,12 @@ def _gnome_restore(saved):
         _run(["gnome-extensions", "enable", "ding@rastersoft.com"], timeout=5)
     except Exception:
         pass
+    try:
+        p_backup = os.path.expanduser("~/.local/share/focus-reminder/panels-backup.json")
+        if os.path.exists(p_backup):
+            os.remove(p_backup)
+    except Exception:
+        pass
 
 
 def _gnome_heal():
@@ -1336,6 +1342,12 @@ def _gnome_heal():
         pass
     try:
         _run(["gnome-extensions", "enable", "ding@rastersoft.com"], timeout=5)
+    except Exception:
+        pass
+    try:
+        p_backup = os.path.expanduser("~/.local/share/focus-reminder/panels-backup.json")
+        if os.path.exists(p_backup):
+            os.remove(p_backup)
     except Exception:
         pass
 
@@ -8561,6 +8573,13 @@ if __name__ == "__main__":
         ssid = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else ""
         password = sys.argv[idx + 2] if len(sys.argv) > idx + 2 else None
         connect_wifi_cli(ssid, password)
+        sys.exit(0)
+    elif "--restore-desktop-panels" in sys.argv:
+        if _load_suspend_state() > time.time():
+            print("Lockout is currently active. Panels remain locked down until countdown ends.", flush=True)
+            sys.exit(1)
+        _gnome_heal()
+        print("Desktop Top Bar and Dock restored successfully.", flush=True)
         sys.exit(0)
     elif "--lockout" in sys.argv:
         # One-shot pseudo lockout: locks now, stays on, no sleep.

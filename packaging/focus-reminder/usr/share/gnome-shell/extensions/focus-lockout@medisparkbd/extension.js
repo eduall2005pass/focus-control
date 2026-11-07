@@ -5,6 +5,7 @@ import Meta from 'gi://Meta';
 import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 
 const STATE_DIR = '.local/share/focus-reminder';
 
@@ -28,6 +29,20 @@ export default class FocusLockoutExtension extends Extension {
         this._studySuspendPath = GLib.build_filenamev([
             GLib.get_home_dir(), STATE_DIR, 'study-suspended.state',
         ]);
+        this._panelsBackupPath = GLib.build_filenamev([
+            GLib.get_home_dir(), STATE_DIR, 'panels-backup.json',
+        ]);
+        this._panelNotifyHook = 0;
+        this._panelBoxNotifyHook = 0;
+        this._detectEnvironment();
+
+        // Crash recovery: if extension loads when lockout is expired, restore any stale backup
+        if (this._readDeadline() <= Date.now() / 1000) {
+            const stale = this._loadPanelsBackup();
+            if (stale) {
+                this._restoreDesktopPanels();
+            }
+        }
         this._root = null;
         this._grab = null;
         this._end = 0;
@@ -106,85 +121,311 @@ export default class FocusLockoutExtension extends Extension {
         this._setLockdownActive(false);
     }
 
+    _detectEnvironment() {
+        this._env = {
+            shellVersion: '50.1',
+            sessionType: 'wayland',
+            ubuntuVersion: '26.04',
+            dockUuid: 'ubuntu-dock@ubuntu.com',
+        };
+        try {
+            this._env.shellVersion = Config.PACKAGE_VERSION || '50.1';
+        } catch (_) {}
+        try {
+            if (typeof Meta.is_wayland_compositor === 'function' && Meta.is_wayland_compositor()) {
+                this._env.sessionType = 'wayland';
+            } else {
+                this._env.sessionType = GLib.getenv('XDG_SESSION_TYPE') || 'x11';
+            }
+        } catch (_) {
+            this._env.sessionType = GLib.getenv('XDG_SESSION_TYPE') || 'unknown';
+        }
+        try {
+            const [ok, data] = GLib.file_get_contents('/etc/os-release');
+            if (ok) {
+                const text = new TextDecoder().decode(data);
+                const m = text.match(/VERSION_ID=["']?([^"'\n]+)/);
+                if (m) this._env.ubuntuVersion = m[1];
+            }
+        } catch (_) {}
+        try {
+            this._env.dockUuid = this._detectDockUuid();
+        } catch (_) {}
+        console.log(`[FocusLockout] Environment detected: GNOME Shell ${this._env.shellVersion}, Ubuntu ${this._env.ubuntuVersion}, Session: ${this._env.sessionType}, Dock: ${this._env.dockUuid}`);
+    }
+
+    _detectDockUuid() {
+        const candidates = ['ubuntu-dock@ubuntu.com', 'dash-to-dock@vibou.hopla.net'];
+        for (const uuid of candidates) {
+            try {
+                if (Main.extensionManager && typeof Main.extensionManager.lookup === 'function' && Main.extensionManager.lookup(uuid)) {
+                    return uuid;
+                }
+            } catch (_) {}
+        }
+        try {
+            const s = new Gio.Settings({schema_id: 'org.gnome.shell'});
+            const enabled = s.get_strv('enabled-extensions');
+            for (const uuid of candidates) {
+                if (enabled.includes(uuid)) return uuid;
+            }
+        } catch (_) {}
+        return 'ubuntu-dock@ubuntu.com';
+    }
+
+    _isExtensionEnabled(uuid) {
+        try {
+            if (Main.extensionManager && typeof Main.extensionManager.lookup === 'function') {
+                const ext = Main.extensionManager.lookup(uuid);
+                if (ext && ext.state !== undefined) {
+                    return ext.state === 1; // ExtensionState.ENABLED
+                }
+            }
+        } catch (_) {}
+        try {
+            const s = new Gio.Settings({schema_id: 'org.gnome.shell'});
+            const enabled = s.get_strv('enabled-extensions');
+            return enabled.includes(uuid);
+        } catch (_) {
+            return false;
+        }
+    }
+
+    _savePanelsBackup(data) {
+        try {
+            GLib.mkdir_with_parents(GLib.path_get_dirname(this._panelsBackupPath), 0o700);
+            GLib.file_set_contents(this._panelsBackupPath, JSON.stringify(data));
+        } catch (e) {
+            logError(e, 'FocusLockout could not write panels backup');
+        }
+    }
+
+    _loadPanelsBackup() {
+        try {
+            const [ok, bytes] = GLib.file_get_contents(this._panelsBackupPath);
+            if (ok) {
+                return JSON.parse(new TextDecoder().decode(bytes));
+            }
+        } catch (_) {}
+        return null;
+    }
+
+    _deletePanelsBackup() {
+        try {
+            GLib.unlink(this._panelsBackupPath);
+        } catch (_) {}
+    }
+
+    _findDockActors(actor) {
+        let found = [];
+        if (!actor) return found;
+        const name = actor.name || '';
+        const hasClass = (typeof actor.has_style_class_name === 'function');
+        if (name === 'dashtodockContainer' ||
+            (hasClass && (actor.has_style_class_name('dashtodock') || actor.has_style_class_name('dashtodockContainer')))) {
+            found.push(actor);
+        }
+        if (typeof actor.get_children === 'function') {
+            for (const child of actor.get_children()) {
+                found = found.concat(this._findDockActors(child));
+            }
+        }
+        return found;
+    }
+
     _setLockdownActive(active) {
         if (this._lockdownActive === active) return;
         this._lockdownActive = active;
 
-        // 1. Overview block/unblock (blocks Super key and Activities overview completely)
+        if (active) {
+            this._applyLockdown();
+        } else {
+            this._restoreDesktopPanels();
+        }
+    }
+
+    _applyLockdown() {
+        // 1. Save original panels & dock state to persistent disk backup if not already saved
         try {
-            if (active) {
-                if (Main.overview && !this._overviewBlocked) {
-                    Main.overview.block();
-                    this._overviewBlocked = true;
-                }
-            } else {
-                if (Main.overview && this._overviewBlocked) {
-                    Main.overview.unblock();
-                    this._overviewBlocked = false;
+            let backup = this._loadPanelsBackup();
+            if (!backup) {
+                const dockUuid = (this._env && this._env.dockUuid) || this._detectDockUuid();
+                const isDockEnabled = this._isExtensionEnabled(dockUuid);
+                const isDingEnabled = this._isExtensionEnabled('ding@rastersoft.com');
+                backup = {
+                    savedAt: Math.floor(Date.now() / 1000),
+                    dockUuid,
+                    dockEnabled: isDockEnabled,
+                    dingEnabled: isDingEnabled,
+                    panelVisible: Main.panel ? Main.panel.visible : true,
+                    panelReactive: Main.panel ? Main.panel.reactive : true,
+                    panelOpacity: Main.panel ? Main.panel.opacity : 255,
+                    panelBoxVisible: Main.layoutManager.panelBox ? Main.layoutManager.panelBox.visible : true,
+                    panelBoxReactive: Main.layoutManager.panelBox ? Main.layoutManager.panelBox.reactive : true,
+                    panelBoxOpacity: Main.layoutManager.panelBox ? Main.layoutManager.panelBox.opacity : 255,
+                };
+                this._savePanelsBackup(backup);
+            }
+        } catch (e) {
+            logError(e, 'FocusLockout error backing up panel state');
+        }
+
+        // 2. Completely hide Top Bar (Main.panel & panelBox) and remove struts
+        try {
+            if (Main.panel) {
+                Main.panel.visible = false;
+                Main.panel.reactive = false;
+                Main.panel.opacity = 0;
+                if (!this._panelNotifyHook) {
+                    this._panelNotifyHook = Main.panel.connect('notify::visible', () => {
+                        if (this._lockdownActive && Main.panel.visible) {
+                            Main.panel.visible = false;
+                            Main.panel.reactive = false;
+                            Main.panel.opacity = 0;
+                        }
+                    });
                 }
             }
-        } catch (_) {}
+            if (Main.layoutManager.panelBox) {
+                Main.layoutManager.panelBox.visible = false;
+                Main.layoutManager.panelBox.reactive = false;
+                Main.layoutManager.panelBox.opacity = 0;
+                if (!this._panelBoxNotifyHook) {
+                    this._panelBoxNotifyHook = Main.layoutManager.panelBox.connect('notify::visible', () => {
+                        if (this._lockdownActive && Main.layoutManager.panelBox.visible) {
+                            Main.layoutManager.panelBox.visible = false;
+                            Main.layoutManager.panelBox.reactive = false;
+                            Main.layoutManager.panelBox.opacity = 0;
+                        }
+                    });
+                }
+            }
+            if (typeof Main.layoutManager._queueUpdateRegions === 'function') {
+                Main.layoutManager._queueUpdateRegions();
+            }
+        } catch (e) {
+            logError(e, 'FocusLockout Top Bar hide error');
+        }
 
-        // 2. Hide/show and deactivate Clutter stage dock actors (Ubuntu Dock)
+        // 3. Completely hide and disable Ubuntu Dock & eliminate edge reveal
         try {
-            const findDocks = (actor) => {
-                let found = [];
-                if (!actor) return found;
-                if (actor.name === 'dashtodockContainer' ||
-                    (actor.has_style_class_name && actor.has_style_class_name('dashtodock'))) {
-                    found.push(actor);
-                }
-                if (actor.get_children) {
-                    for (const child of actor.get_children()) {
-                        found = found.concat(findDocks(child));
-                    }
-                }
-                return found;
-            };
-            const docks = findDocks(global.stage);
+            const dockUuid = (this._env && this._env.dockUuid) || 'ubuntu-dock@ubuntu.com';
+            // Disable extension: removes dock actor, eliminates pressure barriers & auto-hide edge reveal
+            if (Main.extensionManager && typeof Main.extensionManager.disableExtension === 'function') {
+                try { Main.extensionManager.disableExtension(dockUuid); } catch (_) {}
+                try { Main.extensionManager.disableExtension('ding@rastersoft.com'); } catch (_) {}
+            }
+            GLib.spawn_command_line_async(`gnome-extensions disable ${dockUuid}`);
+            GLib.spawn_command_line_async('gnome-extensions disable ding@rastersoft.com');
+
+            // Also hide any Clutter dock actors on stage immediately
+            const docks = this._findDockActors(global.stage);
             for (const dock of docks) {
-                dock.visible = !active;
-                dock.reactive = !active;
-                dock.opacity = active ? 0 : 255;
-                if (active && !dock._focusLockHook) {
+                dock.visible = false;
+                dock.reactive = false;
+                dock.opacity = 0;
+                if (!dock._focusLockHook) {
                     dock._focusLockHook = true;
                     dock.connect('notify::visible', () => {
                         if (this._lockdownActive && dock.visible) {
                             dock.visible = false;
                             dock.reactive = false;
+                            dock.opacity = 0;
                         }
                     });
                 }
             }
-        } catch (_) {}
+        } catch (e) {
+            logError(e, 'FocusLockout Dock hide error');
+        }
 
-        // 3. Dash-to-dock / Ubuntu Dock GSettings lockdown
+        // 4. Block Activities Overview & hot corners
         try {
-            const s = new Gio.Settings({schema_id: 'org.gnome.shell.extensions.dash-to-dock'});
-            if (active) {
-                s.set_boolean('dock-fixed', false);
-                s.set_boolean('autohide', true);
-                s.set_boolean('autohide-in-fullscreen', false);
-                s.set_boolean('intellihide', false);
-                s.set_boolean('require-pressure-to-show', true);
-                s.set_double('pressure-threshold', 1000000.0);
-                s.set_boolean('show-running', false);
-                s.set_boolean('show-favorites', false);
-                s.set_boolean('show-show-apps-button', false);
-                s.set_boolean('hot-keys', false);
-            } else {
-                s.reset('dock-fixed');
-                s.reset('autohide');
-                s.reset('autohide-in-fullscreen');
-                s.reset('intellihide');
-                s.reset('require-pressure-to-show');
-                s.reset('pressure-threshold');
-                s.reset('show-running');
-                s.reset('show-favorites');
-                s.reset('show-show-apps-button');
-                s.reset('hot-keys');
+            if (Main.overview && !this._overviewBlocked) {
+                Main.overview.block();
+                this._overviewBlocked = true;
             }
-        } catch (_) {}
+        } catch (e) {
+            logError(e, 'FocusLockout overview block error');
+        }
+    }
+
+    _restoreDesktopPanels() {
+        // 1. Unhook Top Bar notify guards
+        if (this._panelNotifyHook && Main.panel) {
+            try { Main.panel.disconnect(this._panelNotifyHook); } catch (_) {}
+            this._panelNotifyHook = 0;
+        }
+        if (this._panelBoxNotifyHook && Main.layoutManager.panelBox) {
+            try { Main.layoutManager.panelBox.disconnect(this._panelBoxNotifyHook); } catch (_) {}
+            this._panelBoxNotifyHook = 0;
+        }
+
+        // 2. Load original state from persistent backup (or fallback to defaults)
+        const backup = this._loadPanelsBackup();
+
+        // 3. Restore Top Bar
+        try {
+            if (Main.panel) {
+                Main.panel.visible = backup ? backup.panelVisible : true;
+                Main.panel.reactive = backup ? backup.panelReactive : true;
+                Main.panel.opacity = backup ? backup.panelOpacity : 255;
+            }
+            if (Main.layoutManager.panelBox) {
+                Main.layoutManager.panelBox.visible = backup ? backup.panelBoxVisible : true;
+                Main.layoutManager.panelBox.reactive = backup ? backup.panelBoxReactive : true;
+                Main.layoutManager.panelBox.opacity = backup ? backup.panelBoxOpacity : 255;
+            }
+            if (typeof Main.layoutManager._queueUpdateRegions === 'function') {
+                Main.layoutManager._queueUpdateRegions();
+            }
+        } catch (e) {
+            logError(e, 'FocusLockout Top Bar restore error');
+        }
+
+        // 4. Restore Ubuntu Dock & Desktop Icons without modifying user preferences
+        try {
+            const dockUuid = (backup && backup.dockUuid) || (this._env && this._env.dockUuid) || 'ubuntu-dock@ubuntu.com';
+            const shouldEnableDock = backup ? backup.dockEnabled : true;
+            const shouldEnableDing = backup ? backup.dingEnabled : true;
+
+            if (shouldEnableDock) {
+                if (Main.extensionManager && typeof Main.extensionManager.enableExtension === 'function') {
+                    try { Main.extensionManager.enableExtension(dockUuid); } catch (_) {}
+                }
+                GLib.spawn_command_line_async(`gnome-extensions enable ${dockUuid}`);
+            }
+
+            if (shouldEnableDing) {
+                if (Main.extensionManager && typeof Main.extensionManager.enableExtension === 'function') {
+                    try { Main.extensionManager.enableExtension('ding@rastersoft.com'); } catch (_) {}
+                }
+                GLib.spawn_command_line_async('gnome-extensions enable ding@rastersoft.com');
+            }
+
+            // Also restore stage actors if any exist
+            const docks = this._findDockActors(global.stage);
+            for (const dock of docks) {
+                dock.visible = true;
+                dock.reactive = true;
+                dock.opacity = 255;
+            }
+        } catch (e) {
+            logError(e, 'FocusLockout Dock restore error');
+        }
+
+        // 5. Unblock Activities Overview
+        try {
+            if (Main.overview && this._overviewBlocked) {
+                Main.overview.unblock();
+                this._overviewBlocked = false;
+            }
+        } catch (e) {
+            logError(e, 'FocusLockout overview unblock error');
+        }
+
+        // 6. Clean up backup file
+        this._deletePanelsBackup();
     }
 
     _readDeadline() {
