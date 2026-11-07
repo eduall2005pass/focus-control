@@ -220,28 +220,8 @@ export default class FocusLockoutExtension extends Extension {
             const age = Date.now() / 1000 - ts;
             if (!Number.isFinite(ts) || age < 0 || age >= 8)
                 return false;
-            if (age < 2.5)
-                return true;
             const wins = global.display.get_tab_list(Meta.TabList.NORMAL_ALL, null);
             return wins.some(w => w && (w.get_title() === 'Study' || (w.get_wm_class && w.get_wm_class() === 'focus-reminder')));
-        } catch (_) {
-            return false;
-        }
-    }
-
-    _isWifiActive() {
-        try {
-            const [ok, bytes] = GLib.file_get_contents(this._wifiActivePath);
-            if (!ok)
-                return false;
-            const ts = Number(new TextDecoder().decode(bytes).trim());
-            const age = Date.now() / 1000 - ts;
-            if (!Number.isFinite(ts) || age < 0 || age >= 10)
-                return false;
-            if (age < 1.5)
-                return true;
-            const wins = global.display.get_tab_list(Meta.TabList.NORMAL_ALL, null);
-            return wins.some(w => w && (w.get_title() === 'Wi-Fi Networks' || w.get_title() === 'Wi-Fi'));
         } catch (_) {
             return false;
         }
@@ -267,18 +247,7 @@ export default class FocusLockoutExtension extends Extension {
             this._writeFlag();
             this._setLockdownActive(true);
 
-            const isStudySuspended = this._getStudySuspendedUntil() > now;
-
-            // Focus Lockout screen is the primary and only lockout screen.
-            // Temporarily step aside ONLY when Study Mode or Wi-Fi dialog is active.
-            if ((this._isStudyActive() && !isStudySuspended) || this._isWifiActive()) {
-                if (this._root) {
-                    this._hideOverlay();
-                }
-                return;
-            }
-
-            // Otherwise, show shell overlay (guarantees zero-delay modal shield)
+            // Ensure overlay root is created and covering screen
             if (!this._root) {
                 this._showOverlay();
             }
@@ -290,6 +259,52 @@ export default class FocusLockoutExtension extends Extension {
             if (this._unlockLabel) {
                 this._unlockLabel.set_text(
                     `Unlocks at ${new Date(end * 1000).toLocaleString()}`);
+            }
+
+            const isStudySuspended = this._getStudySuspendedUntil() > now;
+            const studyActive = this._isStudyActive() && !isStudySuspended;
+
+            if (studyActive) {
+                // Study Mode is open on screen!
+                // 1. Release modal grab so user can interact with Study Mode:
+                if (this._grab) {
+                    try {
+                        Main.popModal(this._grab);
+                    } catch (_) {}
+                    this._grab = null;
+                }
+                // 2. Position this._root BELOW global.top_window_group (Study Mode window is in top_window_group).
+                // BUT DO NOT HIDE this._root! this._root stays permanently visible behind Study Mode!
+                if (this._root && Main.layoutManager.uiGroup.contains(global.top_window_group)) {
+                    try {
+                        Main.layoutManager.uiGroup.set_child_below_sibling(this._root, global.top_window_group);
+                    } catch (_) {}
+                }
+                return;
+            }
+
+            // Study Mode is NOT active (or just closed):
+            // 1. Move this._root to the very TOP of uiGroup:
+            if (this._root) {
+                try {
+                    Main.layoutManager.uiGroup.set_child_above_sibling(this._root, null);
+                } catch (_) {}
+            }
+            // 2. Re-acquire modal grab to block all desktop interaction:
+            if (this._root && !this._grab) {
+                try {
+                    this._grab = Main.pushModal(this._root);
+                } catch (e) {
+                    logError(e, 'FocusLockout grab error');
+                }
+                global.stage.set_key_focus(this._root);
+            }
+
+            // 3. Reset Study button state if it was in 'Opening...' state
+            if (this._studyBtn && this._studyLaunching) {
+                this._studyLaunching = false;
+                this._studyBtn.reactive = true;
+                this._studyBtn.set_label('📚  Study Mode');
             }
 
             // Update Study button state based on 30m suspension
@@ -469,22 +484,22 @@ export default class FocusLockoutExtension extends Extension {
             style: 'background-color: #1e293b; color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.45); padding: 12px 32px; border-radius: 8px; font-weight: bold; font-size: 18px;',
         });
         this._wifiBtn.connect('clicked', () => {
-            try {
-                GLib.mkdir_with_parents(GLib.path_get_dirname(this._wifiActivePath), 0o700);
-                GLib.file_set_contents(this._wifiActivePath, `${Date.now() / 1000}\n`);
-            } catch (_) {}
-            this._hideOverlay();
-            try {
-                GLib.spawn_command_line_async('python3 /opt/focus-reminder/focus-reminder.py --wifi');
-            } catch (err) {
-                logError(err, 'Could not spawn wifi dialog');
+            if (this._btnBox) this._btnBox.hide();
+            if (this._wifiCard) {
+                this._wifiCard.show();
+                this._scanWifi();
             }
         });
 
-        btnBox.add_child(this._studyBtn);
-        btnBox.add_child(this._wifiBtn);
-        btnBox.add_child(powerBtn);
-        content.add_child(btnBox);
+        this._btnBox = btnBox;
+        this._btnBox.add_child(this._studyBtn);
+        this._btnBox.add_child(this._wifiBtn);
+        this._btnBox.add_child(powerBtn);
+        content.add_child(this._btnBox);
+
+        this._wifiCard = this._buildWifiCard();
+        this._wifiCard.visible = false;
+        content.add_child(this._wifiCard);
 
         this._root.add_child(topSpace);
         this._root.add_child(content);
@@ -509,6 +524,328 @@ export default class FocusLockoutExtension extends Extension {
             return;
         }
         global.stage.set_key_focus(this._root);
+    }
+
+    _buildWifiCard() {
+        const card = new St.BoxLayout({
+            vertical: true,
+            x_align: Clutter.ActorAlign.CENTER,
+            style: 'background-color: rgba(15, 23, 42, 0.98); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 14px; padding: 24px; min-width: 480px; max-width: 540px; margin-top: 15px;',
+        });
+
+        const headBox = new St.BoxLayout({
+            vertical: false,
+            x_expand: true,
+            style: 'margin-bottom: 14px;',
+        });
+        const titleLbl = new St.Label({
+            text: '📶  WI-FI NETWORKS',
+            y_align: Clutter.ActorAlign.CENTER,
+            style: 'color: #38bdf8; font-weight: bold; font-size: 16px;',
+        });
+        const headSpacer = new St.Widget({x_expand: true});
+
+        const scanBtn = new St.Button({
+            label: '↻  Scan',
+            style_class: 'button',
+            reactive: true,
+            can_focus: true,
+            track_hover: true,
+            style: 'background-color: #1e293b; color: #94a3b8; padding: 6px 14px; border-radius: 6px; font-size: 13px; margin-right: 8px;',
+        });
+        scanBtn.connect('clicked', () => this._scanWifi());
+
+        const closeBtn = new St.Button({
+            label: '✕  Close',
+            style_class: 'button',
+            reactive: true,
+            can_focus: true,
+            track_hover: true,
+            style: 'background-color: #334155; color: #ffffff; padding: 6px 14px; border-radius: 6px; font-weight: bold; font-size: 13px;',
+        });
+        closeBtn.connect('clicked', () => {
+            if (this._wifiCard) this._wifiCard.hide();
+            if (this._btnBox) this._btnBox.show();
+        });
+
+        headBox.add_child(titleLbl);
+        headBox.add_child(headSpacer);
+        headBox.add_child(scanBtn);
+        headBox.add_child(closeBtn);
+        card.add_child(headBox);
+
+        this._wifiStatusLbl = new St.Label({
+            text: 'Ready to scan…',
+            style: 'color: #cbd5e1; font-size: 13px; margin-bottom: 12px;',
+        });
+        card.add_child(this._wifiStatusLbl);
+
+        this._wifiListBox = new St.BoxLayout({
+            vertical: true,
+            style: 'spacing: 6px;',
+        });
+        this._wifiScroll = new St.ScrollView({
+            hscrollbar_policy: St.PolicyType.NEVER,
+            vscrollbar_policy: St.PolicyType.AUTOMATIC,
+            enable_mouse_scrolling: true,
+            style: 'max-height: 240px; min-height: 120px; margin-bottom: 12px;',
+        });
+        this._wifiScroll.set_child(this._wifiListBox);
+        card.add_child(this._wifiScroll);
+
+        this._wifiPassBox = new St.BoxLayout({
+            vertical: true,
+            style: 'background-color: #1e293b; border: 1px solid #475569; border-radius: 8px; padding: 12px; margin-top: 6px; spacing: 8px;',
+        });
+        this._wifiPassBox.hide();
+
+        this._wifiTargetSsidLbl = new St.Label({
+            text: 'Connect to: ',
+            style: 'color: #f1f5f9; font-weight: bold; font-size: 13px;',
+        });
+        this._wifiPassEntry = new St.Entry({
+            hint_text: 'Enter Wi-Fi Password',
+            can_focus: true,
+            style: 'background-color: #0f172a; color: #ffffff; border: 1px solid #3b82f6; border-radius: 6px; padding: 8px 12px; font-size: 14px;',
+        });
+        this._wifiPassEntry.clutter_text.set_password_char('\u25cf');
+
+        const passBtnBox = new St.BoxLayout({
+            vertical: false,
+            style: 'spacing: 10px;',
+        });
+        const connectBtn = new St.Button({
+            label: 'Connect',
+            style_class: 'button',
+            reactive: true,
+            can_focus: true,
+            track_hover: true,
+            style: 'background-color: #2563eb; color: #ffffff; padding: 8px 20px; border-radius: 6px; font-weight: bold; font-size: 13px;',
+        });
+        const cancelBtn = new St.Button({
+            label: 'Cancel',
+            style_class: 'button',
+            reactive: true,
+            can_focus: true,
+            track_hover: true,
+            style: 'background-color: #475569; color: #ffffff; padding: 8px 16px; border-radius: 6px; font-size: 13px;',
+        });
+
+        connectBtn.connect('clicked', () => {
+            const password = this._wifiPassEntry.get_text();
+            this._connectWifi(this._wifiTargetSsid, password);
+        });
+        this._wifiPassEntry.clutter_text.connect('activate', () => {
+            const password = this._wifiPassEntry.get_text();
+            this._connectWifi(this._wifiTargetSsid, password);
+        });
+        cancelBtn.connect('clicked', () => {
+            this._wifiPassBox.hide();
+        });
+
+        passBtnBox.add_child(connectBtn);
+        passBtnBox.add_child(cancelBtn);
+
+        this._wifiPassBox.add_child(this._wifiTargetSsidLbl);
+        this._wifiPassBox.add_child(this._wifiPassEntry);
+        this._wifiPassBox.add_child(passBtnBox);
+        card.add_child(this._wifiPassBox);
+
+        return card;
+    }
+
+    _scanWifi() {
+        if (!this._wifiStatusLbl || !this._wifiListBox) return;
+        this._wifiStatusLbl.set_text('Scanning for Wi-Fi networks…');
+        this._wifiListBox.destroy_all_children();
+
+        const proc = new Gio.Subprocess({
+            argv: ['nmcli', '-t', '-f', 'IN-USE,SSID,SIGNAL,SECURITY', 'dev', 'wifi', 'list'],
+            flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+        });
+        proc.init(null);
+        proc.communicate_utf8_async(null, null, (p, res) => {
+            try {
+                const [ok, stdout, stderr] = p.communicate_utf8_finish(res);
+                if (!this._wifiListBox) return;
+                this._wifiListBox.destroy_all_children();
+                if (!ok || !stdout) {
+                    this._wifiStatusLbl.set_text(stderr ? `Error: ${stderr.trim()}` : 'No networks found.');
+                    return;
+                }
+                const lines = stdout.split('\n');
+                const seen = new Set();
+                const networks = [];
+                let connectedSsid = null;
+                for (const rawLine of lines) {
+                    const line = rawLine.trim();
+                    if (!line) continue;
+                    const parts = line.split(':');
+                    if (parts.length < 4) continue;
+                    const inUse = parts[0].trim() === '*';
+                    const ssid = parts[1].trim();
+                    if (!ssid || seen.has(ssid)) continue;
+                    seen.add(ssid);
+                    if (inUse) connectedSsid = ssid;
+                    const signal = parseInt(parts[2], 10) || 0;
+                    const security = parts.slice(3).join(':').trim();
+                    networks.push({ inUse, ssid, signal, security });
+                }
+
+                networks.sort((a, b) => {
+                    if (a.inUse) return -1;
+                    if (b.inUse) return 1;
+                    return b.signal - a.signal;
+                });
+
+                if (connectedSsid) {
+                    this._wifiStatusLbl.set_text(`Connected to: ${connectedSsid}`);
+                } else {
+                    this._wifiStatusLbl.set_text(`Found ${networks.length} networks. Click one to connect.`);
+                }
+
+                if (networks.length === 0) {
+                    const noNetLbl = new St.Label({
+                        text: 'No Wi-Fi networks found. Click Scan to retry.',
+                        style: 'color: #94a3b8; font-size: 13px; padding: 10px;',
+                    });
+                    this._wifiListBox.add_child(noNetLbl);
+                    return;
+                }
+
+                for (const net of networks) {
+                    const row = new St.BoxLayout({
+                        vertical: false,
+                        x_expand: true,
+                        style: net.inUse
+                            ? 'background-color: rgba(37, 99, 235, 0.2); border: 1px solid #2563eb; border-radius: 6px; padding: 6px 10px; margin-bottom: 2px;'
+                            : 'background-color: rgba(30, 41, 59, 0.6); border: 1px solid rgba(148, 163, 184, 0.15); border-radius: 6px; padding: 6px 10px; margin-bottom: 2px;',
+                    });
+
+                    const signalBars = net.signal > 70 ? '▂▄▆█' : (net.signal > 40 ? '▂▄▆_' : '▂▄__');
+                    const lockIcon = net.security ? '🔒 ' : '';
+                    const inUseIcon = net.inUse ? '✓ ' : '';
+
+                    const ssidBtn = new St.Button({
+                        label: `${inUseIcon}${lockIcon}${net.ssid}`,
+                        style_class: 'button',
+                        reactive: !net.inUse,
+                        can_focus: !net.inUse,
+                        x_align: Clutter.ActorAlign.START,
+                        x_expand: true,
+                        style: net.inUse
+                            ? 'background-color: transparent; color: #60a5fa; font-weight: bold; font-size: 13px; text-align: left; padding: 0;'
+                            : 'background-color: transparent; color: #f1f5f9; font-size: 13px; text-align: left; padding: 0;',
+                    });
+                    if (!net.inUse) {
+                        ssidBtn.connect('clicked', () => {
+                            if (net.security) {
+                                this._wifiTargetSsid = net.ssid;
+                                this._wifiTargetSsidLbl.set_text(`Connect to: ${net.ssid} (${net.security})`);
+                                this._wifiPassEntry.set_text('');
+                                this._wifiPassBox.show();
+                                global.stage.set_key_focus(this._wifiPassEntry);
+                            } else {
+                                this._connectWifi(net.ssid, '');
+                            }
+                        });
+                    }
+
+                    const signalLbl = new St.Label({
+                        text: `${signalBars} ${net.signal}%`,
+                        y_align: Clutter.ActorAlign.CENTER,
+                        style: 'color: #94a3b8; font-size: 11px; margin-left: 8px;',
+                    });
+
+                    row.add_child(ssidBtn);
+                    row.add_child(signalLbl);
+
+                    if (net.inUse) {
+                        const discBtn = new St.Button({
+                            label: 'Disconnect',
+                            style_class: 'button',
+                            reactive: true,
+                            can_focus: true,
+                            style: 'background-color: #ef4444; color: #ffffff; padding: 2px 8px; border-radius: 4px; font-size: 11px; margin-left: 8px;',
+                        });
+                        discBtn.connect('clicked', () => {
+                            this._disconnectWifi(net.ssid);
+                        });
+                        row.add_child(discBtn);
+                    }
+
+                    this._wifiListBox.add_child(row);
+                }
+            } catch (err) {
+                if (this._wifiStatusLbl) {
+                    this._wifiStatusLbl.set_text(`Scan failed: ${err.message || err}`);
+                }
+            }
+        });
+    }
+
+    _connectWifi(ssid, password) {
+        if (!ssid) return;
+        if (this._wifiPassBox) this._wifiPassBox.hide();
+        if (this._wifiStatusLbl) {
+            this._wifiStatusLbl.set_text(`⏳ Connecting to "${ssid}"…`);
+        }
+        const argv = password
+            ? ['nmcli', 'dev', 'wifi', 'connect', ssid, 'password', password]
+            : ['nmcli', 'dev', 'wifi', 'connect', ssid];
+
+        const proc = new Gio.Subprocess({
+            argv,
+            flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+        });
+        proc.init(null);
+        proc.communicate_utf8_async(null, null, (p, res) => {
+            try {
+                const [ok, stdout, stderr] = p.communicate_utf8_finish(res);
+                if (p.get_successful()) {
+                    if (this._wifiStatusLbl) {
+                        this._wifiStatusLbl.set_text(`✓ Successfully connected to "${ssid}"!`);
+                    }
+                    GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
+                        this._scanWifi();
+                        return GLib.SOURCE_REMOVE;
+                    });
+                } else {
+                    const msg = (stderr || stdout || 'Unknown error').trim();
+                    if (this._wifiStatusLbl) {
+                        this._wifiStatusLbl.set_text(`❌ Connection failed: ${msg}`);
+                    }
+                }
+            } catch (err) {
+                if (this._wifiStatusLbl) {
+                    this._wifiStatusLbl.set_text(`❌ Error: ${err.message || err}`);
+                }
+            }
+        });
+    }
+
+    _disconnectWifi(ssid) {
+        if (!ssid) return;
+        if (this._wifiStatusLbl) {
+            this._wifiStatusLbl.set_text(`Disconnecting from "${ssid}"…`);
+        }
+        const proc = new Gio.Subprocess({
+            argv: ['nmcli', 'connection', 'down', 'id', ssid],
+            flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+        });
+        proc.init(null);
+        proc.communicate_utf8_async(null, null, (p, res) => {
+            try {
+                p.communicate_utf8_finish(res);
+                if (this._wifiStatusLbl) {
+                    this._wifiStatusLbl.set_text(`Disconnected from "${ssid}".`);
+                }
+                GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
+                    this._scanWifi();
+                    return GLib.SOURCE_REMOVE;
+                });
+            } catch (_) {}
+        });
     }
 
     _writeFlag() {
@@ -554,6 +891,14 @@ export default class FocusLockoutExtension extends Extension {
         }
         this._studyBtn = null;
         this._wifiBtn = null;
+        this._btnBox = null;
+        this._wifiCard = null;
+        this._wifiStatusLbl = null;
+        this._wifiListBox = null;
+        this._wifiScroll = null;
+        this._wifiPassBox = null;
+        this._wifiPassEntry = null;
+        this._wifiTargetSsid = null;
         this._timerLabel = null;
         this._unlockLabel = null;
         this._removeFlag();
