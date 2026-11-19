@@ -13,6 +13,6 @@ cp assets/focus-reminder.png "$PKGDIR/usr/share/icons/hicolor/48x48/apps/focus-r
 python3 -c 'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
   "$PKGDIR/opt/focus-reminder/focus-reminder.py"
 find "$PKGDIR" -type d -name __pycache__ -prune -exec rm -rf {} +
-dpkg-deb --root-owner-group --compression=gzip --build "$PKGDIR" "$DEB_OUT"
+dpkg-deb --root-owner-group --build "$PKGDIR" "$DEB_OUT"
 echo "Built: $DEB_OUT"
 echo "Install: sudo dpkg -i $DEB_OUT"

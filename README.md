@@ -29,7 +29,7 @@ lockout, and a persistent system tray. Runs automatically for every user.
   study sites (muslimbangla.com) skip the reminder
 - **Tray** — persistent top-bar icon (requires
   `gir1.2-ayatanaappindicator3-0.1`), live waste label, no Quit by design
-- **Protected package** — prerm refuses removal, apt hold, immutable files
+- **Protected lockout state** — root-owned system service; apt hold and immutable files are not used
 
 ## Install
 
@@ -96,7 +96,7 @@ Submit path (Flathub requires a PR from you):
 
 - Suspend confirmations require the system (sudo) password; it is never stored.
 - Power Off needs confirmation; shutdown itself may ask for auth (system policy).
-- Uninstall is blocked by design (prerm + hold + immutable files).
+- Normal package removal is allowed. Run `sudo dpkg -r focus-reminder` or `sudo apt remove focus-reminder`; remove-time cleanup does not expose a shell command API.
 
 ## Optional OS / boot security policy
 
