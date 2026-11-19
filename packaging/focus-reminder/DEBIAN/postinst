@@ -4,7 +4,7 @@ fc-cache -f >/dev/null 2>&1 || true
 update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
 gtk-update-icon-cache -f -q /usr/share/icons/hicolor >/dev/null 2>&1 || true
 
-chmod +x /usr/local/bin/focus-boot-enforce.sh /usr/local/bin/focus-pam-lock.sh /usr/local/bin/focus-lockout-check /usr/local/bin/focus-app-enforcer 2>/dev/null || true
+chmod +x /usr/local/bin/focus-boot-enforce.sh /usr/local/bin/focus-pam-lock.sh /usr/local/bin/focus-lockout-check /usr/local/bin/focus-app-enforcer /usr/local/bin/focus-tty-auth-check.sh 2>/dev/null || true
 chmod +x /usr/local/bin/focus-session-start.sh 2>/dev/null || true
 chmod +x /usr/local/bin/focus-tray-start.sh 2>/dev/null || true
 systemctl restart focus-app-enforcer.service 2>/dev/null || true
@@ -36,6 +36,12 @@ if [ -f /etc/pam.d/common-session ] \
   printf '%s\n' "$PAM_LINE" >> /etc/pam.d/common-session
 fi
 
+# Block TTY / console login during active lockout
+if [ -f /etc/pam.d/login ] \
+   && ! grep -qF "focus-tty-auth-check.sh" /etc/pam.d/login; then
+  sed -i '\|^@include common-auth|i auth [success=ok default=bad] pam_exec.so quiet seteuid /usr/local/bin/focus-tty-auth-check.sh\naccount [success=ok default=bad] pam_exec.so quiet seteuid /usr/local/bin/focus-tty-auth-check.sh' /etc/pam.d/login 2>/dev/null || true
+fi
+
 # Remove the startup barrier that launched GTK before GNOME had a display.
 # The XDG session hook now imports the live display environment, then starts
 # both services after the graphical session is ready.
@@ -59,6 +65,6 @@ apt-mark hold focus-reminder >/dev/null 2>&1 || true
 chattr +i /opt/focus-reminder/focus-reminder.py 2>/dev/null || true
 chattr +i /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c-tray.service 2>/dev/null || true
 chattr +i /etc/systemd/system/focus-boot-enforce.service 2>/dev/null || true
-chattr +i /usr/local/bin/focus-boot-enforce.sh /usr/local/bin/focus-pam-lock.sh /usr/local/bin/focus-lockout-check /usr/local/bin/focus-app-enforcer 2>/dev/null || true
+chattr +i /usr/local/bin/focus-boot-enforce.sh /usr/local/bin/focus-pam-lock.sh /usr/local/bin/focus-lockout-check /usr/local/bin/focus-app-enforcer /usr/local/bin/focus-tty-auth-check.sh 2>/dev/null || true
 chattr +i /usr/share/applications/focus-reminder.desktop 2>/dev/null || true
 exit 0

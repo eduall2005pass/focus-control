@@ -13,8 +13,9 @@
 set -e
 cd "$(dirname "$0")"
 SRC_DIR="$(pwd)"
-APP_SRC="focus-reminder-ubuntu.py"
-[ -f "$APP_SRC" ] || { echo "ERROR: $APP_SRC not found. Run from repo root."; exit 1; }
+APP_SRC="focus-reminder.py"
+[ -f "$APP_SRC" ] || APP_SRC="focus-reminder-ubuntu.py"
+[ -f "$APP_SRC" ] || { echo "ERROR: focus-reminder.py not found. Run from repo root."; exit 1; }
 [ "$(id -u)" = "0" ] || { echo "ERROR: run with sudo: sudo bash install-systemwide.sh"; exit 1; }
 
 echo "[1/5] Installing app to /opt/focus-reminder/"
@@ -43,12 +44,22 @@ install -Dm755 "$SRC_DIR/packaging/focus-reminder/usr/local/bin/focus-boot-enfor
   /usr/local/bin/focus-boot-enforce.sh
 install -Dm755 "$SRC_DIR/packaging/focus-reminder/usr/local/bin/focus-pam-lock.sh" \
   /usr/local/bin/focus-pam-lock.sh
+install -Dm755 "$SRC_DIR/packaging/focus-reminder/usr/local/bin/focus-tty-auth-check.sh" \
+  /usr/local/bin/focus-tty-auth-check.sh
+install -Dm755 "$SRC_DIR/packaging/focus-reminder/usr/local/bin/focus-lockout-check" \
+  /usr/local/bin/focus-lockout-check
+install -Dm755 "$SRC_DIR/packaging/focus-reminder/usr/local/bin/focus-app-enforcer" \
+  /usr/local/bin/focus-app-enforcer
 install -Dm644 "$SRC_DIR/packaging/focus-reminder/etc/systemd/system/focus-boot-enforce.service" \
   /etc/systemd/system/focus-boot-enforce.service
 PAM_LINE="session optional pam_exec.so seteuid /usr/local/bin/focus-pam-lock.sh"
 if [ -f /etc/pam.d/common-session ] \
    && ! grep -qF "focus-pam-lock.sh" /etc/pam.d/common-session; then
   printf '%s\n' "$PAM_LINE" >> /etc/pam.d/common-session
+fi
+if [ -f /etc/pam.d/login ] \
+   && ! grep -qF "focus-tty-auth-check.sh" /etc/pam.d/login; then
+  sed -i '\|^@include common-auth|i auth [success=ok default=bad] pam_exec.so quiet seteuid /usr/local/bin/focus-tty-auth-check.sh\naccount [success=ok default=bad] pam_exec.so quiet seteuid /usr/local/bin/focus-tty-auth-check.sh' /etc/pam.d/login 2>/dev/null || true
 fi
 systemctl daemon-reload
 systemctl enable --now focus-boot-enforce.service
@@ -140,7 +151,7 @@ EOF
 # Keep the application immutable after a legitimate systemwide update.
 chattr +i /opt/focus-reminder/focus-reminder.py 2>/dev/null || true
 chattr +i /etc/systemd/system/focus-boot-enforce.service 2>/dev/null || true
-chattr +i /usr/local/bin/focus-boot-enforce.sh /usr/local/bin/focus-pam-lock.sh 2>/dev/null || true
+chattr +i /usr/local/bin/focus-boot-enforce.sh /usr/local/bin/focus-pam-lock.sh /usr/local/bin/focus-tty-auth-check.sh /usr/local/bin/focus-lockout-check /usr/local/bin/focus-app-enforcer 2>/dev/null || true
 
 echo "[6/6] Installing app-menu entry + verifying"
 cat > /usr/share/applications/focus-reminder.desktop <<'EOF'

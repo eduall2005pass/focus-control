@@ -378,6 +378,14 @@ PAM_LOCK_FLAG = os.path.join(LEDGER_DIR, "pam-lock-requested")
 SHELL_LOCKOUT_FLAG = os.path.join(LEDGER_DIR, "shell-lockout-active")
 GTK_LOCKOUT_READY = os.path.join(LEDGER_DIR, "gtk-lockout-ready")
 STUDY_ACTIVE_FLAG = os.path.join(LEDGER_DIR, "study-active.flag")
+# Written as soon as Study Mode starts loading and cleared when its window maps.
+# The Shell extension uses it to lock the desktop down during startup too, so
+# the desktop cannot be right-clicked before the fullscreen Study window exists.
+STUDY_STARTING_FLAG = os.path.join(LEDGER_DIR, "study-starting.flag")
+LOCKOUT_EXTENSION_UUID = "focus-lockout@medisparkbd"
+# True while Study Mode hands the screen to an external Edge app window; the
+# Study focus guard must not steal focus back until Edge is closed.
+EXTERNAL_BROWSER_ACTIVE = False
 WIFI_ACTIVE_FLAG = os.path.join(LEDGER_DIR, "wifi-active.flag")
 STUDY_SUSPEND_STATE = os.path.join(LEDGER_DIR, "study-suspended.state")
 STUDY_VIOLATIONS_STATE = os.path.join(LEDGER_DIR, "study-violations.json")
@@ -397,6 +405,23 @@ def _clear_study_active():
     try:
         if os.path.exists(STUDY_ACTIVE_FLAG):
             os.remove(STUDY_ACTIVE_FLAG)
+    except Exception:
+        pass
+
+
+def _touch_study_starting():
+    try:
+        os.makedirs(LEDGER_DIR, exist_ok=True)
+        with open(STUDY_STARTING_FLAG, "w") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+
+def _clear_study_starting():
+    try:
+        if os.path.exists(STUDY_STARTING_FLAG):
+            os.remove(STUDY_STARTING_FLAG)
     except Exception:
         pass
 
@@ -573,7 +598,7 @@ def _load_suspend_state():
 
 
 def _restore_suspend_checkpoint():
-    """Return the persisted deadline; boot recovery pauses its remaining time."""
+    """Return the persisted absolute deadline (powered-off time counts too)."""
     end = _load_suspend_state()
     if end <= 0:
         try:
@@ -1279,12 +1304,24 @@ def _gnome_lockdown():
             _run(["gsettings", "set", schema, key, locked_val], timeout=10)
         except Exception as e:
             print(f"lockdown set {schema} {key}: {e}", flush=True)
+    for dext in ("ubuntu-dock@ubuntu.com", "ding@rastersoft.com",
+                 "gtk4-ding@smedius.gitlab.com", "desktop-icons@csoriano",
+                 "desktop-icons-ng@rastersoft.com"):
+        try:
+            _run(["gnome-extensions", "disable", dext], timeout=5)
+        except Exception:
+            pass
     try:
-        _run(["gnome-extensions", "disable", "ubuntu-dock@ubuntu.com"], timeout=5)
+        _run(["pkill", "-9", "-f", "dingManager.js|adw-ding|gtk4-ding"], timeout=5)
     except Exception:
         pass
     try:
-        _run(["gnome-extensions", "disable", "ding@rastersoft.com"], timeout=5)
+        _run(["pkill", "-9", "-f", "gnome-control-center|gnome-tweaks"], timeout=5)
+    except Exception:
+        pass
+    try:
+        _run(["pkill", "-9", "-f", "agetty"], timeout=5)
+        _run(["pkill", "-9", "-x", "login"], timeout=5)
     except Exception:
         pass
     return saved
@@ -1296,14 +1333,12 @@ def _gnome_restore(saved):
             _run(["gsettings", "set", schema, key, raw], timeout=10)
         except Exception as e:
             print(f"lockdown restore {schema} {key}: {e}", flush=True)
-    try:
-        _run(["gnome-extensions", "enable", "ubuntu-dock@ubuntu.com"], timeout=5)
-    except Exception:
-        pass
-    try:
-        _run(["gnome-extensions", "enable", "ding@rastersoft.com"], timeout=5)
-    except Exception:
-        pass
+    for dext in ("ubuntu-dock@ubuntu.com", "ding@rastersoft.com",
+                 "gtk4-ding@smedius.gitlab.com"):
+        try:
+            _run(["gnome-extensions", "enable", dext], timeout=5)
+        except Exception:
+            pass
     try:
         p_backup = os.path.expanduser("~/.local/share/focus-reminder/panels-backup.json")
         if os.path.exists(p_backup):
@@ -1352,6 +1387,32 @@ def _gnome_heal():
         pass
 
 
+_last_extension_check = 0.0
+
+
+def _ensure_shell_extension_enabled(force=False):
+    """Re-enable the Shell lockout extension if it was switched off during a
+    lockout or Study Mode. Best-effort; throttled because it runs from the
+    1-second sweeps."""
+    global _last_extension_check
+    now = time.time()
+    if not force and now - _last_extension_check < 2.5:
+        return
+    _last_extension_check = now
+    try:
+        r = _run(["gsettings", "get", "org.gnome.shell", "enabled-extensions"],
+                 capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and LOCKOUT_EXTENSION_UUID in (r.stdout or ""):
+            return
+    except Exception:
+        pass
+    try:
+        _run(["gnome-extensions", "enable", LOCKOUT_EXTENSION_UUID], timeout=8)
+        print("self-heal: re-enabled Shell lockout extension", flush=True)
+    except Exception as e:
+        print(f"self-heal: could not enable Shell lockout extension: {e}", flush=True)
+
+
 # Binaries that must not run while the device is suspended (browsers, which can
 # open anything incl. AI agents; terminals/VT-launched shells; AI CLIs).
 # Matched by exact basename of argv[0] — never by substring, never self.
@@ -1371,6 +1432,12 @@ LOCKOUT_PROC_DENY = frozenset({
     "roocode", "continue", "goose", "goose-cli",
     "openhands", "crush", "amp", "devin", "cody", "tabby",
     "junie", "kiro", "antigravity",
+    "gnome-control-center", "gnome-settings", "gnome-tweaks", "dconf-editor",
+    "gnome-extensions-app", "gnome-shell-extension-prefs",
+    "extension-manager", "gnome-shell-extension-manager",
+    "systemsettings", "systemsettings5", "kdesystemsettings",
+    "xfce4-settings-manager", "software-properties-gtk", "update-manager",
+    "agetty", "login", "sulogin",
 })
 
 
@@ -1433,6 +1500,14 @@ def _lockout_proc_sweep(sigs=None):
     """SIGKILL denylisted processes, however disguised. Best-effort;
     skips self and unowned PIDs."""
     me = os.getpid()
+    # Study Mode opens NotebookLM/websites in Microsoft Edge app windows; those
+    # must survive the lockout sweep while the study window is open.
+    study_active = os.path.exists(STUDY_ACTIVE_FLAG)
+    if (study_active or os.path.exists(STUDY_STARTING_FLAG)
+            or _load_suspend_state() > time.time()):
+        # The desktop right-click menu can open Settings -> Extensions and
+        # disable the Shell overlay. Put it back if that happened.
+        _ensure_shell_extension_enabled()
     try:
         pids = [p for p in os.listdir("/proc") if p.isdigit()]
     except Exception:
@@ -1442,8 +1517,12 @@ def _lockout_proc_sweep(sigs=None):
             if int(pid) == me:
                 continue
             exe = os.readlink(f"/proc/{pid}/exe")
+            exe_name = os.path.basename(exe.split(" (deleted)")[0]).lower()
             if "ibus" in os.path.basename(exe) or "input-method" in exe:
                 continue  # never kill input methods (Avro/Bengali typing)
+            if study_active and exe_name in (
+                    "msedge", "microsoft-edge", "microsoft-edge-stable"):
+                continue
             st = os.stat(exe)
             if _exe_matches(exe, st, sigs or {"inos": set(), "hashes": {}}):
                 os.kill(int(pid), signal.SIGKILL)
@@ -1486,13 +1565,29 @@ def _arm_focus_guard(win, is_lockout=False):
         try:
             if not win.get_visible():
                 return
+            if EXTERNAL_BROWSER_ACTIVE:
+                return
             if is_lockout and _typing_win is not None:
                 return
+            active = win.is_active() or win.has_toplevel_focus()
+            if active:
+                # If a text field or an inline TreeView editor currently owns
+                # the cursor, leave it alone. Re-presenting the toplevel here
+                # is what was kicking the cursor out of Reading History edits.
+                focus = win.get_focus()
+                while focus is not None:
+                    if isinstance(focus, Gtk.Entry):
+                        return
+                    focus = focus.get_parent()
             gdkwin = win.get_window()
             if (gdkwin is not None
                     and not (gdkwin.get_state() & Gdk.WindowState.FULLSCREEN)):
                 win.fullscreen()
-            win.present()
+            # Never call present() while the window/to entry already has
+            # focus: doing that every 500 ms steals the cursor from Gtk.Entry
+            # widgets and inline TreeView cell editors (Reading History).
+            if not active:
+                win.present()
         except Exception:
             pass
 
@@ -1807,6 +1902,15 @@ def show_typing_test(parent=None):
         return False
 
     _tbuf.connect("insert-text", _typing_filter)
+    def _sync_good_text(buf):
+        try:
+            current = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+            if not _explicit_hit(current):
+                _good_text["v"] = current
+        except Exception:
+            pass
+
+    _tbuf.connect("changed", _sync_good_text)
     status_lbl = Gtk.Label(label="Type above. Save keeps a .txt copy.")
     status_lbl.get_style_context().add_class("typehead")
     status_lbl.set_halign(Gtk.Align.CENTER)
@@ -3222,8 +3326,10 @@ def _save_custom_blocked_keywords(keywords_list):
             os.chmod(CUSTOM_BLOCKED_KEYWORDS_FILE, 0o600)
         except OSError:
             pass
+        return True
     except Exception as e:
         print(f"Error saving custom blocked keywords: {e}", flush=True)
+        return False
 
 
 # Load saved custom keywords
@@ -3364,12 +3470,14 @@ def _add_blocked_keyword(raw):
     raw_lower = (raw or "").strip().lower()
     if not raw_lower:
         return False
-    if raw_lower not in [x.lower() for x in BLOCKED_INPUT_WORDS]:
-        BLOCKED_INPUT_WORDS.append(raw_lower)
     saved = _load_custom_blocked_keywords()
+    if raw_lower in [x.lower() for x in BLOCKED_INPUT_WORDS]:
+        return True
     if raw_lower not in [x.lower() for x in saved]:
         saved.append(raw_lower)
-        _save_custom_blocked_keywords(saved)
+        if not _save_custom_blocked_keywords(saved):
+            return False
+    BLOCKED_INPUT_WORDS.append(raw_lower)
     _rebuild_blocked_structures()
     return True
 
@@ -3630,6 +3738,18 @@ TELEGRAM_KIOSK_JS = r"""
     var href = (el.getAttribute('href') || '').toLowerCase();
     var peer = (el.getAttribute('data-peer-id') || '').toLowerCase();
     var text = (el.textContent || '').toLowerCase();
+    var hash = (location.hash || '').toLowerCase();
+
+    // Check if currently targeting Biprova
+    if (hash.indexOf('biprov') !== -1 || hash.indexOf('biprova') !== -1) {
+      return (text.indexOf('biprov') !== -1 ||
+              text.indexOf('biprova') !== -1 ||
+              href.indexOf('biprov') !== -1 ||
+              href.indexOf('biprova') !== -1 ||
+              peer.indexOf('biprov') !== -1);
+    }
+
+    // Default targeting PDF Materials
     return (href.indexOf('4415493319') !== -1 ||
             href.indexOf('pdf258upload') !== -1 ||
             peer.indexOf('4415493319') !== -1 ||
@@ -3695,7 +3815,10 @@ TELEGRAM_KIOSK_JS = r"""
       if (url.protocol === 'blob:') return;
       if (host === 'web.telegram.org') {
         var hash = url.hash.replace(/^#/, '').toLowerCase();
-        if (hash.indexOf('4415493319') !== -1 || hash.indexOf('pdf258upload') !== -1) return;
+        if (hash.indexOf('4415493319') !== -1 ||
+            hash.indexOf('pdf258upload') !== -1 ||
+            hash.indexOf('biprov') !== -1 ||
+            hash.indexOf('biprova') !== -1) return;
       }
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -3726,34 +3849,26 @@ _SCAN_SKIP = {
 }
 
 _STUDY_DEFAULTS = {
-    "version": 16,
+    "version": 17,
     "links": [
         {"title": "PDF Materials (Cloud)", "url": "tg-materials"},
+        {"title": "Biprova 20 (Cloud)", "url": "tg-biprova"},
+        {"title": "NotebookLM", "url": "https://notebooklm.google.com"},
         {"title": "Boimate", "url": "https://boimate.com"},
-        {"title": "Gemini Notebook", "url": "https://notebook.google.com"},
         {"title": "Medical Contents", "url": "https://medical-contents.abdursakib.workers.dev/0:/"},
         {"title": "MuslimBangla", "url": "https://muslimbangla.com"},
         {"title": "iHadis", "url": "https://ihadis.com/en"},
         {"title": "LiveMCQ", "url": "https://web.livemcq.com/"},
-        {"title": "Translate", "url": "https://translate.google.com"},
     ],
     "allow_hosts": [
         "boimate.com", "www.boimate.com", "*.boimate.com",
         "medical-contents.abdursakib.workers.dev",
-        "drive.google.com",
-        "docs.google.com", "sheets.google.com", "slides.google.com",
         "notebooklm.google.com", "notebook.google.com", "notebook.google",
         "*.notebook.google.com", "*.notebooklm.google.com", "*.notebook.google",
         "notebooklm-pa.googleapis.com",
         "content-push.googleapis.com", "csp.withgoogle.com",
-        "accounts.google.com", "accounts.youtube.com", "myaccount.google.com",
-        "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
-        "youtubei.googleapis.com", "i.ytimg.com", "*.googlevideo.com",
-        "translate.google.com", "translate.googleapis.com", "clients6.google.com",
-        "clients1.google.com", "clients2.google.com", "clients4.google.com",
-        "www.google.com", "google.com", "*.google.com", "*.google",
+        "accounts.google.com", "clients6.google.com",
         "apis.google.com", "content.googleapis.com",
-        "gemini.google.com", "generativelanguage.googleapis.com",
         "alkali-coba-pa.googleapis.com", "alkali-pa.googleapis.com",
         "alkalicoba-pa.googleapis.com",
         "www.gstatic.com", "ssl.gstatic.com", "fonts.gstatic.com", "gstatic.com",
@@ -3808,8 +3923,23 @@ def _study_config():
                     changed = True
                     continue
 
-                # User requirement: remove telegram group links from sidebar
-                if ("telegram" in host or host.endswith("t.me") or host == "t.me"
+                # Study Cloud Drives: PDF Materials and Biprova 20
+                if title_lower in ("pdf materials upload", "pdf materials (cloud)", "pdf materials cloud", "pdf materials") \
+                        or uri_lower in ("tg-materials", "pdf-materials"):
+                    item["title"] = "PDF Materials (Cloud)"
+                    item["url"] = "tg-materials"
+                    uri = "tg-materials"
+                    uri_lower = "tg-materials"
+
+                if "biprov" in title_lower or "biprova" in title_lower or uri_lower == "tg-biprova":
+                    item["title"] = "Biprova 20 (Cloud)"
+                    item["url"] = "tg-biprova"
+                    uri = "tg-biprova"
+                    uri_lower = "tg-biprova"
+
+                # User requirement: remove external telegram group links from sidebar
+                if uri_lower not in ("tg-materials", "tg-biprova") and (
+                        "telegram" in host or host.endswith("t.me") or host == "t.me"
                         or "web.telegram.org" in uri_lower
                         or "-1004415493319" in uri_lower
                         or "group" in title_lower
@@ -3817,16 +3947,24 @@ def _study_config():
                     changed = True
                     continue
 
-                if title_lower == "gemini notebook" and uri != "https://notebook.google.com":
-                    item["url"] = "https://notebook.google.com"
-                    changed = True
+                # NotebookLM stays reachable; it is the only Google service
+                # exposed in Study Mode.
+                if (title_lower in ("gemini notebook", "notebooklm")
+                        or host.endswith("notebook.google.com")
+                        or host == "notebook.google"
+                        or host.endswith("notebooklm.google.com")):
+                    if title != "NotebookLM":
+                        item["title"] = "NotebookLM"
+                        changed = True
+                    if uri != "https://notebooklm.google.com":
+                        item["url"] = "https://notebooklm.google.com"
+                        uri = "https://notebooklm.google.com"
+                        changed = True
 
-                # User requirement: single PDF Materials (Cloud) entry, deduplicated
-                if title_lower in ("pdf materials upload", "pdf materials (cloud)", "pdf materials cloud", "pdf materials") \
-                        or uri_lower in ("tg-materials", "pdf-materials"):
-                    item["title"] = "PDF Materials (Cloud)"
-                    item["url"] = "tg-materials"
-                    uri = "tg-materials"
+                # General Google services and full YouTube are off.
+                if _host_blocked(host) or _is_youtube_host(host):
+                    changed = True
+                    continue
 
                 norm_key = uri.lower()
                 if norm_key in seen_urls:
@@ -3835,18 +3973,24 @@ def _study_config():
                 seen_urls.add(norm_key)
                 kept_links.append(item)
 
-            # Ensure PDF Materials (Cloud) is placed cleanly at top, with no duplicates
+            # Ensure PDF Materials (Cloud) and Biprova 20 (Cloud) are placed cleanly at top, with no duplicates
             tg_item = None
+            biprov_item = None
             other_items = []
             for item in kept_links:
                 if item.get("url") == "tg-materials":
                     tg_item = item
+                elif item.get("url") == "tg-biprova":
+                    biprov_item = item
                 else:
                     other_items.append(item)
             if tg_item is None:
                 tg_item = {"title": "PDF Materials (Cloud)", "url": "tg-materials"}
                 changed = True
-            kept_links = [tg_item] + other_items
+            if biprov_item is None:
+                biprov_item = {"title": "Biprova 20 (Cloud)", "url": "tg-biprova"}
+                changed = True
+            kept_links = [tg_item, biprov_item] + other_items
 
             if len(kept_links) != len(cfg.get("links", [])):
                 cfg["links"] = kept_links
@@ -3860,7 +4004,8 @@ def _study_config():
                 and "whatsapp.net" not in str(host).lower()
                 and "trycloudflare.com" not in str(host).lower()
                 and "telegram" not in str(host).lower()
-                and "t.me" not in str(host).lower()]
+                and "t.me" not in str(host).lower()
+                and str(host).lower().strip() not in _STUDY_LEGACY_BLOCKED_PATTERNS]
             if cfg["allow_hosts"] != old_hosts:
                 changed = True
             for link in _STUDY_DEFAULTS["links"]:
@@ -4133,6 +4278,352 @@ def _host_allowed(host, patterns):
     return False
 
 
+# General Google services and the full YouTube interface are turned off in
+# Study Mode. NotebookLM (notebooklm.google.com) and the static/auth endpoints
+# it needs stay reachable; those are listed explicitly in the allowlist.
+_STUDY_BLOCKED_HOSTS = {
+    "google.com", "www.google.com", "docs.google.com", "drive.google.com",
+    "sheets.google.com", "slides.google.com", "gemini.google.com",
+    "translate.google.com", "translate.googleapis.com", "myaccount.google.com",
+    "accounts.youtube.com", "youtube.com", "www.youtube.com", "m.youtube.com",
+    "music.youtube.com", "youtu.be", "youtubei.googleapis.com", "i.ytimg.com",
+    "youtube-nocookie.com", "www.youtube-nocookie.com",
+    # Search engines and their common regional / lightweight front doors.
+    "bing.com", "www.bing.com", "cn.bing.com", "duckduckgo.com",
+    "www.duckduckgo.com", "html.duckduckgo.com", "search.yahoo.com",
+    "yahoo.com", "www.yahoo.com", "yandex.com", "www.yandex.com",
+    "yandex.ru", "search.brave.com", "ecosia.org", "www.ecosia.org",
+    "qwant.com", "www.qwant.com", "startpage.com", "www.startpage.com",
+    "search.naver.com", "search.daum.net", "baidu.com", "www.baidu.com",
+    "ask.com", "www.ask.com", "aol.com", "search.aol.com",
+    # Additional international and AI-assisted search providers.
+    "sogou.com", "www.sogou.com", "sogou.net", "seznam.cz", "www.seznam.cz",
+    "search.seznam.cz", "kagi.com", "www.kagi.com", "mojeek.com", "www.mojeek.com",
+    "swisscows.com", "www.swisscows.com", "metager.de", "www.metager.de",
+    "yep.com", "www.yep.com", "you.com", "www.you.com", "phind.com",
+    "www.phind.com", "perplexity.ai", "www.perplexity.ai", "komo.ai",
+    "www.komo.ai", "andisearch.com", "www.andisearch.com", "360.cn",
+    "www.360.cn", "so.com", "www.so.com", "search.nifty.com",
+    # Social networks, messaging feeds, forums and short-video platforms.
+    "facebook.com", "www.facebook.com", "m.facebook.com", "fb.com",
+    "instagram.com", "www.instagram.com", "threads.net", "www.threads.net",
+    "twitter.com", "www.twitter.com", "x.com", "www.x.com", "t.co",
+    "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "reddit.com",
+    "www.reddit.com", "old.reddit.com", "redd.it", "snapchat.com",
+    "www.snapchat.com", "pinterest.com", "www.pinterest.com", "pin.it",
+    "linkedin.com", "www.linkedin.com", "discord.com", "www.discord.com",
+    "discord.gg", "web.whatsapp.com", "whatsapp.com", "www.whatsapp.com",
+    "whatsapp.net", "web.telegram.org", "telegram.org", "t.me", "twitch.tv",
+    "www.twitch.tv", "tumblr.com", "www.tumblr.com", "mastodon.social",
+    "bsky.app", "www.bsky.app", "vk.com", "www.vk.com", "ok.ru",
+    "wechat.com", "weibo.com", "www.weibo.com", "quora.com", "www.quora.com",
+    "medium.com", "www.medium.com", "threads.com", "kooapp.com",
+    # Common adult-content domains. The study host allowlist remains the main
+    # safeguard; this list is an extra deny layer, not a complete classifier.
+    "pornhub.com", "www.pornhub.com", "xvideos.com", "www.xvideos.com",
+    "xnxx.com", "www.xnxx.com", "xhamster.com", "www.xhamster.com",
+    "redtube.com", "www.redtube.com", "youporn.com", "www.youporn.com",
+    "youjizz.com", "www.youjizz.com", "eporner.com", "www.eporner.com",
+    "spankbang.com", "www.spankbang.com", "tube8.com", "www.tube8.com",
+    "chaturbate.com", "www.chaturbate.com", "onlyfans.com", "www.onlyfans.com",
+    "xvideos2.com", "xhamsterlive.com", "brazzers.com", "www.brazzers.com",
+    "rule34.xxx", "nhentai.net", "www.nhentai.net",
+    "tipsnetbd.com", "www.tipsnetbd.com", "viralbd.com", "www.viralbd.com",
+    "sabitabhabi.com", "www.sabitabhabi.com",
+}
+_STUDY_BLOCKED_WILDCARDS = (
+    "*.youtube.com", "*.youtu.be", "*.googlevideo.com", "*.youtube-nocookie.com",
+    "*.bing.com", "*.duckduckgo.com", "*.yahoo.com", "*.yandex.com",
+    "*.yandex.ru", "*.ecosia.org", "*.qwant.com", "*.startpage.com",
+    "*.naver.com", "*.daum.net", "*.baidu.com", "*.brave.com",
+    "*.sogou.com", "*.sogou.net", "*.seznam.cz", "*.kagi.com",
+    "*.mojeek.com", "*.swisscows.com", "*.metager.de", "*.yep.com",
+    "*.you.com", "*.phind.com", "*.perplexity.ai", "*.komo.ai",
+    "*.andisearch.com", "*.360.cn", "*.so.com", "*.nifty.com",
+    "*.facebook.com", "*.instagram.com", "*.threads.net", "*.twitter.com",
+    "*.x.com", "*.tiktok.com", "*.reddit.com", "*.snapchat.com",
+    "*.pinterest.com", "*.linkedin.com", "*.discord.com", "*.whatsapp.com",
+    "*.whatsapp.net", "*.telegram.org", "*.t.me", "*.twitch.tv",
+    "*.tumblr.com", "*.mastodon.social", "*.bsky.app", "*.vk.com", "*.ok.ru",
+    "*.wechat.com", "*.weibo.com", "*.quora.com", "*.medium.com",
+    "*.kooapp.com", "*.pornhub.com", "*.xvideos.com", "*.xnxx.com",
+    "*.xhamster.com", "*.redtube.com", "*.youporn.com", "*.youjizz.com",
+    "*.eporner.com", "*.spankbang.com", "*.tube8.com", "*.chaturbate.com",
+    "*.onlyfans.com", "*.brazzers.com", "*.nhentai.net",
+    "*.tipsnetbd.com", "*.viralbd.com", "*.sabitabhabi.com",
+)
+# Exact config entries removed from existing user configs during migration.
+# ("*.google.com" is stripped here but not globally blocked, because
+# notebooklm.google.com must keep working.)
+_STUDY_LEGACY_BLOCKED_PATTERNS = (
+    set(_STUDY_BLOCKED_HOSTS) | set(_STUDY_BLOCKED_WILDCARDS)
+    | {"*.google.com", "*.google"})
+
+
+def _host_blocked(host):
+    host = (host or "").lower().split(":")[0]
+    if not host:
+        return False
+    if host in _STUDY_BLOCKED_HOSTS:
+        return True
+    # Google Search is also served from country-specific Google domains.
+    # Keep the explicitly needed NotebookLM and sign-in endpoints available.
+    google_service_exceptions = {
+        "notebooklm.google.com", "accounts.google.com", "clients6.google.com",
+        "apis.google.com",
+    }
+    if (host not in google_service_exceptions
+            and re.search(r"(?:^|\.)google\.[a-z]{2,}(?:\.[a-z]{2,})?$", host)):
+        return True
+    # A search host remains denied even if someone adds it to their allowlist.
+    if "search" in host.split(".") or "websearch" in host.split("."):
+        return True
+    # Catch obvious adult-category labels even when a specific host is not
+    # listed. Unknown hosts are still denied by the study allowlist.
+    if re.search(r"(?:^|[.-])(adult|porn|porno|xxx|sex|hentai|nsfw|nude)(?:[.-]|$)", host):
+        return True
+    for pattern in _STUDY_BLOCKED_WILDCARDS:
+        base = pattern[1:]  # .example.com
+        if host.endswith(base) and host != pattern[2:]:
+            return True
+    return False
+
+
+def _is_youtube_host(host):
+    host = (host or "").lower()
+    return (host == "youtu.be" or host.endswith(".youtu.be")
+            or host == "youtube.com" or host.endswith(".youtube.com")
+            or host == "youtube-nocookie.com"
+            or host.endswith(".youtube-nocookie.com"))
+
+
+def _youtube_video_id(uri):
+    """Extract a video id from a watch/short/live/embed/youtu.be URL."""
+    try:
+        raw = str(uri or "").strip()
+        if not raw:
+            return None
+        if "://" not in raw:
+            raw = "https://" + raw
+        parsed = urlparse(raw)
+        host = (parsed.hostname or "").lower()
+        if host in ("youtu.be", "www.youtu.be"):
+            vid = (parsed.path or "").strip("/").split("/")[0]
+        elif _is_youtube_host(host):
+            path = (parsed.path or "").strip("/")
+            if path == "watch":
+                vid = urllib.parse.parse_qs(parsed.query).get("v", [""])[0]
+            elif path.startswith("watch/"):
+                vid = path.split("/", 1)[1]
+            else:
+                vid = ""
+                for prefix in ("embed/", "shorts/", "live/", "v/"):
+                    if path.startswith(prefix):
+                        vid = path[len(prefix):].split("/")[0]
+                        break
+        else:
+            return None
+        vid = str(vid or "").strip()
+        return vid if re.fullmatch(r"[A-Za-z0-9_-]{6,}", vid) else None
+    except Exception:
+        return None
+
+
+def _edge_launch_url(uri):
+    """URL to load in Edge app mode."""
+    raw = str(uri or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        parsed = urlparse(raw)
+        if parsed.scheme not in ("http", "https"):
+            return None
+        return raw
+    except Exception:
+        return None
+
+
+EDGE_PROFILE_DIR = os.path.join(LEDGER_DIR, "study-edge-profile")
+# Only the embedded player (not the YouTube watch UI) is allowed in Edge.
+_EDGE_EXTRA_ALLOW_REGEXES = ()
+
+
+def _edge_allow_regexes():
+    patterns = list(_STUDY_DEFAULTS["allow_hosts"])
+    try:
+        cfg = _study_config()
+        patterns = cfg.get("allow_hosts") or patterns
+    except Exception:
+        pass
+    regexes = list(_EDGE_EXTRA_ALLOW_REGEXES)
+    seen = set(regexes)
+    for pattern in patterns:
+        pattern = str(pattern or "").strip().lower()
+        if not pattern or pattern in seen:
+            continue
+        seen.add(pattern)
+        if pattern.startswith("*."):
+            if _host_blocked(pattern[2:]):
+                continue
+            host = re.escape(pattern[2:])
+            regexes.append(rf"^https?://([^/]+\.)?{host}(:\d+)?(/|$)")
+        else:
+            if _host_blocked(pattern):
+                continue
+            host = re.escape(pattern)
+            regexes.append(rf"^https?://{host}(:\d+)?(/|$)")
+    return regexes
+
+
+def _ensure_edge_extension():
+    """Write a small Edge navigation guard: block every top-level page except
+    the study allowlist and the YouTube embed player."""
+    try:
+        ext_dir = os.path.join(EDGE_PROFILE_DIR, "focus-study-guard")
+        os.makedirs(ext_dir, exist_ok=True)
+        manifest = {
+            "manifest_version": 3,
+            "name": "Focus Study Guard",
+            "version": "1.1",
+            "description": "Blocks non-study pages and filters explicit input in Study Mode",
+            "permissions": ["declarativeNetRequest"],
+            "host_permissions": ["<all_urls>"],
+            "content_scripts": [{
+                "matches": ["http://*/*", "https://*/*"],
+                "js": ["focus-input-filter.js"],
+                "run_at": "document_start",
+                "all_frames": True,
+            }],
+            "declarative_net_request": {
+                "rule_resources": [{
+                    "id": "study_rules",
+                    "enabled": True,
+                    "path": "rules.json",
+                }]
+            },
+        }
+        rules = []
+        rule_id = 1
+        # Block search engines, social media, adult domains, full YouTube
+        for host in sorted(_STUDY_BLOCKED_HOSTS):
+            rules.append({
+                "id": rule_id,
+                "priority": 1,
+                "action": {"type": "block"},
+                "condition": {
+                    "urlFilter": f"||{host}^",
+                    "resourceTypes": ["main_frame", "sub_frame"],
+                },
+            })
+            rule_id += 1
+        for wildcard in sorted(_STUDY_BLOCKED_WILDCARDS):
+            base = wildcard.lstrip("*.")
+            rules.append({
+                "id": rule_id,
+                "priority": 1,
+                "action": {"type": "block"},
+                "condition": {
+                    "urlFilter": f"||{base}^",
+                    "resourceTypes": ["main_frame", "sub_frame"],
+                },
+            })
+            rule_id += 1
+        # Block adult label regexes
+        rules.append({
+            "id": rule_id,
+            "priority": 1,
+            "action": {"type": "block"},
+            "condition": {
+                "regexFilter": r"^https?://([^/]+\.)?(adult|porn|porno|xxx|sex|hentai|nsfw|nude)[.-]",
+                "resourceTypes": ["main_frame", "sub_frame"],
+            },
+        })
+        rule_id += 1
+        # Block regional Google search frontends
+        rules.append({
+            "id": rule_id,
+            "priority": 1,
+            "action": {"type": "block"},
+            "condition": {
+                "regexFilter": r"^https?://([^/]+\.)?google\.[a-z]{2,}(/|$)",
+                "resourceTypes": ["main_frame", "sub_frame"],
+            },
+        })
+        rule_id += 1
+        # Whitelist permitted exceptions: NotebookLM and Google sign-in
+        for exc in ("notebooklm.google.com", "notebook.google.com", "notebook.google",
+                    "accounts.google.com", "clients6.google.com", "apis.google.com"):
+            rules.append({
+                "id": rule_id,
+                "priority": 2,
+                "action": {"type": "allow"},
+                "condition": {
+                    "urlFilter": f"||{exc}^",
+                    "resourceTypes": ["main_frame", "sub_frame"],
+                },
+            })
+            rule_id += 1
+        for filename, payload in (("manifest.json", manifest),
+                                  ("rules.json", rules),
+                                  ("focus-input-filter.js", INPUT_FILTER_JS)):
+            path = os.path.join(ext_dir, filename)
+            text = payload if isinstance(payload, str) else json.dumps(payload, indent=2)
+            try:
+                with open(path) as f:
+                    if f.read() == text:
+                        continue
+            except OSError:
+                pass
+            with open(path, "w") as f:
+                f.write(text)
+        return ext_dir
+    except Exception as e:
+        print(f"edge extension setup error: {e}", flush=True)
+        return None
+
+
+def _find_edge():
+    for candidate in ("microsoft-edge", "microsoft-edge-stable", "msedge"):
+        path = shutil.which(candidate)
+        if path:
+            return path
+    for path in ("/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable",
+                 "/opt/microsoft/msedge/msedge"):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _open_in_edge(uri):
+    """Open an allowed page in a dedicated Edge app window (no address bar)."""
+    edge = _find_edge()
+    target = _edge_launch_url(uri)
+    if edge is None or not target:
+        return False
+    try:
+        os.makedirs(EDGE_PROFILE_DIR, exist_ok=True)
+        command = [edge, f"--app={target}",
+                   f"--user-data-dir={EDGE_PROFILE_DIR}",
+                   "--start-fullscreen", "--no-first-run",
+                   "--no-default-browser-check", "--disable-background-mode",
+                   "--disable-translate",
+                   "--disable-features=Translate,msEdgeSidebar"]
+        ext_dir = _ensure_edge_extension()
+        if ext_dir:
+            command.extend([f"--disable-extensions-except={ext_dir}",
+                            f"--load-extension={ext_dir}"])
+        subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        return True
+    except Exception as e:
+        print(f"edge launch error: {e}", flush=True)
+        return False
+
+
 # Only the PDF Materials Upload conversation is exposed in Telegram Web.
 TELEGRAM_WEB_HOST = "web.telegram.org"
 TELEGRAM_WEB_PATH = "/k"
@@ -4141,11 +4632,21 @@ TELEGRAM_GROUP_HASH = "-1004415493319"
 TELEGRAM_GROUP_URL = (
     f"https://{TELEGRAM_WEB_HOST}{TELEGRAM_WEB_PATH}/#{TELEGRAM_GROUP_HASH}")
 TELEGRAM_TARGET_PEER_PATH = os.path.join(LEDGER_DIR, "telegram-target-peer")
+TELEGRAM_BIPROVA_PEER_PATH = os.path.join(LEDGER_DIR, "telegram-biprova-peer")
 
 
 def _load_telegram_target_peer():
     try:
         with open(TELEGRAM_TARGET_PEER_PATH) as f:
+            peer = f.read().strip()
+        return peer if re.fullmatch(r"-?\d{5,}", peer) else ""
+    except Exception:
+        return ""
+
+
+def _load_telegram_biprova_peer():
+    try:
+        with open(TELEGRAM_BIPROVA_PEER_PATH) as f:
             peer = f.read().strip()
         return peer if re.fullmatch(r"-?\d{5,}", peer) else ""
     except Exception:
@@ -4206,25 +4707,37 @@ def _page_allowed(uri, patterns):
         if not uri:
             return False
         uri_lower = uri.strip().lower()
-        if uri_lower.startswith(("about:", "data:", "javascript:", "file:")):
+        if uri_lower == "about:blank":
             return True
-        if "tg-materials" in uri_lower or "telegram-materials" in uri_lower:
+        if uri_lower in ("tg-materials", "pdf-materials", "telegram-materials"):
             return True
         if uri_lower.startswith("blob:"):
             inner = uri[5:]
             inner_host = (urlparse(inner).hostname or "").lower()
             if inner_host:
                 return _host_allowed(inner_host, patterns)
-            return True
+            return False
         parsed = urlparse(uri)
+        if parsed.scheme not in ("http", "https"):
+            return False
         host = (parsed.hostname or "").lower()
+        if _host_blocked(host):
+            return False
         if host == TELEGRAM_WEB_HOST:
             peer = _load_telegram_target_peer()
+            biprova_peer = _load_telegram_biprova_peer()
             fragment = parsed.fragment.lower()
-            allowed_fragments = {TELEGRAM_GROUP_HASH.lower(), "-1004415493319", "4415493319", "pdf258upload"}
+            allowed_fragments = {
+                TELEGRAM_GROUP_HASH.lower(),
+                "-1004415493319", "4415493319", "pdf258upload",
+                "biprova", "biprov", "biprova20", "biprova_20"
+            }
             if peer:
                 allowed_fragments.add(peer.lower())
                 allowed_fragments.add(peer.replace("-100", "").lower())
+            if biprova_peer:
+                allowed_fragments.add(biprova_peer.lower())
+                allowed_fragments.add(biprova_peer.replace("-100", "").lower())
             return ((parsed.path or "/").rstrip("/").lower() in TELEGRAM_WEB_PATHS
                     and (fragment in allowed_fragments or not fragment)
                     and _host_allowed(host, patterns))
@@ -4463,12 +4976,16 @@ def show_study_window(parent=None, end_ts=None):
         print("WebKit2 unavailable — study view disabled", flush=True)
         return
 
+    # Lock the desktop down before the (sometimes slow) GTK/WebKit window is
+    # built. Otherwise the desktop is briefly visible and right-click ->
+    # Settings -> Extensions can disable the Shell lockout overlay.
+    _touch_study_starting()
+    _ensure_shell_extension_enabled(force=True)
+
     if end_ts is None:
         _saved = _load_suspend_state()
         if _saved > time.time():
             end_ts = _saved
-
-    _touch_study_active()
 
     cfg = _study_config()
     allow = cfg.get("allow_hosts") or _STUDY_DEFAULTS["allow_hosts"]
@@ -4520,7 +5037,13 @@ def show_study_window(parent=None, end_ts=None):
                    border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 5px;
                    padding: 2px 7px; min-height: 25px; }
     .sidebar { background: #101b2c; border-right: 1px solid rgba(148, 163, 184, 0.16);
-               padding: 5px 7px; min-width: 260px; }
+               padding: 5px 6px; min-width: 230px; }
+    .player-page { background: #000000; }
+    .player-header { background: #0d1527; border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+                     padding: 4px 10px; min-height: 32px; }
+    .player-title { font-family: Inter, sans-serif; font-size: 11.5px; font-weight: 700;
+                    letter-spacing: 0.5px; color: #93c5fd; }
+    .player-sub { font-family: Inter, sans-serif; font-size: 10.5px; color: #94a3b8; }
     .studyhead { font-family: Inter, sans-serif; font-size: 13px; color: #dbeafe;
                  letter-spacing: 1.5px; font-weight: bold; }
     .studytime { font-family: Inter, sans-serif; font-size: 12.5px; color: #9ca3af; }
@@ -4719,12 +5242,18 @@ def show_study_window(parent=None, end_ts=None):
     win.connect("delete-event", lambda *_: True)  # Alt+F4 blocked
 
     outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-    bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
     bar.get_style_context().add_class("studybar")
+
+    sidebar_toggle_btn = Gtk.Button(label="☰")
+    sidebar_toggle_btn.get_style_context().add_class("topbar-btn")
+    sidebar_toggle_btn.set_size_request(32, 26)
+    sidebar_toggle_btn.set_tooltip_text("Toggle Sidebar (Ctrl+B)")
+    bar.pack_start(sidebar_toggle_btn, False, False, 0)
 
     clock_lbl = Gtk.Label(label=time.strftime("🕒 %I:%M:%S %p"))
     clock_lbl.get_style_context().add_class("topbar-clock")
-    clock_lbl.set_size_request(130, 26)
+    clock_lbl.set_size_request(118, 26)
     clock_lbl.set_xalign(0.5)
     clock_lbl.set_yalign(0.5)
     clock_lbl.set_tooltip_text(time.strftime("%A, %d %B %Y"))
@@ -4732,7 +5261,7 @@ def show_study_window(parent=None, end_ts=None):
 
     time_lbl = Gtk.Label(label="")
     time_lbl.get_style_context().add_class("topbar-timer")
-    time_lbl.set_size_request(132, 26)
+    time_lbl.set_size_request(118, 26)
     time_lbl.set_xalign(0.5)
     time_lbl.set_yalign(0.5)
     bar.pack_start(time_lbl, False, False, 0)
@@ -4740,36 +5269,41 @@ def show_study_window(parent=None, end_ts=None):
     extend_btn = Gtk.Button(label="➕ Extend")
     extend_btn.get_style_context().add_class("topbar-btn")
     extend_btn.get_style_context().add_class("extend-btn")
-    extend_btn.set_size_request(84, 26)
+    extend_btn.set_size_request(74, 26)
     extend_btn.set_tooltip_text("Extend lockout duration (3 days / 7 days)")
     bar.pack_start(extend_btn, False, False, 0)
 
-    topbar_spacer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-    topbar_spacer.set_hexpand(True)
-    bar.pack_start(topbar_spacer, True, True, 0)
+    address_entry = Gtk.Entry()
+    address_entry.set_width_chars(16)
+    address_entry.set_hexpand(True)
+    address_entry.set_placeholder_text("🌐 Visit any website (opens in Edge) or YouTube link/ID…")
+    address_entry.set_tooltip_text(
+        "Enter any website to open in restricted Edge, or a YouTube video link to play natively. Search engines, social media and explicit keywords are blocked.")
+    address_entry.set_activates_default(True)
+    bar.pack_start(address_entry, True, True, 2)
 
     usb_import_btn = Gtk.Button(label="📂 Open")
     usb_import_btn.get_style_context().add_class("topbar-btn")
-    usb_import_btn.set_size_request(78, 26)
+    usb_import_btn.set_size_request(66, 26)
     usb_import_btn.set_tooltip_text(
-        "Open a PDF or image directly from storage, USB, or phone")
+        "Open a PDF, image, or video directly")
     bar.pack_start(usb_import_btn, False, False, 0)
 
-    add_kw_btn = Gtk.Button(label="➕ Add Keyword")
+    add_kw_btn = Gtk.Button(label="🛡️ +Word")
     add_kw_btn.get_style_context().add_class("topbar-btn")
-    add_kw_btn.set_size_request(106, 26)
+    add_kw_btn.set_size_request(76, 26)
     add_kw_btn.set_tooltip_text("Add blocked keyword")
     bar.pack_start(add_kw_btn, False, False, 0)
 
-    history_btn = Gtk.Button(label="📋 Read History")
+    history_btn = Gtk.Button(label="📋 History")
     history_btn.get_style_context().add_class("topbar-btn")
-    history_btn.set_size_request(114, 26)
-    history_btn.set_tooltip_text("Open reading history log (Excel-style table)")
+    history_btn.set_size_request(74, 26)
+    history_btn.set_tooltip_text("Open reading history log")
     bar.pack_start(history_btn, False, False, 0)
 
-    split_btn = Gtk.Button(label="◫ Split View")
+    split_btn = Gtk.Button(label="◫ Split")
     split_btn.get_style_context().add_class("topbar-btn")
-    split_btn.set_size_request(86, 26)
+    split_btn.set_size_request(60, 26)
     split_btn.set_tooltip_text("Show two study pages side by side")
     bar.pack_start(split_btn, False, False, 0)
 
@@ -4780,30 +5314,42 @@ def show_study_window(parent=None, end_ts=None):
 
     recent_btn = Gtk.Button(label="🕒 Recent ▾")
     recent_btn.get_style_context().add_class("topbar-btn")
-    recent_btn.set_size_request(82, 26)
+    recent_btn.set_size_request(78, 26)
     recent_btn.set_tooltip_text("Click to show recently visited sites and documents")
     bar.pack_start(recent_btn, False, False, 0)
 
     battery_lbl = Gtk.Label(label="🔋 —")
     battery_lbl.get_style_context().add_class("topbar-stat")
-    battery_lbl.set_size_request(78, 26)
+    battery_lbl.set_size_request(62, 26)
     battery_lbl.set_tooltip_text("Live battery charge")
     bar.pack_start(battery_lbl, False, False, 0)
 
     block_counter_btn = Gtk.Button(label="🛡️ 0/10")
     block_counter_btn.get_style_context().add_class("blockcountbtn")
     block_counter_btn.get_style_context().add_class("blockcount-clean")
-    block_counter_btn.set_size_request(76, 26)
+    block_counter_btn.set_size_request(66, 26)
     block_counter_btn.set_tooltip_text(
         "Keyword blocks in last 5 minutes: 0/10. Reaching 10 blocks suspends Study Mode for 30 minutes.")
     bar.pack_start(block_counter_btn, False, False, 0)
 
     right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
     side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
-    side.set_size_request(260, -1)
+    side.set_size_request(240, -1)
     side.set_hexpand(False)
     side.set_halign(Gtk.Align.START)
     side.get_style_context().add_class("sidebar")
+
+    def _toggle_sidebar(*_):
+        if side.get_visible():
+            side.hide()
+            sidebar_toggle_btn.set_label("☰")
+            sidebar_toggle_btn.set_tooltip_text("Show Sidebar (Ctrl+B)")
+        else:
+            side.show_all()
+            sidebar_toggle_btn.set_label("◧")
+            sidebar_toggle_btn.set_tooltip_text("Hide Sidebar (Ctrl+B)")
+
+    sidebar_toggle_btn.connect("clicked", _toggle_sidebar)
 
     # Study Mode brand header moved to top of sidebar
     brand_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
@@ -5115,9 +5661,8 @@ def show_study_window(parent=None, end_ts=None):
         stack.set_visible_child_name("home")
 
     def _return_to_group(*_):
-        _set_group_ui(True)
-        stack.set_visible_child_name("web")
-        web.load_uri(TELEGRAM_GROUP_URL)
+        _set_group_ui(False)
+        _launch_study_edge(TELEGRAM_GROUP_URL, title="PDF Materials")
 
     tg_back.connect("clicked", _leave_group_view)
     tg_reload.connect("clicked", _return_to_group)
@@ -5167,10 +5712,8 @@ def show_study_window(parent=None, end_ts=None):
         if host == TELEGRAM_WEB_HOST or host.endswith((".telegram.org", ".t.me")):
             _toast("Telegram is only available in the single-group view")
             return
-        if parsed.scheme not in ("http", "https") or not _page_allowed(uri, allow):
-            _toast(f"Blocked: {host or uri} — not in study list")
-            return
-        view.load_uri(uri)
+        # Websites open in Edge app mode; WebKit here is only for local PDFs.
+        _launch_study_edge(uri)
 
     def _build_split_pane(caption):
         pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -5293,13 +5836,12 @@ def show_study_window(parent=None, end_ts=None):
                     action = decision.get_navigation_action()
                     uri = action.get_request().get_uri() or ""
                     parsed = urlparse(uri)
-                    if parsed.scheme in ("about", "blob", "data"):
+                    if parsed.scheme in ("about", "blob", "data", "file"):
                         return False
-                    if parsed.scheme == "file":
-                        return False
-                    if (parsed.scheme in ("http", "https")
-                            and _page_allowed(uri, allow)):
-                        return False
+                    if parsed.scheme in ("http", "https"):
+                        decision.ignore()
+                        GLib.idle_add(_launch_study_edge, uri)
+                        return True
                     decision.ignore()
                     _toast(f"Blocked: {parsed.hostname or uri} — not in study list")
                     return True
@@ -6225,6 +6767,83 @@ def show_study_window(parent=None, end_ts=None):
     stack.add_named(reader, "reader")
     stack.add_named(split_panel, "split")
 
+    # ---------- Native Video Player Page ----------
+    player_state = {"active": False, "title": "", "vid": "", "minimized": False}
+    player_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    player_panel.get_style_context().add_class("player-page")
+
+    player_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    player_header.get_style_context().add_class("player-header")
+
+    player_icon_lbl = Gtk.Label(label="▶ NATIVE VIDEO PLAYER")
+    player_icon_lbl.get_style_context().add_class("player-title")
+    player_header.pack_start(player_icon_lbl, False, False, 0)
+
+    player_sub_lbl = Gtk.Label(label="")
+    player_sub_lbl.get_style_context().add_class("player-sub")
+    player_sub_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+    player_sub_lbl.set_max_width_chars(45)
+    player_header.pack_start(player_sub_lbl, False, False, 4)
+
+    player_theater_btn = Gtk.Button(label="⛶ Theater")
+    player_theater_btn.get_style_context().add_class("topbar-btn")
+    player_theater_btn.set_size_request(80, 24)
+    player_theater_btn.set_tooltip_text("Toggle sidebar for wide theater mode")
+    player_theater_btn.connect("clicked", lambda *_: _toggle_sidebar())
+    player_header.pack_end(player_theater_btn, False, False, 0)
+
+    player_close_btn = Gtk.Button(label="✕ Close")
+    player_close_btn.get_style_context().add_class("topbar-btn")
+    player_close_btn.set_size_request(68, 24)
+    player_close_btn.set_tooltip_text("Close video player and return")
+    player_header.pack_end(player_close_btn, False, False, 0)
+
+    player_panel.pack_start(player_header, False, False, 0)
+
+    try:
+        player_web = WebKit2.WebView()
+    except Exception:
+        player_web = WebKit2.WebView.new()
+    player_web.set_hexpand(True)
+    player_web.set_vexpand(True)
+    try:
+        pst = player_web.get_settings()
+        if hasattr(pst, "set_enable_media"):
+            pst.set_enable_media(True)
+        if hasattr(pst, "set_media_playback_requires_user_gesture"):
+            pst.set_media_playback_requires_user_gesture(False)
+        if hasattr(pst, "set_enable_developer_extras"):
+            pst.set_enable_developer_extras(False)
+        if hasattr(pst, "set_enable_write_console_messages_to_stdout"):
+            pst.set_enable_write_console_messages_to_stdout(False)
+    except Exception:
+        pass
+
+    def _on_player_decide_policy(_v, decision, decision_type):
+        try:
+            if decision_type == WebKit2.PolicyDecisionType.NAVIGATION_ACTION:
+                action = decision.get_navigation_action()
+                uri = (action.get_request().get_uri() or "").lower()
+                if (uri.startswith(("about:", "data:", "blob:", "file:"))
+                        or "youtube-nocookie.com" in uri
+                        or "googlevideo.com" in uri):
+                    return False
+                decision.ignore()
+                return True
+            if decision_type == WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION:
+                decision.ignore()
+                return True
+        except Exception:
+            pass
+        return False
+
+    player_web.connect("decide-policy", _on_player_decide_policy)
+    player_web.connect("permission-request", lambda _v, req: (req.allow(), True)[1])
+    player_web.connect("context-menu", lambda *_: True)
+    player_panel.pack_start(player_web, True, True, 0)
+
+    stack.add_named(player_panel, "player")
+
     # ---------- Read History Page (Excel / Spreadsheet style) ----------
     history_return_page = {"name": "home"}
     history_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -6913,8 +7532,10 @@ def show_study_window(parent=None, end_ts=None):
 
     def _open_media(path, force_fullscreen=False):
         ext = os.path.splitext(path)[1].lower()
-        if ext in (".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv",
-                   ".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac",
+        if ext in (".mp4", ".mkv", ".webm", ".avi", ".mov"):
+            _play_local_video_native(path)
+            return
+        if ext in (".flv", ".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac",
                    ".zip", ".rar", ".7z", ".tar", ".gz",
                    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods"):
             try:
@@ -7362,9 +7983,21 @@ def show_study_window(parent=None, end_ts=None):
                     minimized=bool(doc_state.get("minimized")))
                 dock_box.pack_start(row, False, False, 0)
                 count += 1
+            if player_state.get("active"):
+                p_title = player_state.get("title") or "Video Player"
+                row = _new_dock_row(
+                    "▶️",
+                    p_title,
+                    current == "player",
+                    on_open=_show_player,
+                    on_min=_minimize_player,
+                    on_close=_close_player,
+                    minimized=bool(player_state.get("minimized")))
+                dock_box.pack_start(row, False, False, 0)
+                count += 1
             if count == 0:
-                empty = Gtk.Label(label="Open a study link or a PDF/image.\n"
-                                        "Everything you open stays here.")
+                empty = Gtk.Label(label="Websites open in Edge; PDFs/images open\n"
+                                        "here in the reader.")
                 empty.get_style_context().add_class("dockempty")
                 empty.set_halign(Gtk.Align.START)
                 empty.set_line_wrap(True)
@@ -7477,14 +8110,19 @@ def show_study_window(parent=None, end_ts=None):
                         or mime == "application/pdf"):
                     if (_page_allowed(uri, allow)
                             or _page_allowed(view.get_uri() or "", allow)
-                            or uri.startswith(("blob:", "data:"))):
+                            or (uri.startswith("blob:") and _page_allowed(uri, allow))):
                         decision.download()
                         return True
             if dtype == WebKit2.PolicyDecisionType.NAVIGATION_ACTION:
                 uri = decision.get_navigation_action().get_request().get_uri() or ""
                 parsed = urlparse(uri)
-                if parsed.scheme in ("about", "blob", "data"):
+                if uri == "about:blank":
                     return False
+                if parsed.scheme == "blob" and _page_allowed(uri, allow):
+                    return False
+                if parsed.scheme not in ("http", "https", "file"):
+                    decision.ignore()
+                    return True
                 if parsed.scheme == "file":
                     local_path = os.path.realpath(
                         urllib.parse.unquote(parsed.path))
@@ -7497,7 +8135,9 @@ def show_study_window(parent=None, end_ts=None):
                         decision.ignore()
                         GLib.idle_add(_open_media, local_path)
                         return True
-                    return False
+                    decision.ignore()
+                    _toast("Blocked: local file access is limited to opened study materials")
+                    return True
                 if _page_allowed(uri, allow):
                     if uri.lower().split("?")[0].endswith(FILE_DL_EXTS):
                         decision.ignore()
@@ -7522,7 +8162,8 @@ def show_study_window(parent=None, end_ts=None):
                             pass
                         return True
                     if (_page_allowed(uri, allow)
-                            or uri.startswith(("about:", "blob:", "data:"))):
+                            or uri == "about:blank"
+                            or (uri.startswith("blob:") and _page_allowed(uri, allow))):
                         GLib.idle_add(_open_popup, uri)
                     else:
                         print(f"popup blocked: {uri}", flush=True)
@@ -7541,7 +8182,8 @@ def show_study_window(parent=None, end_ts=None):
                     parent_view.download_uri(uri)
                     return None
                 if (_page_allowed(uri, allow)
-                        or uri.startswith(("about:", "blob:", "data:"))):
+                        or uri == "about:blank"
+                        or (uri.startswith("blob:") and _page_allowed(uri, allow))):
                     GLib.idle_add(_open_popup, uri)
                 else:
                     print(f"popup blocked (create): {uri}", flush=True)
@@ -7643,6 +8285,229 @@ def show_study_window(parent=None, end_ts=None):
         except Exception as e:
             print(f"tab load event error: {e}", flush=True)
 
+    edge_watch = {"id": 0, "ticks": 0, "seen": False}
+
+    def _edge_profile_running():
+        try:
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{entry}/cmdline", "rb") as f:
+                        if b"study-edge-profile" in f.read():
+                            return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    def _pause_focus_for_edge():
+        global EXTERNAL_BROWSER_ACTIVE
+        EXTERNAL_BROWSER_ACTIVE = True
+        try:
+            win.unfullscreen()
+            win.set_keep_above(False)
+        except Exception:
+            pass
+
+    def _resume_focus_after_edge():
+        global EXTERNAL_BROWSER_ACTIVE
+        EXTERNAL_BROWSER_ACTIVE = False
+        try:
+            win.set_keep_above(True)
+            win.fullscreen()
+            win.present()
+        except Exception:
+            pass
+
+    def _watch_edge_close():
+        edge_watch["ticks"] += 1
+        if _edge_profile_running():
+            edge_watch["seen"] = True
+            return True
+        # Give a newly launched Edge a few seconds to appear before restoring.
+        if not edge_watch["seen"] and edge_watch["ticks"] < 5:
+            return True
+        edge_watch["id"] = 0
+        _resume_focus_after_edge()
+        return False
+
+    def _open_edge_and_watch(raw):
+        _pause_focus_for_edge()
+        if not _open_in_edge(raw):
+            _resume_focus_after_edge()
+            return False
+        if not edge_watch["id"]:
+            edge_watch["ticks"] = 0
+            edge_watch["seen"] = False
+            edge_watch["id"] = GLib.timeout_add(1000, _watch_edge_close)
+        return True
+
+    def _show_player():
+        player_state["minimized"] = False
+        stack.set_visible_child_name("player")
+        _render_dock()
+
+    def _minimize_player():
+        player_state["minimized"] = True
+        stack.set_visible_child_name("home")
+        _render_dock()
+
+    def _close_player(*_):
+        player_state["active"] = False
+        player_web.load_uri("about:blank")
+        _render_dock()
+        if doc_state.get("active"):
+            _show_doc()
+        else:
+            stack.set_visible_child_name("home")
+
+    player_close_btn.connect("clicked", _close_player)
+
+    def _play_youtube_native(vid, raw_url=None):
+        if not vid:
+            _toast("Enter a valid YouTube video link or ID")
+            return False
+        player_state["active"] = True
+        player_state["vid"] = vid
+        player_state["title"] = f"YouTube · {vid}"
+        player_state["minimized"] = False
+        player_sub_lbl.set_text(f"ID: {vid}")
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }}
+  iframe {{ border: 0; width: 100%; height: 100%; display: block; }}
+</style>
+</head>
+<body>
+  <iframe src="https://www.youtube-nocookie.com/embed/{vid}?autoplay=1&controls=1&modestbranding=1&rel=0&iv_load_policy=3&playsinline=1"
+    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+</body>
+</html>"""
+        player_web.load_html(html, "https://www.youtube-nocookie.com")
+        stack.set_visible_child_name("player")
+        _render_dock()
+        _record_recent("web", raw_url or f"https://www.youtube.com/watch?v={vid}", f"YouTube · {vid}")
+        _toast(f"▶ Playing video in Native Player: {vid}")
+        return True
+
+    def _play_local_video_native(path):
+        if not os.path.isfile(path):
+            _toast("Video file not found")
+            return
+        fname = os.path.basename(path)
+        player_state["active"] = True
+        player_state["vid"] = fname
+        player_state["title"] = fname
+        player_state["minimized"] = False
+        player_sub_lbl.set_text(fname)
+        file_uri = Gio.File.new_for_path(os.path.abspath(path)).get_uri()
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; display: flex; justify-content: center; align-items: center; }}
+  video {{ max-width: 100%; max-height: 100%; width: 100%; height: 100%; outline: none; }}
+</style>
+</head>
+<body>
+  <video src="{file_uri}" controls autoplay></video>
+</body>
+</html>"""
+        player_web.load_html(html, "file:///")
+        stack.set_visible_child_name("player")
+        _render_dock()
+        _record_recent_document(path, 1)
+        _toast(f"▶ Playing: {fname}")
+
+    def _launch_study_edge(url, title=""):
+        """Open a web target in restricted Edge app mode."""
+        raw = str(url or "").strip()
+        if not raw:
+            return False
+        if "://" not in raw:
+            raw = "https://" + raw
+        parsed = urlparse(raw)
+        host = (parsed.hostname or "").lower()
+        if _host_blocked(host):
+            _toast("Blocked: search engines, social media and adult sites are disabled")
+            return False
+        if host == TELEGRAM_WEB_HOST or host.endswith((".telegram.org", ".t.me")):
+            if not parsed.fragment or parsed.fragment.lower() in ("-1004415493319", "4415493319", "pdf258upload"):
+                raw = TELEGRAM_GROUP_URL
+            host = TELEGRAM_WEB_HOST
+        if _is_youtube_host(host):
+            vid = _youtube_video_id(raw)
+            if not vid:
+                _toast("Full YouTube is blocked — only a specific video link/ID works")
+                return False
+            # Specific YouTube video plays in the Native Video Player
+            return _play_youtube_native(vid, raw)
+
+        # In Study Mode, any website not in blocked categories opens in restricted Edge
+        if not _open_edge_and_watch(raw):
+            _toast("Microsoft Edge is not installed")
+            return False
+        _record_recent("web", raw, title or host or raw)
+        _toast(f"↗ Opened {host or 'page'} in Edge")
+        return True
+
+    def _open_address_entry(entry):
+        raw = (entry.get_text() or "").strip()
+        if not raw:
+            return
+        entry.set_text("")
+
+        # 1. Check explicit keyword filter
+        hit = _explicit_hit(raw)
+        if hit:
+            _record_input_violation()
+            if _study_block_count_updater:
+                _study_block_count_updater()
+            _toast(f"⛔ Blocked explicit keyword: {hit}")
+            return
+
+        # 2. Check if input is a YouTube video link or 11-char video ID
+        vid = _youtube_video_id(raw)
+        if not vid and re.fullmatch(r"[A-Za-z0-9_-]{11}", raw):
+            vid = raw
+
+        target_url = raw if "://" in raw else "https://" + raw
+        parsed = urlparse(target_url)
+        host = (parsed.hostname or "").lower()
+
+        if _is_youtube_host(host):
+            if vid:
+                _play_youtube_native(vid, raw)
+                return
+            else:
+                _toast("Blocked: Full YouTube browsing is disabled. Only specific video links work.")
+                return
+
+        if vid and ("youtube" in raw or "youtu.be" in raw):
+            _play_youtube_native(vid, raw)
+            return
+
+        # 3. Check website scheme
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            _toast("Enter a website address starting with http:// or https://")
+            return
+
+        # 4. Check blocked categories: search engines, social media, adult domains
+        if _host_blocked(host):
+            _toast("Blocked: Search engines, social media, and adult sites are disabled")
+            return
+
+        # 5. Open allowed website in restricted Edge (never WebKit)
+        _launch_study_edge(target_url)
+
+    address_entry.connect("activate", _open_address_entry)
+
     def _open_web_url(url, force_new=False, allow_special=False, title=""):
         raw = str(url or "").strip()
         if not raw:
@@ -7650,25 +8515,11 @@ def show_study_window(parent=None, end_ts=None):
         if raw.startswith(("about:", "blob:", "data:")):
             if not allow_special:
                 return None
+        elif raw.startswith("file:"):
+            pass
         else:
-            if "://" not in raw:
-                raw = "https://" + raw
-            parsed = urlparse(raw)
-            host = (parsed.hostname or "").lower()
-            if host == TELEGRAM_WEB_HOST or host.endswith((".telegram.org", ".t.me")):
-                main_tab = next((t for t in web_tabs if t.get("main")), None)
-                if main_tab is None:
-                    main_tab = _create_web_tab(TELEGRAM_GROUP_URL, main=True)
-                _show_tab(main_tab)
-                try:
-                    web.load_uri(TELEGRAM_GROUP_URL)
-                except Exception:
-                    pass
-                return main_tab
-            if not _page_allowed(raw, allow):
-                print(f"nav blocked: {raw}", flush=True)
-                _toast(f"Blocked: {host or raw} — not in study list")
-                return None
+            _launch_study_edge(raw, title=title)
+            return None
         if not force_new:
             for tab in web_tabs:
                 current = tab.get("url") or tab["view"].get_uri() or ""
@@ -7698,12 +8549,17 @@ def show_study_window(parent=None, end_ts=None):
                 or "telegram-materials" in url_clean
                 or (urlparse(url or "").hostname or "").lower() == TELEGRAM_WEB_HOST
                 or str(url).strip() == TELEGRAM_GROUP_URL):
-            _open_web_url(TELEGRAM_GROUP_URL)
+            _launch_study_edge(TELEGRAM_GROUP_URL, title="PDF Materials")
             return
-        if url.startswith("file://") or _page_allowed(url, allow):
+        if url_clean in ("tg-biprova", "biprova", "biprova 20", "biprov", "biprova (cloud)", "biprova 20 (cloud)"):
+            b_peer = _load_telegram_biprova_peer()
+            b_target = f"https://{TELEGRAM_WEB_HOST}{TELEGRAM_WEB_PATH}/#{b_peer}" if b_peer else f"https://{TELEGRAM_WEB_HOST}{TELEGRAM_WEB_PATH}/#biprova"
+            _launch_study_edge(b_target, title="Biprova 20")
+            return
+        if url.startswith("file://"):
             _open_web_url(url)
-        else:
-            _toast("Blocked: not in study list")
+            return
+        _launch_study_edge(url)
 
     def _make_side_btn(icon_text, tooltip, on_click):
         btn = Gtk.Button()
@@ -7745,6 +8601,12 @@ def show_study_window(parent=None, end_ts=None):
                 chooser.set_current_folder(STUDY_INBOX)
             except Exception:
                 pass
+        for mnt_cand in (os.path.expanduser("~/PDF-Materials"), os.path.expanduser("~/Telegram-Materials")):
+            if os.path.isdir(mnt_cand):
+                try:
+                    chooser.add_shortcut_folder(mnt_cand)
+                except Exception:
+                    pass
 
         all_filter = Gtk.FileFilter()
         all_filter.set_name("PDF and Images (*.pdf, *.png, *.jpg…)")
@@ -7811,19 +8673,28 @@ def show_study_window(parent=None, end_ts=None):
             return
         kw_entry.set_text("")
         if _is_keyword_blocked(raw):
-            kw_feedback_lbl.set_text("👍")
-            _toast("👍")
+            kw_feedback_lbl.set_text("Already blocked")
+            _toast("That keyword is already blocked")
         else:
-            _add_blocked_keyword(raw)
-            if web:
+            if not _add_blocked_keyword(raw):
+                kw_feedback_lbl.set_text("Save failed")
+                _toast("Could not save that blocked keyword")
+                GLib.idle_add(kw_entry.grab_focus)
+                return
+            # Refresh the unpacked Edge extension on disk. Edge applies a
+            # changed content script after its Study Mode process restarts.
+            _ensure_edge_extension()
+            js = f"if (window.__focusAddWord) window.__focusAddWord({json.dumps(raw.lower())});"
+            for tab in list(web_tabs):
                 try:
-                    web.run_javascript(
-                        f"if (window.__focusAddWord) window.__focusAddWord({json.dumps(raw.lower())});"
-                    )
+                    tab["view"].run_javascript(js, None, None, None)
                 except Exception:
-                    pass
+                    try:
+                        tab["view"].run_javascript(js)
+                    except Exception:
+                        pass
             kw_feedback_lbl.set_text("✔ Done")
-            _toast("✔ Done")
+            _toast("Keyword saved and filter updated")
         GLib.idle_add(kw_entry.grab_focus)
 
     def _toggle_kw_popover(*_):
@@ -7950,11 +8821,10 @@ def show_study_window(parent=None, end_ts=None):
             url = item.get("url", "")
             if (urlparse(url).hostname or "").lower() == TELEGRAM_WEB_HOST:
                 url = TELEGRAM_GROUP_URL
-            if url and _page_allowed(url, allow):
-                stack.set_visible_child_name("web")
-                web.load_uri(url)
+            if url:
+                _launch_study_edge(url, title=str(item.get("title") or ""))
             else:
-                _toast("This recent website is no longer allowed")
+                _toast("This recent website is no longer available")
         _hide_recent_panel()
 
     def _hide_recent_panel(*_):
@@ -8100,6 +8970,7 @@ def show_study_window(parent=None, end_ts=None):
 
     def _on_back_clicked(*_):
         _clear_study_active()
+        _clear_study_starting()
         t_end = time.time() + 0.15
         while time.time() < t_end:
             while Gtk.events_pending():
@@ -8121,7 +8992,13 @@ def show_study_window(parent=None, end_ts=None):
             mods = st & Gtk.accelerator_get_default_mod_mask()
             ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
             if kv == Gdk.KEY_Escape:
+                if stack.get_visible_child_name() == "player":
+                    _close_player()
+                    return True
                 _on_back_clicked()
+                return True
+            if (ctrl and kv in (Gdk.KEY_b, Gdk.KEY_B)) or kv == Gdk.KEY_F9:
+                _toggle_sidebar()
                 return True
             if ctrl and kv in (Gdk.KEY_l, Gdk.KEY_t, Gdk.KEY_n, Gdk.KEY_w,
                                Gdk.KEY_p, Gdk.KEY_j, Gdk.KEY_u):
@@ -8374,19 +9251,20 @@ def show_study_window(parent=None, end_ts=None):
     # start on the bismillah home page (no auto-load of a link)
     stack.set_visible_child_name("home")
 
-    _study_sweep = None
-    if end_ts or _load_suspend_state() > time.time():
-        _study_sigs = _lockout_exe_signatures()
-        _lockout_proc_sweep(_study_sigs)
-        _study_sweep = GLib.timeout_add_seconds(
-            1, lambda: (_lockout_proc_sweep(_study_sigs), True)[1])
+    _study_sigs = _lockout_exe_signatures()
+    _lockout_proc_sweep(_study_sigs)
+    _study_sweep = GLib.timeout_add_seconds(
+        1, lambda: (_lockout_proc_sweep(_study_sigs), True)[1])
 
     def _on_destroy(*_a):
         global _study_win, _study_parent
         global _study_auto_closing
         global _study_block_count_updater
+        global EXTERNAL_BROWSER_ACTIVE
         _study_block_count_updater = None
+        EXTERNAL_BROWSER_ACTIVE = False
         _clear_study_active()
+        _clear_study_starting()
         if _study_sweep:
             try:
                 GLib.source_remove(_study_sweep)
@@ -8398,7 +9276,8 @@ def show_study_window(parent=None, end_ts=None):
             except Exception:
                 pass
         for source_id in (guard_id, battery_timer,
-                          recent_hide_state.get("id", 0)):
+                          recent_hide_state.get("id", 0),
+                          edge_watch.get("id", 0)):
             try:
                 if source_id:
                     GLib.source_remove(source_id)
@@ -8419,13 +9298,19 @@ def show_study_window(parent=None, end_ts=None):
         Gtk.main_quit()
 
     win.connect("destroy", _on_destroy)
+    # Do not release the Shell lockout while the Study window is only being
+    # constructed. The Shell accepts this handoff only after the window maps.
+    def _on_study_mapped(*_a):
+        _touch_study_active()
+        _clear_study_starting()
+        return False
+    win.connect("map-event", _on_study_mapped)
     win.show_all()
     try:
         win.present_with_time(int(time.time()))
     except Exception:
         win.present()
     win.grab_focus()
-    _touch_study_active()
     while Gtk.events_pending():
         Gtk.main_iteration_do(False)
     Gtk.main()
@@ -8590,6 +9475,17 @@ if __name__ == "__main__":
                 _mins = max(1, min(24 * 60, int(sys.argv[_idx + 1])))
             except ValueError:
                 pass
+        # Only one CLI lockout loop may run at a time. A second launch must not
+        # create another countdown after the first one finishes.
+        try:
+            os.makedirs(LEDGER_DIR, exist_ok=True)
+            _lockout_lock_fp = open(
+                os.path.join(LEDGER_DIR, "lockout.lock"), "w")
+            fcntl.flock(_lockout_lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("Another lockout is already running; not starting a "
+                  "second countdown.", flush=True)
+            sys.exit(0)
         while not _has_display() or not _gtk_display_ready():
             print("Lockout waiting for display…", flush=True)
             time.sleep(0.5)
@@ -8600,11 +9496,17 @@ if __name__ == "__main__":
             time.sleep(0.5)
         show_now_once()
     elif "--study" in sys.argv:
-        _touch_study_active()
+        # Raise the Shell lockdown before waiting for the display/GTK startup,
+        # otherwise the desktop is interactive during that delay and can be
+        # right-clicked -> Settings -> Extensions to disable the lockout.
+        if not _is_study_suspended():
+            _touch_study_starting()
+            _ensure_shell_extension_enabled(force=True)
         while not _has_display() or not _gtk_display_ready():
             time.sleep(0.02)
         if _is_study_suspended():
             _clear_study_active()
+            _clear_study_starting()
             until = _get_study_suspended_until()
             rem_m = max(1, int(math.ceil((until - time.time()) / 60.0)))
             notify(f"Study Mode is temporarily suspended ({rem_m}m remaining).")
@@ -8613,6 +9515,7 @@ if __name__ == "__main__":
             show_study_window()
         finally:
             _clear_study_active()
+            _clear_study_starting()
         sys.exit(0)
     elif "--wifi" in sys.argv:
         _touch_wifi_active()

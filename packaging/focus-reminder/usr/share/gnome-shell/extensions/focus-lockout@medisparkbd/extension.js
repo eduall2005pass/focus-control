@@ -23,6 +23,9 @@ export default class FocusLockoutExtension extends Extension {
         this._studyActivePath = GLib.build_filenamev([
             GLib.get_home_dir(), STATE_DIR, 'study-active.flag',
         ]);
+        this._studyStartingPath = GLib.build_filenamev([
+            GLib.get_home_dir(), STATE_DIR, 'study-starting.flag',
+        ]);
         this._wifiActivePath = GLib.build_filenamev([
             GLib.get_home_dir(), STATE_DIR, 'wifi-active.flag',
         ]);
@@ -49,22 +52,69 @@ export default class FocusLockoutExtension extends Extension {
         this._monitorId = 0;
         this._studyBtn = null;
         this._wifiBtn = null;
+        this._stageEventId = 0;
         this._studyLaunching = false;
         this._lockdownActive = false;
         this._overviewBlocked = false;
         this._windowCreatedId = global.display.connect('window-created', (_display, metaWindow) => {
             try {
-                const title = metaWindow.get_title();
-                const wmClass = metaWindow.get_wm_class();
+                const title = metaWindow.get_title() || '';
+                const wmClass = metaWindow.get_wm_class() || '';
+                if (this._lockdownActive) {
+                    const titleLower = title.toLowerCase();
+                    const wmLower = wmClass.toLowerCase();
+                    if (wmLower.includes('gnome-control-center') ||
+                        wmLower.includes('systemsettings') ||
+                        wmLower.includes('gnome-tweaks') ||
+                        wmLower.includes('gnome-extensions') ||
+                        wmLower.includes('extension-manager') ||
+                        wmLower.includes('org.gnome.extensions') ||
+                        titleLower === 'settings' ||
+                        titleLower.startsWith('settings —') ||
+                        titleLower.startsWith('settings -') ||
+                        titleLower.includes('extensions')) {
+                        console.log(`[FocusLockout] Neutralizing desktop settings/extension window: ${title} (${wmClass})`);
+                        metaWindow.delete(global.get_current_time());
+                        this._sweepSettingsApps();
+                        return;
+                    }
+                }
                 if (title === 'Study' || wmClass === 'focus-reminder' || title === 'Open PDF / Image' || title === 'Wi-Fi Networks' || title === 'Extend Lockout Time') {
                     metaWindow.activate(global.get_current_time());
                 }
             } catch (_) {}
         });
+        this._stageEventId = global.stage.connect('captured-event', (_stage, event) => {
+            if (!this._lockdownActive)
+                return Clutter.EVENT_PROPAGATE;
+
+            const type = event.type();
+            if (type === Clutter.EventType.BUTTON_PRESS || type === Clutter.EventType.BUTTON_RELEASE) {
+                const btn = event.get_button();
+                if (btn === 3 || btn === 2) {
+                    // No shell or desktop context menu is allowed during an
+                    // active lockout, including the Study Mode handoff window.
+                    return Clutter.EVENT_STOP;
+                }
+            }
+
+            // Block Ctrl+Alt+F1 through Ctrl+Alt+F12 (TTY / Virtual Terminal switching bypass)
+            if (type === Clutter.EventType.KEY_PRESS || type === Clutter.EventType.KEY_RELEASE) {
+                const state = event.get_state();
+                const ctrlAlt = (Clutter.ModifierType.CONTROL_MASK | Clutter.ModifierType.MOD1_MASK);
+                if ((state & ctrlAlt) === ctrlAlt) {
+                    const symbol = event.get_key_symbol();
+                    if (symbol >= 0xffbe && symbol <= 0xffc9) {
+                        return Clutter.EVENT_STOP;
+                    }
+                }
+            }
+            return Clutter.EVENT_PROPAGATE;
+        });
         this._monitors = [];
         this._setupFileMonitors();
         this._pollId = GLib.timeout_add(
-            GLib.PRIORITY_DEFAULT, 100, () => {
+            GLib.PRIORITY_DEFAULT, 50, () => {
                 try {
                     this._syncLockout();
                 } catch (e) {
@@ -80,7 +130,8 @@ export default class FocusLockoutExtension extends Extension {
     }
 
     _setupFileMonitors() {
-        const paths = [this._statePath, this._studyActivePath, this._wifiActivePath, this._gtkReadyPath, this._studySuspendPath];
+        const paths = [this._statePath, this._studyActivePath, this._studyStartingPath,
+            this._wifiActivePath, this._gtkReadyPath, this._studySuspendPath];
         for (const p of paths) {
             try {
                 const file = Gio.File.new_for_path(p);
@@ -116,6 +167,10 @@ export default class FocusLockoutExtension extends Extension {
         if (this._windowCreatedId) {
             global.display.disconnect(this._windowCreatedId);
             this._windowCreatedId = 0;
+        }
+        if (this._stageEventId) {
+            try { global.stage.disconnect(this._stageEventId); } catch (_) {}
+            this._stageEventId = 0;
         }
         this._hideOverlay();
         this._setLockdownActive(false);
@@ -171,6 +226,35 @@ export default class FocusLockoutExtension extends Extension {
             }
         } catch (_) {}
         return 'ubuntu-dock@ubuntu.com';
+    }
+
+    _detectDesktopIconUuids() {
+        const candidates = [
+            'gtk4-ding@smedius.gitlab.com',
+            'ding@rastersoft.com',
+            'desktop-icons@csoriano',
+            'desktop-icons-ng@rastersoft.com',
+        ];
+        const result = new Set(candidates);
+        try {
+            const s = new Gio.Settings({schema_id: 'org.gnome.shell'});
+            const enabled = s.get_strv('enabled-extensions');
+            for (const uuid of enabled) {
+                if (/ding|desktop.*icon/i.test(uuid)) {
+                    result.add(uuid);
+                }
+            }
+        } catch (_) {}
+        if (Main.extensionManager && typeof Main.extensionManager.getUuids === 'function') {
+            try {
+                for (const uuid of Main.extensionManager.getUuids()) {
+                    if (/ding|desktop.*icon/i.test(uuid)) {
+                        result.add(uuid);
+                    }
+                }
+            } catch (_) {}
+        }
+        return Array.from(result);
     }
 
     _isExtensionEnabled(uuid) {
@@ -233,8 +317,24 @@ export default class FocusLockoutExtension extends Extension {
         return found;
     }
 
+    _sweepSettingsApps() {
+        // Settings / Extension Manager are the known lockout bypass. Kill them
+        // even if they were started after the lockdown began. Long binary names
+        // are truncated in /proc/PID/comm, so match the full argv[0] with -f.
+        for (const name of [
+            'gnome-control-center', 'gnome-settings', 'gnome-tweaks',
+            'dconf-editor', 'gnome-extensions-app',
+            'gnome-shell-extension-prefs', 'extension-manager',
+            'gnome-shell-extension-manager',
+        ]) {
+            GLib.spawn_command_line_async(
+                `pkill -9 -f '^([^ ]*/)?${name}( |$)'`);
+        }
+    }
+
     _setLockdownActive(active) {
         if (this._lockdownActive === active) return;
+        console.log(`[FocusLockout] lockdown active=${active}`);
         this._lockdownActive = active;
 
         if (active) {
@@ -252,6 +352,8 @@ export default class FocusLockoutExtension extends Extension {
                 const dockUuid = (this._env && this._env.dockUuid) || this._detectDockUuid();
                 const isDockEnabled = this._isExtensionEnabled(dockUuid);
                 const isDingEnabled = this._isExtensionEnabled('ding@rastersoft.com');
+                const allDesktopUuids = this._detectDesktopIconUuids();
+                const enabledDesktopUuids = allDesktopUuids.filter(u => this._isExtensionEnabled(u));
                 const act = Main.panel?.statusArea?.activities;
                 let mutterOverlayKey = 'Super_L';
                 let hotCornersEnabled = false;
@@ -269,6 +371,7 @@ export default class FocusLockoutExtension extends Extension {
                     dockUuid,
                     dockEnabled: isDockEnabled,
                     dingEnabled: isDingEnabled,
+                    desktopIconUuids: enabledDesktopUuids,
                     panelVisible: Main.panel ? Main.panel.visible : true,
                     panelReactive: Main.panel ? Main.panel.reactive : true,
                     panelOpacity: Main.panel ? Main.panel.opacity : 255,
@@ -350,16 +453,66 @@ export default class FocusLockoutExtension extends Extension {
             logError(e, 'FocusLockout Top Bar hide error');
         }
 
-        // 4. Completely hide and disable Ubuntu Dock & eliminate edge reveal
+        // 4. Completely hide and disable Ubuntu Dock, Desktop Icons & eliminate edge reveal
         try {
             const dockUuid = (this._env && this._env.dockUuid) || 'ubuntu-dock@ubuntu.com';
-            // Disable extension: removes dock actor, eliminates pressure barriers & auto-hide edge reveal
+            // Disable dock extension: removes dock actor, eliminates pressure barriers & auto-hide edge reveal
             if (Main.extensionManager && typeof Main.extensionManager.disableExtension === 'function') {
                 try { Main.extensionManager.disableExtension(dockUuid); } catch (_) {}
-                try { Main.extensionManager.disableExtension('ding@rastersoft.com'); } catch (_) {}
             }
             GLib.spawn_command_line_async(`gnome-extensions disable ${dockUuid}`);
-            GLib.spawn_command_line_async('gnome-extensions disable ding@rastersoft.com');
+
+            // Disable all desktop icon extensions (DING, GTK4-DING, etc.) so right-click desktop menu never exists
+            const allDesktopUuids = this._detectDesktopIconUuids();
+            for (const uuid of allDesktopUuids) {
+                if (Main.extensionManager && typeof Main.extensionManager.disableExtension === 'function') {
+                    try { Main.extensionManager.disableExtension(uuid); } catch (_) {}
+                }
+                GLib.spawn_command_line_async(`gnome-extensions disable ${uuid}`);
+            }
+            GLib.spawn_command_line_async('pkill -9 -f "dingManager.js|adw-ding|gtk4-ding"');
+
+            // Immediately neutralize any settings / control-center processes and open windows
+            this._sweepSettingsApps();
+            this._lastSettingsSweep = Date.now();
+            try {
+                const wins = global.display.get_tab_list(Meta.TabList.NORMAL_ALL, null);
+                for (const win of wins) {
+                    if (!win) continue;
+                    const wm = ((win.get_wm_class && win.get_wm_class()) || '').toLowerCase();
+                    const t = ((win.get_title && win.get_title()) || '').toLowerCase();
+                    if (wm.includes('gnome-control-center') ||
+                        wm.includes('gnome-tweaks') ||
+                        wm.includes('gnome-extensions') ||
+                        wm.includes('extension-manager') ||
+                        wm.includes('org.gnome.extensions') ||
+                        t === 'settings' || t.startsWith('settings -') ||
+                        t.includes('extensions')) {
+                        win.delete(global.get_current_time());
+                    }
+                }
+            } catch (_) {}
+
+            // Disable reactivity on desktop background actors so right-clicks cannot trigger anything
+            try {
+                if (Main.layoutManager) {
+                    if (Main.layoutManager._backgroundGroup) {
+                        Main.layoutManager._backgroundGroup.reactive = false;
+                    }
+                    if (Main.layoutManager._bgManagers) {
+                        for (const bgMgr of Main.layoutManager._bgManagers) {
+                            if (bgMgr && bgMgr.backgroundActor) {
+                                bgMgr.backgroundActor.reactive = false;
+                                if (bgMgr.backgroundActor._backgroundMenu) {
+                                    try { bgMgr.backgroundActor._backgroundMenu.close(); } catch (_) {}
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (bgErr) {
+                logError(bgErr, 'FocusLockout background neutralize error');
+            }
 
             // Also hide any Clutter dock actors on stage immediately
             const docks = this._findDockActors(global.stage);
@@ -484,7 +637,9 @@ export default class FocusLockoutExtension extends Extension {
         try {
             const dockUuid = (backup && backup.dockUuid) || (this._env && this._env.dockUuid) || 'ubuntu-dock@ubuntu.com';
             const shouldEnableDock = backup ? backup.dockEnabled : true;
-            const shouldEnableDing = backup ? backup.dingEnabled : true;
+            const desktopUuidsToEnable = (backup && backup.desktopIconUuids)
+                ? backup.desktopIconUuids
+                : (backup && backup.dingEnabled ? ['ding@rastersoft.com'] : []);
 
             if (shouldEnableDock) {
                 if (Main.extensionManager && typeof Main.extensionManager.enableExtension === 'function') {
@@ -493,12 +648,28 @@ export default class FocusLockoutExtension extends Extension {
                 GLib.spawn_command_line_async(`gnome-extensions enable ${dockUuid}`);
             }
 
-            if (shouldEnableDing) {
+            for (const uuid of desktopUuidsToEnable) {
                 if (Main.extensionManager && typeof Main.extensionManager.enableExtension === 'function') {
-                    try { Main.extensionManager.enableExtension('ding@rastersoft.com'); } catch (_) {}
+                    try { Main.extensionManager.enableExtension(uuid); } catch (_) {}
                 }
-                GLib.spawn_command_line_async('gnome-extensions enable ding@rastersoft.com');
+                GLib.spawn_command_line_async(`gnome-extensions enable ${uuid}`);
             }
+
+            // Restore desktop background reactivity
+            try {
+                if (Main.layoutManager) {
+                    if (Main.layoutManager._backgroundGroup) {
+                        Main.layoutManager._backgroundGroup.reactive = true;
+                    }
+                    if (Main.layoutManager._bgManagers) {
+                        for (const bgMgr of Main.layoutManager._bgManagers) {
+                            if (bgMgr && bgMgr.backgroundActor) {
+                                bgMgr.backgroundActor.reactive = true;
+                            }
+                        }
+                    }
+                }
+            } catch (_) {}
 
             // Also restore stage actors if any exist
             const docks = this._findDockActors(global.stage);
@@ -533,6 +704,13 @@ export default class FocusLockoutExtension extends Extension {
             if (backup && backup.hotCornersEnabled !== undefined) {
                 const is = new Gio.Settings({schema_id: 'org.gnome.desktop.interface'});
                 is.set_boolean('enable-hot-corners', backup.hotCornersEnabled);
+            } else {
+                // No backup (crash / stale file): fall back to the schema
+                // defaults instead of leaving hot corners disabled.
+                try {
+                    const is = new Gio.Settings({schema_id: 'org.gnome.desktop.interface'});
+                    is.reset('enable-hot-corners');
+                } catch (_) {}
             }
             if (Main.layoutManager && typeof Main.layoutManager._updateHotCorners === 'function') {
                 Main.layoutManager._updateHotCorners();
@@ -540,6 +718,12 @@ export default class FocusLockoutExtension extends Extension {
             if (backup && backup.mutterOverlayKey !== undefined) {
                 const ms = new Gio.Settings({schema_id: 'org.gnome.mutter'});
                 ms.set_string('overlay-key', backup.mutterOverlayKey);
+            } else {
+                // Never leave the Super key disabled if the backup is missing.
+                try {
+                    const ms = new Gio.Settings({schema_id: 'org.gnome.mutter'});
+                    ms.reset('overlay-key');
+                } catch (_) {}
             }
         } catch (_) {}
 
@@ -584,6 +768,19 @@ export default class FocusLockoutExtension extends Extension {
         }
     }
 
+    _isStudyStarting() {
+        try {
+            const [ok, bytes] = GLib.file_get_contents(this._studyStartingPath);
+            if (!ok)
+                return false;
+            const ts = Number(new TextDecoder().decode(bytes).trim());
+            const age = Date.now() / 1000 - ts;
+            return Number.isFinite(ts) && age >= 0 && age < 30;
+        } catch (_) {
+            return false;
+        }
+    }
+
     _getStudySuspendedUntil() {
         try {
             const [ok, bytes] = GLib.file_get_contents(this._studySuspendPath);
@@ -599,96 +796,119 @@ export default class FocusLockoutExtension extends Extension {
     _syncLockout() {
         const end = this._readDeadline();
         const now = Date.now() / 1000;
-        if (end > now) {
-            this._end = end;
-            this._writeFlag();
+        const lockoutActive = end > now;
+        const isStudySuspended = this._getStudySuspendedUntil() > now;
+        // study-active means the Study window has mapped; study-starting means
+        // it is still loading. Both must lock the desktop down, but only the
+        // mapped window is allowed to hide the lockout overlay.
+        const studyMapped = this._isStudyActive() && !isStudySuspended;
+        const studyStarting = this._isStudyStarting() && !isStudySuspended;
+        const studyBusy = studyMapped || studyStarting;
+
+        if (lockoutActive || studyBusy)
             this._setLockdownActive(true);
+        else
+            this._setLockdownActive(false);
 
-            // Ensure overlay root is created and covering screen
-            if (!this._root) {
-                this._showOverlay();
+        if (lockoutActive || studyBusy) {
+            const sweepNow = Date.now();
+            if (sweepNow - (this._lastSettingsSweep || 0) >= 2000) {
+                this._lastSettingsSweep = sweepNow;
+                this._sweepSettingsApps();
             }
+        }
 
-            // Dynamically update the countdown timer every second
-            if (this._timerLabel) {
-                this._timerLabel.set_text(this._formatRemaining(end));
-            }
-            if (this._unlockLabel) {
-                this._unlockLabel.set_text(
-                    `Unlocks at ${new Date(end * 1000).toLocaleString()}`);
-            }
-
-            const isStudySuspended = this._getStudySuspendedUntil() > now;
-            const studyActive = this._isStudyActive() && !isStudySuspended;
-
-            if (studyActive) {
-                // Study Mode is open on screen!
-                // 1. Release modal grab so user can interact with Study Mode:
-                if (this._grab) {
-                    try {
-                        Main.popModal(this._grab);
-                    } catch (_) {}
-                    this._grab = null;
-                }
-                // 2. Hide overlay root so Study Mode is fully visible in fullscreen:
-                if (this._root) {
-                    this._root.hide();
-                }
-                return;
-            }
-
-            // Study Mode is NOT active (or just closed):
-            // 1. Make this._root visible and move it to the very TOP of uiGroup:
-            if (this._root) {
-                this._root.show();
-                try {
-                    Main.layoutManager.uiGroup.set_child_above_sibling(this._root, null);
-                } catch (_) {}
-            }
-            // 2. Re-acquire modal grab to block all desktop interaction:
-            if (this._root && !this._grab) {
-                try {
-                    this._grab = Main.pushModal(this._root);
-                } catch (e) {
-                    logError(e, 'FocusLockout grab error');
-                }
-                global.stage.set_key_focus(this._root);
-            }
-
-            // 3. Reset Study button state if it was in 'Opening...' state
-            if (this._studyBtn && this._studyLaunching) {
-                this._studyLaunching = false;
-                this._studyBtn.reactive = true;
-                this._studyBtn.set_label('📚  Study Mode');
-            }
-
-            // Update Study button state based on 30m suspension
-            if (this._studyBtn) {
-                const suspendedUntil = this._getStudySuspendedUntil();
-                if (suspendedUntil > now) {
-                    const minsLeft = Math.ceil((suspendedUntil - now) / 60);
-                    this._studyBtn.reactive = false;
-                    this._studyBtn.can_focus = false;
-                    this._studyBtn.track_hover = false;
-                    this._studyBtn.set_label(`📚 Study Suspended (${minsLeft}m)`);
-                    this._studyBtn.style = 'background-color: #334155; color: #94a3b8; padding: 12px 32px; border-radius: 8px; font-weight: bold; font-size: 18px; border: 1px solid #475569; opacity: 0.6;';
-                } else if (!this._studyLaunching) {
-                    this._studyBtn.reactive = true;
-                    this._studyBtn.can_focus = true;
-                    this._studyBtn.track_hover = true;
-                    this._studyBtn.set_label('📚  Study Mode');
-                    this._studyBtn.style = 'background-color: #2563eb; color: #ffffff; padding: 12px 32px; border-radius: 8px; font-weight: bold; font-size: 18px;';
-                }
-            }
-        } else {
+        if (!lockoutActive) {
+            // No countdown: make sure no stale overlay stays on screen.
             if (this._root) {
                 this._hideOverlay();
             } else {
                 this._removeFlag();
             }
-            try { GLib.unlink(this._studyActivePath); } catch (_) {}
-            try { GLib.unlink(this._wifiActivePath); } catch (_) {}
-            this._setLockdownActive(false);
+            if (!studyBusy) {
+                try { GLib.unlink(this._studyActivePath); } catch (_) {}
+                try { GLib.unlink(this._studyStartingPath); } catch (_) {}
+                try { GLib.unlink(this._wifiActivePath); } catch (_) {}
+            }
+            return;
+        }
+
+        this._end = end;
+        this._writeFlag();
+
+        // Ensure overlay root is created and covering screen
+        if (!this._root) {
+            this._showOverlay();
+        }
+
+        // Dynamically update the countdown timer every second
+        if (this._timerLabel) {
+            this._timerLabel.set_text(this._formatRemaining(end));
+        }
+        if (this._unlockLabel) {
+            this._unlockLabel.set_text(
+                `Unlocks at ${new Date(end * 1000).toLocaleString()}`);
+        }
+
+        if (studyMapped) {
+            // Study Mode is open on screen. Release the modal grab and hide
+            // the overlay so the Study window is usable. The desktop remains
+            // locked down (right-click/settings/extension-manager blocked).
+            if (this._grab) {
+                try {
+                    Main.popModal(this._grab);
+                } catch (_) {}
+                this._grab = null;
+            }
+            if (this._root) {
+                this._root.hide();
+            }
+            return;
+        }
+
+        // Study Mode is NOT active (or is still starting). Keep the overlay up
+        // until the Study window actually maps, so the desktop is never shown.
+        // 1. Make this._root visible and move it to the very TOP of uiGroup:
+        if (this._root) {
+            this._root.show();
+            try {
+                Main.layoutManager.uiGroup.set_child_above_sibling(this._root, null);
+            } catch (_) {}
+        }
+        // 2. Re-acquire modal grab to block all desktop interaction:
+        if (this._root && !this._grab) {
+            try {
+                this._grab = Main.pushModal(this._root);
+            } catch (e) {
+                logError(e, 'FocusLockout grab error');
+            }
+            global.stage.set_key_focus(this._root);
+        }
+
+        // 3. Reset Study button state if it was in 'Opening...' state
+        if (this._studyBtn && this._studyLaunching) {
+            this._studyLaunching = false;
+            this._studyBtn.reactive = true;
+            this._studyBtn.set_label('📚  Study Mode');
+        }
+
+        // Update Study button state based on 30m suspension
+        if (this._studyBtn) {
+            const suspendedUntil = this._getStudySuspendedUntil();
+            if (suspendedUntil > now) {
+                const minsLeft = Math.ceil((suspendedUntil - now) / 60);
+                this._studyBtn.reactive = false;
+                this._studyBtn.can_focus = false;
+                this._studyBtn.track_hover = false;
+                this._studyBtn.set_label(`📚 Study Suspended (${minsLeft}m)`);
+                this._studyBtn.style = 'background-color: #334155; color: #94a3b8; padding: 12px 32px; border-radius: 8px; font-weight: bold; font-size: 18px; border: 1px solid #475569; opacity: 0.6;';
+            } else if (!this._studyLaunching) {
+                this._studyBtn.reactive = true;
+                this._studyBtn.can_focus = true;
+                this._studyBtn.track_hover = true;
+                this._studyBtn.set_label('📚  Study Mode');
+                this._studyBtn.style = 'background-color: #2563eb; color: #ffffff; padding: 12px 32px; border-radius: 8px; font-weight: bold; font-size: 18px;';
+            }
         }
     }
 
@@ -721,6 +941,22 @@ export default class FocusLockoutExtension extends Extension {
             width,
             height,
             style: 'background-color: rgba(5, 13, 29, 0.99); padding: 48px;',
+        });
+
+        // Block right-click and middle-click context menus on lockout screen
+        this._root.connect('button-press-event', (_actor, event) => {
+            const btn = event.get_button();
+            if (btn === 3 || btn === 2) {
+                return Clutter.EVENT_STOP;
+            }
+            return Clutter.EVENT_PROPAGATE;
+        });
+        this._root.connect('button-release-event', (_actor, event) => {
+            const btn = event.get_button();
+            if (btn === 3 || btn === 2) {
+                return Clutter.EVENT_STOP;
+            }
+            return Clutter.EVENT_PROPAGATE;
         });
 
         // Block all keyboard bypass, but allow typing in wifi password entry
@@ -824,7 +1060,8 @@ export default class FocusLockoutExtension extends Extension {
             });
             try {
                 const script = this._getScriptPath();
-                GLib.spawn_command_line_async(`python3 ${script} --study`);
+                GLib.spawn_command_line_async(
+                    `python3 ${GLib.shell_quote(script)} --study`);
             } catch (err) {
                 logError(err, 'Could not spawn study mode');
                 this._studyLaunching = false;
@@ -1192,20 +1429,33 @@ export default class FocusLockoutExtension extends Extension {
     }
 
     _getScriptPath() {
-        const optPath = '/opt/focus-reminder/focus-reminder.py';
-        const localPath = '/home/prof21/MediSparkBD/focus-control/focus-reminder-ubuntu.py';
-        try {
-            if (GLib.file_test(localPath, GLib.FileTest.EXISTS)) {
-                const fOpt = Gio.File.new_for_path(optPath);
-                const fLoc = Gio.File.new_for_path(localPath);
-                const infoOpt = fOpt.query_info('time::modified', Gio.FileQueryInfoFlags.NONE, null);
-                const infoLoc = fLoc.query_info('time::modified', Gio.FileQueryInfoFlags.NONE, null);
-                if (infoLoc.get_modification_date_time().compare(infoOpt.get_modification_date_time()) > 0) {
-                    return localPath;
+        // Prefer whichever real script exists: installed package first, then
+        // the development checkout(s). Never return a non-existent path.
+        const home = GLib.get_home_dir();
+        const candidates = [
+            '/opt/focus-reminder/focus-reminder.py',
+            GLib.build_filenamev([home, 'projects', 'focus-control', 'focus-reminder.py']),
+            GLib.build_filenamev([home, 'MediSparkBD', 'focus-control', 'focus-reminder.py']),
+            GLib.build_filenamev([home, 'MediSparkBD', 'focus-control', 'focus-reminder-ubuntu.py']),
+            GLib.build_filenamev([home, 'focus-control', 'focus-reminder.py']),
+        ];
+        let best = null;
+        let bestTime = -1;
+        for (const path of candidates) {
+            try {
+                if (!GLib.file_test(path, GLib.FileTest.EXISTS))
+                    continue;
+                const info = Gio.File.new_for_path(path).query_info(
+                    'time::modified', Gio.FileQueryInfoFlags.NONE, null);
+                const stamp = info.get_modification_date_time();
+                const t = stamp ? stamp.to_unix() : 0;
+                if (t > bestTime) {
+                    best = path;
+                    bestTime = t;
                 }
-            }
-        } catch (_) {}
-        return optPath;
+            } catch (_) {}
+        }
+        return best || candidates[0];
     }
 
     _connectWifi(ssid, password) {

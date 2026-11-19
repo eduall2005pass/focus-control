@@ -116,29 +116,74 @@ for home in glob.glob("/home/*/"):
     ledger = os.path.join(home, ".local/share/focus-reminder")
     checkpoint = os.path.join(ledger, "suspend-checkpoint.json")
     state_file = os.path.join(ledger, "suspend.state")
+    schedule_path = os.path.join(ledger, "lockout-schedule.json")
     try:
         os.unlink(os.path.join(ledger, "shell-lockout-active"))
     except OSError:
         pass
+    end = 0.0
+    try:
+        with open(state_file) as f:
+            end = float(f.read().strip())
+    except Exception:
+        end = 0.0
+    state = {}
     try:
         with open(checkpoint) as f:
             state = json.load(f)
-        remaining = max(0.0, float(state.get("remaining_seconds", 0)))
-        if remaining <= 0:
-            continue
-        # Pause the countdown while powered off. Restore its last saved
-        # remaining time before GDM, then start a new wall-clock deadline.
-        end = now + remaining
-        state["saved_at"] = now
-        state["remaining_seconds"] = remaining
-        schedule = state.get("schedule")
-        stage_left = state.get("stage_remaining_seconds")
-        if isinstance(schedule, dict) and stage_left is not None:
+        if not isinstance(state, dict):
+            state = {}
+    except Exception:
+        state = {}
+    if end <= 0:
+        try:
+            end = (float(state.get("saved_at", 0))
+                   + max(0.0, float(state.get("remaining_seconds", 0))))
+        except Exception:
+            end = 0.0
+    if end <= 0:
+        continue
+    if end <= now:
+        # The countdown finished while the laptop was powered off. Do not
+        # restart it on boot: clear the stale lockout markers.
+        for path in (state_file, checkpoint, schedule_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        try:
+            os.unlink(os.path.join(ledger, "pam-lock-requested"))
+        except OSError:
+            pass
+        continue
+    # Keep the ORIGINAL wall-clock deadline. Powered-off time therefore
+    # counts down normally instead of pausing the timer.
+    remaining = max(0.0, end - now)
+    state["saved_at"] = now
+    state["remaining_seconds"] = remaining
+    schedule = state.get("schedule")
+    if not isinstance(schedule, dict):
+        try:
+            with open(schedule_path) as f:
+                schedule = json.load(f)
+            if not isinstance(schedule, dict):
+                schedule = None
+            else:
+                state["schedule"] = schedule
+        except Exception:
+            schedule = None
+    if isinstance(schedule, dict):
+        try:
             stage = int(schedule.get("stage", 0))
             segments = schedule.get("segments", [])
             if 0 <= stage < len(segments):
-                schedule["stage_start"] = now - max(
-                    0.0, float(segments[stage]) - max(0.0, float(stage_left)))
+                schedule_end = float(schedule["stage_start"]) + sum(
+                    int(value) for value in segments[stage:])
+                state["stage_remaining_seconds"] = max(
+                    0.0, min(remaining, schedule_end - now))
+        except Exception:
+            pass
+    try:
         os.makedirs(ledger, exist_ok=True)
         for path, content in (
             (state_file, str(end)),
@@ -154,8 +199,7 @@ for home in glob.glob("/home/*/"):
             finally:
                 if os.path.exists(tmp):
                     os.unlink(tmp)
-        if isinstance(schedule, dict) and stage_left is not None:
-            schedule_path = os.path.join(ledger, "lockout-schedule.json")
+        if isinstance(schedule, dict):
             fd, tmp = tempfile.mkstemp(prefix=".focus-boot-", dir=ledger)
             try:
                 with os.fdopen(fd, "w") as f:
@@ -170,7 +214,7 @@ for home in glob.glob("/home/*/"):
             uid, gid = os.stat(home).st_uid, os.stat(home).st_gid
             os.chown(state_file, uid, gid)
             os.chown(checkpoint, uid, gid)
-            if isinstance(schedule, dict) and stage_left is not None:
+            if isinstance(schedule, dict):
                 os.chown(schedule_path, uid, gid)
         except OSError:
             pass
@@ -200,8 +244,68 @@ while true; do
     done
     if [ "$any_active" -eq 1 ]; then
         echo active > "$LOCK_FLAG" 2>/dev/null || true
+
+        # --- TTY / Virtual Terminal Lockdown ---
+        # 1. Lock VT switching in Linux kernel via ioctl VT_LOCKSWITCH (0x560B)
+        python3 -c '
+import fcntl, os
+for dev in ("/dev/console", "/dev/tty0", "/dev/tty1"):
+    try:
+        fd = os.open(dev, os.O_RDWR)
+        try:
+            fcntl.ioctl(fd, 0x560B, 1) # VT_LOCKSWITCH
+            break
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+' 2>/dev/null || true
+
+        # 2. Stop getty/agetty services on text virtual terminals
+        systemctl stop getty.target >/dev/null 2>&1 || true
+        systemctl stop "getty@tty*.service" >/dev/null 2>&1 || true
+        pkill -9 -f "agetty" >/dev/null 2>&1 || true
+        pkill -9 -x "login" >/dev/null 2>&1 || true
+
+        # 3. Detect graphical session VT and force switch back to GUI if on text console
+        gui_vt=$(loginctl list-sessions --no-legend 2>/dev/null | while read -r sess uid user rest; do
+            type=$(loginctl show-session "$sess" -p Type --value 2>/dev/null || true)
+            if [ "$type" = "wayland" ] || [ "$type" = "x11" ]; then
+                vtnr=$(loginctl show-session "$sess" -p VTNr --value 2>/dev/null || true)
+                if [ -n "$vtnr" ] && [ "$vtnr" -ge 1 ] 2>/dev/null; then
+                    echo "$vtnr"
+                    break
+                fi
+            fi
+        done)
+        gui_vt="${gui_vt:-2}"
+        cur_vt=$(cat /sys/class/tty/tty0/active 2>/dev/null || true)
+        if [ -n "$cur_vt" ] && [ "$cur_vt" != "tty${gui_vt}" ]; then
+            chvt "$gui_vt" 2>/dev/null || true
+        fi
+
+        # 4. Terminate any user processes/shells on non-GUI TTYs
+        for tty_idx in 1 3 4 5 6 7 8 9 10 11 12; do
+            if [ "$tty_idx" -ne "$gui_vt" ]; then
+                pkill -9 -t "tty${tty_idx}" 2>/dev/null || true
+            fi
+        done
     else
         rm -f "$LOCK_FLAG" 2>/dev/null || true
+        # Re-enable VT switching when lockout is over
+        python3 -c '
+import fcntl, os
+for dev in ("/dev/console", "/dev/tty0", "/dev/tty1"):
+    try:
+        fd = os.open(dev, os.O_RDWR)
+        try:
+            fcntl.ioctl(fd, 0x560C, 1) # VT_UNLOCKSWITCH
+            break
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+' 2>/dev/null || true
     fi
     sleep "$CHECK_INTERVAL"
 done

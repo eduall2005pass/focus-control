@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Telegram Group Virtual Cloud Drive (FUSE)
-Mounts a Telegram Group/Channel as a read-only Linux filesystem with on-demand streaming.
+Telegram Multi-Group Virtual Cloud Drive (FUSE)
+Mounts Telegram Groups/Channels as a read/write Linux filesystem with:
+- On-demand streaming (lazy reading, sparse local chunk caching)
+- Direct file uploads (copy/drop files into group folders to upload to Telegram)
+- Multi-group support: "PDF Materials Upload" and "biprova 20"
 """
 import os
 import sys
@@ -10,7 +13,23 @@ import stat
 import time
 import asyncio
 import threading
+import shutil
+import ctypes.util
 from collections import OrderedDict
+
+# Ensure libfuse is located even if LD_LIBRARY_PATH isn't set in user environment
+_orig_find_library = ctypes.util.find_library
+def _custom_find_library(name):
+    if name == 'fuse':
+        for p in ('/home/prof21/.local/lib/libfuse.so.2',
+                  '/home/prof21/.local/lib/libfuse.so',
+                  '/usr/lib/x86_64-linux-gnu/libfuse.so.2',
+                  '/lib/x86_64-linux-gnu/libfuse.so.2'):
+            if os.path.exists(p):
+                return p
+    return _orig_find_library(name)
+ctypes.util.find_library = _custom_find_library
+
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from fuse import FUSE, Operations, FuseOSError
@@ -20,8 +39,16 @@ API_HASH = "ea37c38f22a23da008e98ce1b0e982e8"
 SESSION_DIR = os.path.expanduser("~/.local/share/focus-reminder")
 SESSION_FILE = os.path.join(SESSION_DIR, "telegram_drive.session")
 CACHE_DIR = os.path.expanduser("~/.cache/telegram-materials")
+STAGING_DIR = os.path.join(CACHE_DIR, "upload_staging")
 DEFAULT_MOUNT = os.path.expanduser("~/Telegram-Materials")
-TARGET_PEER = os.environ.get("TG_CHAT", "-1004415493319")
+
+# Default groups to mount:
+# 1) Primary PDF Materials Upload (-1004415493319 / pdf258upload)
+# 2) Biprova 20 (searches joined chats/channels)
+DEFAULT_TARGETS = [
+    "-1004415493319",
+    "biprova 20",
+]
 
 EXT_CATEGORIES = {
     "PDFs": {".pdf"},
@@ -33,19 +60,22 @@ EXT_CATEGORIES = {
 }
 
 
-class TelegramDriveFS(Operations):
-    def __init__(self, loop, client, chat_entity):
-        self.loop = loop
-        self.client = client
+class GroupDrive:
+    """Manages file listing and categories for a single Telegram group."""
+    def __init__(self, chat_entity, folder_name=None):
         self.chat = chat_entity
+        self.id = getattr(chat_entity, "id", 0)
+        self.title = getattr(chat_entity, "title", str(self.id)).strip()
+        self.name = folder_name or self._clean_folder_name(self.title)
         self.lock = threading.Lock()
-        self.files = {}          # filename -> file_dict
-        self.msg_to_name = {}    # msg_id -> filename
+        self.files = {}          # clean_filename -> file_dict
+        self.msg_to_name = {}    # msg_id -> clean_filename
         self.categories = {cat: set() for cat in EXT_CATEGORIES}
-        self.cache_dir = os.path.join(CACHE_DIR, "files")
-        os.makedirs(self.cache_dir, exist_ok=True)
-        self.fd_map = {}
-        self.next_fd = 100
+
+    @staticmethod
+    def _clean_folder_name(title):
+        clean = title.replace("/", "_").replace("\\", "_").replace(":", "_").strip()
+        return clean or "Unnamed_Group"
 
     def add_message(self, msg):
         if not (msg.media or msg.file):
@@ -65,13 +95,12 @@ class TelegramDriveFS(Operations):
             else:
                 filename = f"file_{msg_id}{ext}"
 
-        # Clean filename
         clean_name = filename.replace("/", "_").replace("\\", "_").strip()
         if not clean_name:
             clean_name = f"file_{msg_id}{ext}"
 
         with self.lock:
-            # Handle duplicate names
+            # Handle duplicate names inside this group
             if clean_name in self.files and self.files[clean_name]["msg_id"] != msg_id:
                 base, ext_part = os.path.splitext(clean_name)
                 clean_name = f"{base} ({msg_id}){ext_part}"
@@ -82,6 +111,7 @@ class TelegramDriveFS(Operations):
                 "size": size,
                 "mtime": mtime,
                 "media": msg.media,
+                "group": self,
             }
             self.files[clean_name] = file_info
             self.msg_to_name[msg_id] = clean_name
@@ -91,32 +121,101 @@ class TelegramDriveFS(Operations):
                 if file_ext in exts:
                     self.categories[cat].add(clean_name)
 
-    def _resolve_path(self, path):
+
+class TelegramMultiDriveFS(Operations):
+    """
+    FUSE filesystem exposing multiple Telegram groups as virtual directories
+    with lazy chunk streaming and write/upload capability.
+    """
+    def __init__(self, loop, client, groups_dict, default_group):
+        self.loop = loop
+        self.client = client
+        self.groups = groups_dict         # folder_name -> GroupDrive
+        self.default_group = default_group
+        self.lock = threading.Lock()
+        self.cache_dir = os.path.join(CACHE_DIR, "files")
+        self.staging_dir = STAGING_DIR
+        os.makedirs(self.cache_dir, exist_ok=True)
+        os.makedirs(self.staging_dir, exist_ok=True)
+
+        self.next_fd = 1000
+        self.read_fd_map = {}             # fd -> file_info
+        self.write_fd_map = {}            # fd -> upload_dict
+        self.active_uploads = {}          # normalized_path -> upload_dict
+
+    def _resolve(self, path):
         path = path.strip("/")
         if not path:
             return "root", None
-        parts = path.split("/", 1)
-        if len(parts) == 1:
-            if parts[0] in self.categories or parts[0] == "All":
-                return "dir", parts[0]
-            if parts[0] in self.files:
-                return "file", self.files[parts[0]]
+
+        parts = path.split("/")
+        first = parts[0]
+
+        # Case 1: First path element is a known group folder
+        if first in self.groups:
+            grp = self.groups[first]
+            if len(parts) == 1:
+                return "group_dir", grp
+            second = parts[1]
+            if len(parts) == 2:
+                if second == "All" or second in grp.categories:
+                    return "cat_dir", (grp, second)
+                with grp.lock:
+                    if second in grp.files:
+                        return "file", (grp, grp.files[second])
+                return "none", None
+            if len(parts) == 3:
+                cat, fname = second, parts[2]
+                with grp.lock:
+                    if cat == "All" and fname in grp.files:
+                        return "file", (grp, grp.files[fname])
+                    if cat in grp.categories and fname in grp.categories[cat]:
+                        return "file", (grp, grp.files[fname])
+                return "none", None
             return "none", None
-        cat, fname = parts[0], parts[1]
-        if cat in self.categories and fname in self.categories[cat]:
-            return "file", self.files[fname]
-        if cat == "All" and fname in self.files:
-            return "file", self.files[fname]
+
+        # Case 2: Direct access at root level (fallback to default group)
+        if self.default_group:
+            grp = self.default_group
+            if len(parts) == 1:
+                if first == "All" or first in grp.categories:
+                    return "cat_dir", (grp, first)
+                with grp.lock:
+                    if first in grp.files:
+                        return "file", (grp, grp.files[first])
+            elif len(parts) == 2:
+                cat, fname = parts[0], parts[1]
+                with grp.lock:
+                    if cat == "All" and fname in grp.files:
+                        return "file", (grp, grp.files[fname])
+                    if cat in grp.categories and fname in grp.categories[cat]:
+                        return "file", (grp, grp.files[fname])
+
         return "none", None
 
-    # --- FUSE Operations (Read-Only) ---
+    # --- FUSE Operations ---
 
     def getattr(self, path, fh=None):
-        kind, item = self._resolve_path(path)
         now = time.time()
-        if kind == "root" or kind == "dir":
+        norm_path = path.strip("/")
+
+        # Active in-flight upload file info
+        with self.lock:
+            if norm_path in self.active_uploads:
+                up = self.active_uploads[norm_path]
+                return dict(
+                    st_mode=stat.S_IFREG | 0o664,
+                    st_nlink=1,
+                    st_size=up["size"],
+                    st_ctime=up["mtime"],
+                    st_mtime=up["mtime"],
+                    st_atime=now
+                )
+
+        kind, item = self._resolve(path)
+        if kind in ("root", "group_dir", "cat_dir"):
             return dict(
-                st_mode=stat.S_IFDIR | 0o555,
+                st_mode=stat.S_IFDIR | 0o775,
                 st_nlink=2,
                 st_size=4096,
                 st_ctime=now,
@@ -124,68 +223,81 @@ class TelegramDriveFS(Operations):
                 st_atime=now
             )
         elif kind == "file":
+            grp, f_info = item
             return dict(
-                st_mode=stat.S_IFREG | 0o444,
+                st_mode=stat.S_IFREG | 0o664,
                 st_nlink=1,
-                st_size=item["size"],
-                st_ctime=item["mtime"],
-                st_mtime=item["mtime"],
+                st_size=f_info["size"],
+                st_ctime=f_info["mtime"],
+                st_mtime=f_info["mtime"],
                 st_atime=now
             )
         raise FuseOSError(errno.ENOENT)
 
     def readdir(self, path, fh):
-        kind, item = self._resolve_path(path)
+        kind, item = self._resolve(path)
         entries = [".", ".."]
+
         if kind == "root":
-            entries.append("All")
-            entries.extend(sorted(self.categories.keys()))
-            with self.lock:
-                entries.extend(sorted(self.files.keys()))
+            # Expose all group folders
+            entries.extend(sorted(self.groups.keys()))
             return entries
-        elif kind == "dir":
-            with self.lock:
-                if item == "All":
-                    return entries + sorted(self.files.keys())
-                elif item in self.categories:
-                    return entries + sorted(self.categories[item])
+
+        if kind == "group_dir":
+            grp = item
+            entries.append("All")
+            entries.extend(sorted(grp.categories.keys()))
+            with grp.lock:
+                entries.extend(sorted(grp.files.keys()))
+            return entries
+
+        if kind == "cat_dir":
+            grp, cat = item
+            with grp.lock:
+                if cat == "All":
+                    return entries + sorted(grp.files.keys())
+                if cat in grp.categories:
+                    return entries + sorted(grp.categories[cat])
+
         raise FuseOSError(errno.ENOENT)
 
     def open(self, path, flags):
-        # Enforce read-only
         accmode = flags & os.O_ACCMODE
         if accmode != os.O_RDONLY:
-            raise FuseOSError(errno.EROFS)
-        kind, item = self._resolve_path(path)
+            return self._create_or_open_write(path, flags)
+
+        kind, item = self._resolve(path)
         if kind != "file":
             raise FuseOSError(errno.ENOENT)
+        grp, f_info = item
+
         with self.lock:
             fd = self.next_fd
             self.next_fd += 1
-            self.fd_map[fd] = item
+            self.read_fd_map[fd] = f_info
         return fd
 
-    def release(self, path, fh):
-        with self.lock:
-            self.fd_map.pop(fh, None)
-        return 0
-
     def read(self, path, size, offset, fh):
-        kind, item = self._resolve_path(path)
-        if kind != "file":
-            raise FuseOSError(errno.ENOENT)
+        with self.lock:
+            f_info = self.read_fd_map.get(fh)
 
-        file_size = item["size"]
+        if not f_info:
+            kind, res = self._resolve(path)
+            if kind != "file":
+                raise FuseOSError(errno.ENOENT)
+            f_info = res[1]
+
+        file_size = f_info["size"]
         if offset >= file_size:
             return b""
         req_size = min(size, file_size - offset)
         if req_size <= 0:
             return b""
 
-        msg_id = item["msg_id"]
+        msg_id = f_info["msg_id"]
         cache_file = os.path.join(self.cache_dir, f"{msg_id}.dat")
 
-        # Check if already cached on disk
+        # Fast local cache read
         if os.path.isfile(cache_file):
             try:
                 with open(cache_file, "rb") as cf:
@@ -197,20 +309,19 @@ class TelegramDriveFS(Operations):
             except Exception:
                 pass
 
-        # Stream requested chunk from Telegram via Telethon
+        # Stream chunk from Telegram via Telethon MTProto
         try:
             future = asyncio.run_coroutine_threadsafe(
-                self._fetch_chunk(item["media"], offset, req_size, file_size, cache_file),
+                self._fetch_chunk(f_info["media"], offset, req_size, file_size, cache_file),
                 self.loop
             )
             return future.result(timeout=60)
         except Exception as e:
-            print(f"Error reading chunk for {item['name']} (off={offset}, sz={req_size}): {e}", flush=True)
+            print(f"[TG-Drive] Read error for {f_info['name']} (off={offset}, sz={req_size}): {e}", flush=True)
             raise FuseOSError(errno.EIO)
 
     async def _fetch_chunk(self, media, offset, size, file_size, cache_file):
-        # 512 KiB aligned chunking for optimal Telegram MTProto throughput
-        CHUNK_ALIGN = 524288  # 512 KB
+        CHUNK_ALIGN = 524288  # 512 KiB aligned chunks
         aligned_offset = (offset // CHUNK_ALIGN) * CHUNK_ALIGN
         fetch_len = min(CHUNK_ALIGN, file_size - aligned_offset)
         if fetch_len < (offset - aligned_offset + size):
@@ -220,7 +331,6 @@ class TelegramDriveFS(Operations):
         async for chunk in self.client.iter_download(media, offset=aligned_offset, limit=fetch_len, request_size=CHUNK_ALIGN):
             buf.extend(chunk)
 
-        # Write to sparse cache file for fast re-reading
         try:
             with open(cache_file, "r+b" if os.path.exists(cache_file) else "wb") as cf:
                 cf.seek(aligned_offset)
@@ -231,28 +341,189 @@ class TelegramDriveFS(Operations):
         start_in_buf = offset - aligned_offset
         return bytes(buf[start_in_buf:start_in_buf + size])
 
-    # Explicitly disallow any write/delete/modify operation
-    def write(self, path, data, offset, fh): raise FuseOSError(errno.EROFS)
-    def create(self, path, mode, fi=None): raise FuseOSError(errno.EROFS)
-    def unlink(self, path): raise FuseOSError(errno.EROFS)
-    def rmdir(self, path): raise FuseOSError(errno.EROFS)
-    def mkdir(self, path, mode): raise FuseOSError(errno.EROFS)
-    def rename(self, old, new): raise FuseOSError(errno.EROFS)
-    def chmod(self, path, mode): raise FuseOSError(errno.EROFS)
-    def chown(self, path, uid, gid): raise FuseOSError(errno.EROFS)
-    def truncate(self, path, length, fh=None): raise FuseOSError(errno.EROFS)
+    # --- Write & Upload Operations ---
+
+    def create(self, path, mode, fi=None):
+        return self._create_or_open_write(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+
+    def _create_or_open_write(self, path, flags):
+        parts = path.strip("/").split("/")
+        filename = parts[-1]
+
+        # Determine destination group
+        target_group = None
+        if len(parts) >= 2 and parts[0] in self.groups:
+            target_group = self.groups[parts[0]]
+        else:
+            target_group = self.default_group
+
+        if not target_group:
+            raise FuseOSError(errno.EROFS)
+
+        staging_name = f"{int(time.time() * 1000)}_{filename}"
+        staging_file = os.path.join(self.staging_dir, staging_name)
+
+        try:
+            fp = open(staging_file, "wb+")
+        except Exception as e:
+            print(f"[TG-Drive] Failed to create staging file {staging_file}: {e}", flush=True)
+            raise FuseOSError(errno.EIO)
+
+        norm_path = path.strip("/")
+        with self.lock:
+            fd = self.next_fd
+            self.next_fd += 1
+            upload_entry = {
+                "path": norm_path,
+                "filename": filename,
+                "group": target_group,
+                "staging_path": staging_file,
+                "fp": fp,
+                "size": 0,
+                "mtime": time.time(),
+            }
+            self.write_fd_map[fd] = upload_entry
+            self.active_uploads[norm_path] = upload_entry
+
+        print(f"[TG-Drive] In-flight upload initiated: '{filename}' -> Group '{target_group.name}'", flush=True)
+        return fd
+
+    def write(self, path, data, offset, fh):
+        with self.lock:
+            up = self.write_fd_map.get(fh)
+        if not up:
+            raise FuseOSError(errno.EBADF)
+        try:
+            up["fp"].seek(offset)
+            up["fp"].write(data)
+            up["size"] = max(up["size"], offset + len(data))
+            return len(data)
+        except Exception as e:
+            print(f"[TG-Drive] Write staging error: {e}", flush=True)
+            raise FuseOSError(errno.EIO)
+
+    def truncate(self, path, length, fh=None):
+        with self.lock:
+            up = self.write_fd_map.get(fh) if fh else self.active_uploads.get(path.strip("/"))
+        if up:
+            up["fp"].truncate(length)
+            up["size"] = length
+            return 0
+        return 0
+
+    def flush(self, path, fh):
+        with self.lock:
+            up = self.write_fd_map.get(fh)
+        if up:
+            try:
+                up["fp"].flush()
+            except Exception:
+                pass
+        return 0
+
+    def release(self, path, fh):
+        norm_path = path.strip("/")
+        up = None
+
+        with self.lock:
+            if fh in self.read_fd_map:
+                self.read_fd_map.pop(fh, None)
+                return 0
+            if fh in self.write_fd_map:
+                up = self.write_fd_map.pop(fh, None)
+                self.active_uploads.pop(norm_path, None)
+
+        if up:
+            try:
+                up["fp"].flush()
+                up["fp"].close()
+            except Exception:
+                pass
+
+            staging_path = up["staging_path"]
+            group = up["group"]
+            filename = up["filename"]
+
+            # Trigger background Telegram upload worker
+            def _upload_worker():
+                try:
+                    if not os.path.isfile(staging_path) or os.path.getsize(staging_path) == 0:
+                        print(f"[TG-Drive] File {filename} was empty; skipped upload.", flush=True)
+                        return
+
+                    size_mb = os.path.getsize(staging_path) / (1024 * 1024)
+                    print(f"[TG-Drive] 📤 Uploading '{filename}' ({size_mb:.2f} MB) to Telegram group '{group.name}'...", flush=True)
+
+                    async def _send():
+                        # Send file to group
+                        msg = await self.client.send_file(group.chat, staging_path, caption=filename)
+                        group.add_message(msg)
+                        print(f"[TG-Drive] ✅ Successfully uploaded '{filename}' to '{group.name}' (Msg ID: {msg.id})", flush=True)
+
+                    future = asyncio.run_coroutine_threadsafe(_send(), self.loop)
+                    future.result(timeout=1800)  # 30 minutes timeout for big files
+                except Exception as e:
+                    print(f"[TG-Drive] ❌ Upload failed for '{filename}': {e}", flush=True)
+                finally:
+                    try:
+                        if os.path.exists(staging_path):
+                            os.remove(staging_path)
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_upload_worker, daemon=True).start()
+
+        return 0
+
+    # Read-only fallback for other modification operations
+    def unlink(self, path): raise FuseOSError(errno.EPERM)
+    def rmdir(self, path): raise FuseOSError(errno.EPERM)
+    def mkdir(self, path, mode): raise FuseOSError(errno.EPERM)
+    def rename(self, old, new): raise FuseOSError(errno.EPERM)
+    def chmod(self, path, mode): return 0
+    def chown(self, path, uid, gid): return 0
 
 
-async def build_index(fs, chat_entity):
-    print(f"[TG-Drive] Indexing files in {getattr(chat_entity, 'title', TARGET_PEER)}...", flush=True)
+async def resolve_target(client, target):
+    """Resolve a chat entity by ID, username, or case-insensitive title search."""
+    target_str = str(target).strip()
+
+    # Try numeric ID
+    try:
+        if target_str.startswith("-100") or target_str.isdigit() or target_str.startswith("-"):
+            ent = await client.get_entity(int(target_str))
+            if ent: return ent
+    except Exception:
+        pass
+
+    # Try username or direct entity string
+    try:
+        ent = await client.get_entity(target_str)
+        if ent: return ent
+    except Exception:
+        pass
+
+    # Search all user dialogs by title/name
+    target_lower = target_str.lower()
+    async for dialog in client.iter_dialogs():
+        title = (dialog.name or "").lower()
+        if target_lower in title or ("biprov" in target_lower and "biprov" in title):
+            return dialog.entity
+
+    return None
+
+
+async def build_index(group_drive, client):
+    """Index all media files in a Telegram group."""
+    print(f"[TG-Drive] Indexing files in '{group_drive.name}'...", flush=True)
     count = 0
-    async for msg in fs.client.iter_messages(chat_entity, limit=None):
+    async for msg in client.iter_messages(group_drive.chat, limit=None):
         if msg.media or msg.file:
-            fs.add_message(msg)
+            group_drive.add_message(msg)
             count += 1
             if count % 50 == 0:
-                print(f"[TG-Drive] Indexed {count} files...", flush=True)
-    print(f"[TG-Drive] Index complete: {len(fs.files)} unique files ready to stream.", flush=True)
+                print(f"[TG-Drive] Indexed {count} files in '{group_drive.name}'...", flush=True)
+    print(f"[TG-Drive] Index complete for '{group_drive.name}': {len(group_drive.files)} files ready.", flush=True)
 
 
 def start_daemon(mount_point=DEFAULT_MOUNT):
@@ -287,47 +558,92 @@ def start_daemon(mount_point=DEFAULT_MOUNT):
 
     # Connect client
     future = asyncio.run_coroutine_threadsafe(client.connect(), loop)
-    future.result(timeout=15)
+    future.result(timeout=20)
 
     future = asyncio.run_coroutine_threadsafe(client.is_user_authorized(), loop)
     if not future.result(timeout=10):
         print("ERROR: User is not authorized. Please run tg_auth.py to log in.", flush=True)
         sys.exit(1)
 
-    # Resolve target chat
-    target = TARGET_PEER
-    try:
-        if target.startswith("-100"):
-            target = int(target)
-    except ValueError:
-        pass
+    print("[TG-Drive] Connected and authorized with Telegram.", flush=True)
 
-    future = asyncio.run_coroutine_threadsafe(client.get_entity(target), loop)
-    chat_entity = future.result(timeout=20)
-    print(f"[TG-Drive] Connected to Telegram. Target: {getattr(chat_entity, 'title', target)}", flush=True)
+    # Determine targets from env or default
+    targets = DEFAULT_TARGETS
+    if os.environ.get("TG_CHATS"):
+        targets = [t.strip() for t in os.environ.get("TG_CHATS").split(",") if t.strip()]
+    elif os.environ.get("TG_CHAT"):
+        targets = [os.environ.get("TG_CHAT").strip(), "biprova 20"]
 
-    fs = TelegramDriveFS(loop, client, chat_entity)
+    groups_dict = OrderedDict()
+    primary_group = None
 
-    # Initial index
-    future = asyncio.run_coroutine_threadsafe(build_index(fs, chat_entity), loop)
-    future.result(timeout=120)
+    for target in targets:
+        try:
+            future = asyncio.run_coroutine_threadsafe(resolve_target(client, target), loop)
+            ent = future.result(timeout=20)
+            if ent:
+                title = getattr(ent, "title", str(target))
+                # Custom friendly folder name
+                folder_name = "PDF Materials" if ("pdf" in title.lower() or "4415493319" in str(getattr(ent, "id", ""))) else GroupDrive._clean_folder_name(title)
+                grp = GroupDrive(ent, folder_name=folder_name)
+                groups_dict[folder_name] = grp
+                if primary_group is None:
+                    primary_group = grp
+                print(f"[TG-Drive] Resolved group: '{title}' -> Folder: '{folder_name}' (ID: {grp.id})", flush=True)
 
-    # Listen for new files in real time
-    @client.on(events.NewMessage(chats=chat_entity))
+                # Persist discovered peer IDs for Study Mode
+                if "4415493319" in str(grp.id) or "pdf" in title.lower():
+                    try:
+                        with open(os.path.join(SESSION_DIR, "telegram-target-peer"), "w") as f:
+                            f.write(str(grp.id))
+                    except Exception:
+                        pass
+                if "biprov" in title.lower():
+                    try:
+                        with open(os.path.join(SESSION_DIR, "telegram-biprova-peer"), "w") as f:
+                            f.write(str(grp.id))
+                    except Exception:
+                        pass
+            else:
+                print(f"[TG-Drive] Warning: Could not find Telegram group matching '{target}'", flush=True)
+        except Exception as e:
+            print(f"[TG-Drive] Error resolving '{target}': {e}", flush=True)
+
+    if not groups_dict:
+        print("ERROR: No groups could be resolved. Please check group permissions.", flush=True)
+        sys.exit(1)
+
+    # Build initial index for all groups
+    for grp in groups_dict.values():
+        future = asyncio.run_coroutine_threadsafe(build_index(grp, client), loop)
+        future.result(timeout=180)
+
+    # Real-time event listener for incoming messages across all connected groups
+    all_chats = [g.chat for g in groups_dict.values()]
+    @client.on(events.NewMessage(chats=all_chats))
     async def on_new_msg(event):
         if event.message and (event.message.media or event.message.file):
-            fs.add_message(event.message)
-            print(f"[TG-Drive] New file received: {getattr(event.message.file, 'name', 'unnamed')}", flush=True)
+            chat_id = getattr(event.chat, "id", None)
+            for g in groups_dict.values():
+                if getattr(g.chat, "id", None) == chat_id:
+                    g.add_message(event.message)
+                    print(f"[TG-Drive] 📥 New file arrived in '{g.name}': {getattr(event.message.file, 'name', 'unnamed')}", flush=True)
+                    break
+
+    fs = TelegramMultiDriveFS(loop, client, groups_dict, default_group=primary_group)
 
     print(f"[TG-Drive] Mounting FUSE filesystem at {mount_point}...", flush=True)
-    print(f"[TG-Drive] Accessible at: {mount_point} and {symlink_path}")
-    print("[TG-Drive] Read-only, on-demand streaming enabled. Press Ctrl+C to exit.", flush=True)
+    print(f"[TG-Drive] Mounted groups:")
+    for name, g in groups_dict.items():
+        print(f"  📁 {mount_point}/{name} ({len(g.files)} files)")
+    print(f"[TG-Drive] Upload enabled! Drag and drop files into group folders to upload directly to Telegram.")
+    print("[TG-Drive] Press Ctrl+C to unmount and exit.", flush=True)
 
     # Clean unmount if already mounted
     os.system(f"fusermount -u {mount_point} 2>/dev/null")
 
     try:
-        FUSE(fs, mount_point, foreground=True, nothreads=False, ro=True, allow_other=False)
+        FUSE(fs, mount_point, foreground=True, nothreads=False, ro=False, allow_other=False)
     finally:
         os.system(f"fusermount -u {mount_point} 2>/dev/null")
 

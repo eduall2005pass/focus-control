@@ -14,13 +14,17 @@ lockout, and a persistent system tray. Runs automatically for every user.
   `~/Documents/typing test/`
 - **Emergency Lockout** — tray menu or alert button: minutes (1–60), hours
   (1–24), or days (1–7, double confirm); system-password required; the device
-  remains powered on behind a fullscreen lockout; remaining time resumes on
-  reboot, while the computer is powered off
+  remains powered on behind a fullscreen lockout; the countdown keeps using
+  real wall-clock time, so time spent powered off is counted too
 - **Waste ledger** — per-day JSON in `~/.local/share/focus-reminder/`,
   idle/lock aware, daily-limit escalation alert
 - **Study Mode** — whitelisted study links, PDF/image reader with annotation
-  save, persistent logins, and an in-study **page dock** to switch, minimize
-  and close several open pages at once
+  save, persistent logins, an in-study address bar restricted to approved
+  websites, and a **page dock** to switch, minimize and close open pages
+- **Study browsing restrictions** — worldwide Google domains, known search
+  providers, social platforms, YouTube and known adult-content domains are
+  blocked; other destinations must
+  be explicitly present in the study-site allowlist
 - **Study exemptions** — PDF readers, whiteboards (GazBoard), LibreOffice,
   study sites (muslimbangla.com) skip the reminder
 - **Tray** — persistent top-bar icon (requires

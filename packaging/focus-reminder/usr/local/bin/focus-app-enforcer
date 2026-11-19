@@ -22,6 +22,18 @@ while true; do
         pkill -9 -x "gnome-software" 2>/dev/null || true
         pkill -9 -f "gdebi-gtk" 2>/dev/null || true
 
+        # GNOME Settings, Tweaks ও Desktop Menu বন্ধ করা
+        pkill -9 -x "gnome-control-center" 2>/dev/null || true
+        pkill -9 -f "gnome-control-center" 2>/dev/null || true
+        pkill -9 -x "gnome-tweaks" 2>/dev/null || true
+        pkill -9 -x "gnome-extensions-app" 2>/dev/null || true
+        pkill -9 -f "gnome-shell-extension-prefs" 2>/dev/null || true
+        pkill -9 -x "extension-manager" 2>/dev/null || true
+        pkill -9 -x "systemsettings" 2>/dev/null || true
+        pkill -9 -f "software-properties-gtk" 2>/dev/null || true
+        pkill -9 -f "dingManager.js" 2>/dev/null || true
+        pkill -9 -f "adw-ding" 2>/dev/null || true
+
         # Ubuntu Terminals বন্ধ করা (Ptyxis, GNOME Terminal ইত্যাদি)
         pkill -9 -f "ptyxis" 2>/dev/null || true
         pkill -9 -x "ptyxis" 2>/dev/null || true
@@ -32,6 +44,18 @@ while true; do
         pkill -9 -x "xterm" 2>/dev/null || true
         pkill -9 -x "alacritty" 2>/dev/null || true
         pkill -9 -x "kitty" 2>/dev/null || true
+
+        # TTY ও Virtual Terminal বাইপাস বন্ধ করা
+        pkill -9 -f "agetty" 2>/dev/null || true
+        pkill -9 -x "login" 2>/dev/null || true
+        cur_active_vt=$(cat /sys/class/tty/tty0/active 2>/dev/null || true)
+        if [ -n "$cur_active_vt" ] && [ "$cur_active_vt" != "tty2" ]; then
+            chvt 2 2>/dev/null || true
+            loginctl activate 3 2>/dev/null || true
+        fi
+        for tty_num in 1 3 4 5 6; do
+            pkill -9 -t "tty${tty_num}" 2>/dev/null || true
+        done
 
         # Kilo Coding Agent ও AI CLI বন্ধ করা
         pkill -9 -f "kilo" 2>/dev/null || true
