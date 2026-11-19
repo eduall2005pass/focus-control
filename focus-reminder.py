@@ -4778,7 +4778,8 @@ def _is_nav_permitted(uri):
     u_lower = u.lower()
     if u_lower in ("about:blank", "about:srcdoc"):
         return True
-    if u_lower in ("tg-materials", "pdf-materials", "telegram-materials"):
+    if u_lower in ("tg-materials", "pdf-materials", "telegram-materials",
+                   "tg-biprova", "biprova", "biprova 20"):
         return True
     if u_lower.startswith(("data:", "blob:")):
         return True
@@ -5086,6 +5087,13 @@ def show_study_window(parent=None, end_ts=None):
         except Exception:
             pass
 
+    _study_shell_saved = None
+    if parent is None and not _is_lockout_active():
+        try:
+            _study_shell_saved = _gnome_lockdown()
+        except Exception as _e:
+            print(f"study desktop lockdown: {_e}", flush=True)
+
     win = _new_fullscreen("Study")
     _study_win = win
     win.set_modal(True)
@@ -5096,7 +5104,7 @@ def show_study_window(parent=None, end_ts=None):
     css.load_from_data(b"""
     .studywin { background: #0b1220; }
     .studybar { background: #0d1527; border-bottom: 1px solid rgba(148, 163, 184, 0.16);
-                padding: 2px 10px; min-height: 32px; }
+                padding: 2px 8px; min-height: 32px; }
     .studybar entry { background: rgba(15, 23, 42, 0.85); color: #f1f5f9;
                       border: 1px solid rgba(148, 163, 184, 0.25);
                       border-radius: 5px; padding: 2px 8px; font-family: Inter, sans-serif;
@@ -5120,6 +5128,22 @@ def show_study_window(parent=None, end_ts=None):
     .topbar-btn:hover { background: rgba(59, 130, 246, 0.25); border-color: rgba(96, 165, 250, 0.45);
                         color: #ffffff; }
     .topbar-btn:active { background: rgba(37, 99, 235, 0.4); }
+    .topbar-nav-btn { min-width: 26px; padding: 1px 4px; font-size: 11px; }
+    .topbar-exit-btn { background: rgba(239, 68, 68, 0.18); border-color: rgba(239, 68, 68, 0.35); color: #fca5a5; font-weight: 700; }
+    .topbar-exit-btn:hover { background: rgba(239, 68, 68, 0.35); border-color: rgba(239, 68, 68, 0.6); color: #ffffff; }
+    .study-progress { min-height: 2px; }
+    .study-progress trough { background: rgba(15, 23, 42, 0.5); border: none; min-height: 2px; }
+    .study-progress progress { background: #3b82f6; border: none; min-height: 2px; }
+    .home-action-btn { background: rgba(16, 27, 44, 0.85); border: 1px solid rgba(96, 165, 250, 0.25);
+                       border-radius: 10px; padding: 12px 18px; min-width: 155px; box-shadow: none; }
+    .home-action-btn:hover { background: rgba(37, 99, 235, 0.25); border-color: rgba(96, 165, 250, 0.55); }
+    .home-action-icon { font-size: 24px; }
+    .home-action-title { font-family: Inter, sans-serif; font-size: 12.5px; font-weight: 700; color: #e2e8f0; }
+    .home-action-sub { font-family: Inter, sans-serif; font-size: 10px; color: #94a3b8; }
+    .home-chip { background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(148, 163, 184, 0.16);
+                 border-radius: 14px; padding: 2px 10px; box-shadow: none; }
+    .home-chip:hover { background: rgba(59, 130, 246, 0.22); border-color: rgba(96, 165, 250, 0.45); }
+    .home-chip label { font-family: Inter, sans-serif; font-size: 11px; font-weight: 600; color: #93c5fd; }
     .topbar-stat { font-family: Inter, sans-serif; font-size: 11px; font-weight: 600;
                    color: #94a3b8; background: rgba(15, 23, 42, 0.7);
                    border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 5px;
@@ -5330,18 +5354,18 @@ def show_study_window(parent=None, end_ts=None):
     win.connect("delete-event", lambda *_: True)  # Alt+F4 blocked
 
     outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-    bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
     bar.get_style_context().add_class("studybar")
 
     sidebar_toggle_btn = Gtk.Button(label="☰")
     sidebar_toggle_btn.get_style_context().add_class("topbar-btn")
-    sidebar_toggle_btn.set_size_request(32, 26)
+    sidebar_toggle_btn.set_size_request(28, 26)
     sidebar_toggle_btn.set_tooltip_text("Toggle Sidebar (Ctrl+B)")
     bar.pack_start(sidebar_toggle_btn, False, False, 0)
 
     clock_lbl = Gtk.Label(label=time.strftime("🕒 %I:%M:%S %p"))
     clock_lbl.get_style_context().add_class("topbar-clock")
-    clock_lbl.set_size_request(118, 26)
+    clock_lbl.set_size_request(105, 26)
     clock_lbl.set_xalign(0.5)
     clock_lbl.set_yalign(0.5)
     clock_lbl.set_tooltip_text(time.strftime("%A, %d %B %Y"))
@@ -5349,7 +5373,7 @@ def show_study_window(parent=None, end_ts=None):
 
     time_lbl = Gtk.Label(label="")
     time_lbl.get_style_context().add_class("topbar-timer")
-    time_lbl.set_size_request(118, 26)
+    time_lbl.set_size_request(105, 26)
     time_lbl.set_xalign(0.5)
     time_lbl.set_yalign(0.5)
     bar.pack_start(time_lbl, False, False, 0)
@@ -5357,12 +5381,36 @@ def show_study_window(parent=None, end_ts=None):
     extend_btn = Gtk.Button(label="➕ Extend")
     extend_btn.get_style_context().add_class("topbar-btn")
     extend_btn.get_style_context().add_class("extend-btn")
-    extend_btn.set_size_request(74, 26)
+    extend_btn.set_size_request(68, 26)
     extend_btn.set_tooltip_text("Extend lockout duration (3 days / 7 days)")
     bar.pack_start(extend_btn, False, False, 0)
 
+    nav_back_btn = Gtk.Button(label="◀")
+    nav_back_btn.get_style_context().add_class("topbar-btn")
+    nav_back_btn.get_style_context().add_class("topbar-nav-btn")
+    nav_back_btn.set_size_request(26, 26)
+    nav_back_btn.set_tooltip_text("Back (Alt+Left)")
+    nav_back_btn.set_sensitive(False)
+    bar.pack_start(nav_back_btn, False, False, 0)
+
+    nav_fwd_btn = Gtk.Button(label="▶")
+    nav_fwd_btn.get_style_context().add_class("topbar-btn")
+    nav_fwd_btn.get_style_context().add_class("topbar-nav-btn")
+    nav_fwd_btn.set_size_request(26, 26)
+    nav_fwd_btn.set_tooltip_text("Forward (Alt+Right)")
+    nav_fwd_btn.set_sensitive(False)
+    bar.pack_start(nav_fwd_btn, False, False, 0)
+
+    nav_reload_btn = Gtk.Button(label="↻")
+    nav_reload_btn.get_style_context().add_class("topbar-btn")
+    nav_reload_btn.get_style_context().add_class("topbar-nav-btn")
+    nav_reload_btn.set_size_request(26, 26)
+    nav_reload_btn.set_tooltip_text("Reload Page (F5)")
+    nav_reload_btn.set_sensitive(False)
+    bar.pack_start(nav_reload_btn, False, False, 0)
+
     address_entry = Gtk.Entry()
-    address_entry.set_width_chars(16)
+    address_entry.set_width_chars(14)
     address_entry.set_hexpand(True)
     address_entry.set_placeholder_text("🌐 Enter website address or YouTube video URL/ID…")
     address_entry.set_tooltip_text(
@@ -5372,32 +5420,32 @@ def show_study_window(parent=None, end_ts=None):
 
     open_edge_btn = Gtk.Button(label="↗ Edge")
     open_edge_btn.get_style_context().add_class("topbar-btn")
-    open_edge_btn.set_size_request(62, 26)
+    open_edge_btn.set_size_request(58, 26)
     open_edge_btn.set_tooltip_text("Open current website in external Microsoft Edge")
     bar.pack_start(open_edge_btn, False, False, 0)
 
     usb_import_btn = Gtk.Button(label="📂 Open")
     usb_import_btn.get_style_context().add_class("topbar-btn")
-    usb_import_btn.set_size_request(66, 26)
+    usb_import_btn.set_size_request(58, 26)
     usb_import_btn.set_tooltip_text(
         "Open a PDF, image, or video directly")
     bar.pack_start(usb_import_btn, False, False, 0)
 
     add_kw_btn = Gtk.Button(label="🛡️ +Word")
     add_kw_btn.get_style_context().add_class("topbar-btn")
-    add_kw_btn.set_size_request(76, 26)
+    add_kw_btn.set_size_request(68, 26)
     add_kw_btn.set_tooltip_text("Add blocked keyword")
     bar.pack_start(add_kw_btn, False, False, 0)
 
     history_btn = Gtk.Button(label="📋 History")
     history_btn.get_style_context().add_class("topbar-btn")
-    history_btn.set_size_request(74, 26)
+    history_btn.set_size_request(68, 26)
     history_btn.set_tooltip_text("Open reading history log")
     bar.pack_start(history_btn, False, False, 0)
 
     split_btn = Gtk.Button(label="◫ Split")
     split_btn.get_style_context().add_class("topbar-btn")
-    split_btn.set_size_request(60, 26)
+    split_btn.set_size_request(56, 26)
     split_btn.set_tooltip_text("Show two study pages side by side")
     bar.pack_start(split_btn, False, False, 0)
 
@@ -5408,23 +5456,36 @@ def show_study_window(parent=None, end_ts=None):
 
     recent_btn = Gtk.Button(label="🕒 Recent ▾")
     recent_btn.get_style_context().add_class("topbar-btn")
-    recent_btn.set_size_request(78, 26)
+    recent_btn.set_size_request(68, 26)
     recent_btn.set_tooltip_text("Click to show recently visited sites and documents")
     bar.pack_start(recent_btn, False, False, 0)
 
     battery_lbl = Gtk.Label(label="🔋 —")
     battery_lbl.get_style_context().add_class("topbar-stat")
-    battery_lbl.set_size_request(62, 26)
+    battery_lbl.set_size_request(56, 26)
     battery_lbl.set_tooltip_text("Live battery charge")
     bar.pack_start(battery_lbl, False, False, 0)
 
     block_counter_btn = Gtk.Button(label="🛡️ 0/10")
     block_counter_btn.get_style_context().add_class("blockcountbtn")
     block_counter_btn.get_style_context().add_class("blockcount-clean")
-    block_counter_btn.set_size_request(66, 26)
+    block_counter_btn.set_size_request(60, 26)
     block_counter_btn.set_tooltip_text(
         "Keyword blocks in last 5 minutes: 0/10. Reaching 10 blocks suspends Study Mode for 30 minutes.")
     bar.pack_start(block_counter_btn, False, False, 0)
+
+    exit_btn = Gtk.Button(label="🚪 Exit")
+    exit_btn.get_style_context().add_class("topbar-btn")
+    exit_btn.get_style_context().add_class("topbar-exit-btn")
+    exit_btn.set_size_request(58, 26)
+    exit_btn.set_tooltip_text("Exit Study Mode (Requires confirmation or returning to lockout)")
+    bar.pack_start(exit_btn, False, False, 0)
+
+    top_progress = Gtk.ProgressBar()
+    top_progress.get_style_context().add_class("study-progress")
+    top_progress.set_size_request(-1, 2)
+    top_progress.set_no_show_all(True)
+    top_progress.hide()
 
     right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
     side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
@@ -5740,6 +5801,41 @@ def show_study_window(parent=None, end_ts=None):
     web_host.pack_start(web_stack, True, True, 0)
     web_tabs = []
     doc_state = {"active": False, "title": "", "icon": "📄"}
+
+    def _get_active_tab():
+        if stack.get_visible_child_name() == "web":
+            active_name = web_stack.get_visible_child_name()
+            for t in web_tabs:
+                if t["name"] == active_name:
+                    return t
+        return None
+
+    def _update_nav_buttons():
+        t = _get_active_tab()
+        if t and t.get("view"):
+            v = t["view"]
+            nav_back_btn.set_sensitive(bool(v.can_go_back()))
+            nav_fwd_btn.set_sensitive(bool(v.can_go_forward()))
+            nav_reload_btn.set_sensitive(True)
+        else:
+            nav_back_btn.set_sensitive(False)
+            nav_fwd_btn.set_sensitive(False)
+            nav_reload_btn.set_sensitive(False)
+
+    nav_back_btn.connect("clicked", lambda *_: _get_active_tab()["view"].go_back() if (_get_active_tab() and _get_active_tab()["view"].can_go_back()) else None)
+    nav_fwd_btn.connect("clicked", lambda *_: _get_active_tab()["view"].go_forward() if (_get_active_tab() and _get_active_tab()["view"].can_go_forward()) else None)
+    nav_reload_btn.connect("clicked", lambda *_: _get_active_tab()["view"].reload() if _get_active_tab() else None)
+
+    def _on_load_progress(view):
+        try:
+            p = view.get_estimated_load_progress()
+            top_progress.set_fraction(p)
+            if p >= 1.0:
+                GLib.timeout_add(300, lambda: (top_progress.hide(), False)[1])
+        except Exception:
+            pass
+
+    stack.connect("notify::visible-child-name", lambda *_: _update_nav_buttons())
 
     group_ui_state = {"active": False}
 
@@ -6372,10 +6468,12 @@ def show_study_window(parent=None, end_ts=None):
                 except Exception:
                     pass
                 icon = "⚡" if "charg" in status else "🔋"
+                battery_lbl.set_tooltip_text(f"Battery: {percent}% ({status or 'on battery'})")
                 return f"{icon} {percent}%"
             except (OSError, ValueError):
                 continue
-        return "🔋 N/A"
+        battery_lbl.set_tooltip_text("Power: AC mains connected (No battery detected)")
+        return "⚡ AC"
 
     def _refresh_battery():
         try:
@@ -6745,26 +6843,76 @@ def show_study_window(parent=None, end_ts=None):
     except Exception:
         pass
 
-    # ---- home (bismillah) ----
-    home = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+    # ---- home (bismillah & study dashboard) ----
+    home = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
     home.set_valign(Gtk.Align.CENTER)
     home.set_halign(Gtk.Align.CENTER)
     home.get_style_context().add_class("homepage")
+
     bism = Gtk.Label()
-    bism.set_markup('<span font_family="Amiri" size="52000" foreground="#e8eefc">'
+    bism.set_markup('<span font_family="Amiri" size="50000" foreground="#e8eefc">'
                     '\u0628\u0650\u0633\u0652\u0645\u0650 \u0627\u0644\u0644\u064e\u0651\u0647\u0650 '
                     '\u0627\u0644\u0631\u064e\u0651\u062d\u0652\u0645\u064e\u0670\u0646\u0650 '
                     '\u0627\u0644\u0631\u064e\u0651\u062d\u0650\u064a\u0645\u0650</span>')
     bism.set_halign(Gtk.Align.CENTER)
     home.pack_start(bism, False, False, 0)
-    flavor = Gtk.Label()
-    flavor.set_markup('<span font_family="Amiri" size="20000" foreground="#9cb3d9">'
-                      '\u0628\u0650\u0633\u0652\u0645\u0650 \u0627\u0644\u0644\u064e\u0651\u0647\u0650 '
-                      '\u0627\u0644\u0631\u064e\u0651\u062d\u0652\u0645\u064e\u0670\u0646\u0650 '
-                      '\u0627\u0644\u0631\u064e\u0651\u062d\u0650\u064a\u0645\u0650</span>')
-    flavor.set_opacity(0.55)
-    flavor.set_halign(Gtk.Align.CENTER)
-    home.pack_start(flavor, False, False, 0)
+
+    subhead = Gtk.Label()
+    subhead.set_markup('<span font_family="Inter, sans-serif" size="11500" font_weight="bold" foreground="#93c5fd">'
+                       'Distraction-free Study Workspace · Focused Learning</span>')
+    subhead.set_halign(Gtk.Align.CENTER)
+    home.pack_start(subhead, False, False, 0)
+
+    home_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+    home_actions.set_halign(Gtk.Align.CENTER)
+    home_actions.set_margin_top(14)
+    home_actions.set_margin_bottom(8)
+
+    def _make_home_action(icon_str, title_str, subtitle_str, callback):
+        btn = Gtk.Button()
+        btn.get_style_context().add_class("home-action-btn")
+        ibox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        ic = Gtk.Label(label=icon_str)
+        ic.get_style_context().add_class("home-action-icon")
+        t = Gtk.Label(label=title_str)
+        t.get_style_context().add_class("home-action-title")
+        s = Gtk.Label(label=subtitle_str)
+        s.get_style_context().add_class("home-action-sub")
+        ibox.pack_start(ic, False, False, 0)
+        ibox.pack_start(t, False, False, 0)
+        ibox.pack_start(s, False, False, 0)
+        btn.add(ibox)
+        btn.connect("clicked", lambda *_: callback())
+        return btn
+
+    def _on_home_browse():
+        address_entry.grab_focus()
+        _toast("Enter a website URL in the address bar above")
+
+    btn_web = _make_home_action("🌐", "Browse Study Web", "Enter any study website", _on_home_browse)
+    btn_file = _make_home_action("📂", "Open Material", "PDF, image, or video", lambda: usb_import_btn.emit("clicked"))
+    btn_hist = _make_home_action("📋", "Reading History", "View recent reading logs", lambda: history_btn.emit("clicked"))
+
+    home_actions.pack_start(btn_web, False, False, 0)
+    home_actions.pack_start(btn_file, False, False, 0)
+    home_actions.pack_start(btn_hist, False, False, 0)
+    home.pack_start(home_actions, False, False, 0)
+
+    quick_links = cfg.get("links", [])
+    if quick_links:
+        chips_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        chips_box.set_halign(Gtk.Align.CENTER)
+        chips_box.set_margin_top(4)
+        for ql in quick_links[:5]:
+            q_title = ql.get("title", "Link")
+            q_url = ql.get("url", "")
+            chip = Gtk.Button(label=f"↗ {q_title}")
+            chip.get_style_context().add_class("home-chip")
+            chip.set_tooltip_text(f"{q_title}\n{q_url}")
+            chip.connect("clicked", lambda _b, u=q_url, t=q_title: _load_link(u, title=t))
+            chips_box.pack_start(chip, False, False, 0)
+        home.pack_start(chips_box, False, False, 0)
+
     stack.add_named(home, "home")
 
     # ---- PDF / image reader with annotation layer ----
@@ -8317,16 +8465,104 @@ def show_study_window(parent=None, end_ts=None):
     def _has_loading_web_tabs(exclude=None):
         return any(t is not exclude and t.get("loading") for t in web_tabs)
 
-    def _on_tab_load_failed(tab, _view, _event, failing_uri, error):
+    def _on_tab_title(tab_obj, view_obj):
+        try:
+            t = view_obj.get_title()
+            if t and t.strip():
+                tab_obj["title"] = t.strip()
+                _render_dock()
+        except Exception:
+            pass
+
+    def _on_tab_uri(tab_obj, view_obj):
+        try:
+            u = view_obj.get_uri()
+            if u and not u.startswith("about:"):
+                tab_obj["url"] = u
+                if (stack.get_visible_child_name() == "web"
+                        and web_stack.get_visible_child_name() == tab_obj["name"]):
+                    address_entry.set_text(u)
+                    _update_nav_buttons()
+        except Exception:
+            pass
+
+    def _on_tab_load_failed(tab, view, _event, failing_uri, error):
         tab["loading"] = False
+        top_progress.hide()
         if not _has_loading_web_tabs():
             _hide_loading()
         print(f"website load failed: {failing_uri}: {error}", flush=True)
         if (stack.get_visible_child_name() == "web"
                 and web_stack.get_visible_child_name() == tab["name"]):
-            _toast("Website could not load. Check the address or internet connection, then retry.")
+            _toast("Website could not load. Check the address or network connection.")
+        if failing_uri and not failing_uri.startswith("about:"):
+            escaped_uri = html.escape(failing_uri)
+            err_msg = getattr(error, 'message', str(error))
+            escaped_err = html.escape(str(err_msg))
+            err_html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body {{
+    background-color: #0b1220;
+    color: #e2e8f0;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    margin: 0;
+    text-align: center;
+  }}
+  .card {{
+    background: #101b2c;
+    border: 1px solid rgba(148, 163, 184, 0.2);
+    border-radius: 12px;
+    padding: 32px 40px;
+    max-width: 500px;
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+  }}
+  .icon {{ font-size: 42px; margin-bottom: 14px; }}
+  h2 {{ margin: 0 0 12px 0; font-size: 20px; color: #f87171; font-weight: 700; }}
+  p {{ margin: 0 0 16px 0; font-size: 13px; color: #94a3b8; line-height: 1.5; }}
+  .uri {{ font-family: monospace; font-size: 11.5px; color: #93c5fd; background: rgba(30, 58, 138, 0.35);
+          padding: 6px 12px; border-radius: 6px; word-break: break-all; margin-bottom: 16px; display: inline-block; }}
+  .err-detail {{ font-size: 11px; color: #64748b; margin-bottom: 22px; }}
+  .btn {{
+    background: #2563eb;
+    color: #ffffff;
+    border: none;
+    border-radius: 6px;
+    padding: 9px 24px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    text-decoration: none;
+    display: inline-block;
+  }}
+  .btn:hover {{ background: #1d4ed8; }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">⚠️</div>
+    <h2>Unable to Load Website</h2>
+    <div class="uri">{escaped_uri}</div>
+    <p>The page could not be reached. Please check the website address or internet connection.</p>
+    <div class="err-detail">{escaped_err}</div>
+    <a class="btn" href="{escaped_uri}">↻ Try Again</a>
+  </div>
+</body>
+</html>"""
+            try:
+                view.load_html(err_html, failing_uri)
+            except Exception:
+                pass
         _render_dock()
-        return False
+        _update_nav_buttons()
+        return True
 
     def _create_web_tab(url, main=False):
         if main:
@@ -8357,26 +8593,6 @@ def show_study_window(parent=None, end_ts=None):
             scroll.add(view)
             wrap = Gtk.Overlay()
             wrap.add(scroll)
-            nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-            nav.get_style_context().add_class("floatbar")
-            nav.set_halign(Gtk.Align.END)
-            nav.set_valign(Gtk.Align.START)
-            nav.set_margin_top(10)
-            nav.set_margin_end(12)
-            back_b = Gtk.Button(label="‹")
-            fwd_b = Gtk.Button(label="›")
-            for nav_btn in (back_b, fwd_b):
-                nav_btn.get_style_context().add_class("floatbtn")
-                nav_btn.get_style_context().add_class("webnavbtn")
-                nav_btn.set_size_request(30, 30)
-                nav.pack_start(nav_btn, False, False, 0)
-            back_b.set_tooltip_text("Back")
-            fwd_b.set_tooltip_text("Forward")
-            back_b.connect("clicked", lambda *_: view.go_back()
-                           if view.can_go_back() else None)
-            fwd_b.connect("clicked", lambda *_: view.go_forward()
-                          if view.can_go_forward() else None)
-            wrap.add_overlay(nav)
             web_stack.add_named(wrap, name)
             wrap.show_all()
             view.connect("authenticate", _on_web_authenticate)
@@ -8391,6 +8607,12 @@ def show_study_window(parent=None, end_ts=None):
             view.connect("load-failed",
                          lambda v, ev, uri, err: _on_tab_load_failed(
                              tab, v, ev, uri, err))
+            view.connect("notify::estimated-load-progress",
+                         lambda v, _p: _on_load_progress(v))
+            view.connect("notify::title",
+                         lambda v, _p, t=tab: _on_tab_title(t, v))
+            view.connect("notify::uri",
+                         lambda v, _p, t=tab: _on_tab_uri(t, v))
         tab = {"id": name, "name": name, "view": view, "wrap": wrap,
                "url": url, "title": "", "minimized": False, "main": main,
                "loading": False}
@@ -8399,6 +8621,12 @@ def show_study_window(parent=None, end_ts=None):
                 view.connect("load-changed", lambda _v, ev: _on_tab_load(tab, ev))
                 view.connect("load-failed", lambda v, ev, uri, err: _on_tab_load_failed(
                     tab, v, ev, uri, err))
+                view.connect("notify::estimated-load-progress",
+                             lambda v, _p: _on_load_progress(v))
+                view.connect("notify::title",
+                             lambda v, _p, t=tab: _on_tab_title(t, v))
+                view.connect("notify::uri",
+                             lambda v, _p, t=tab: _on_tab_uri(t, v))
             except Exception:
                 pass
         web_tabs.append(tab)
@@ -8413,7 +8641,10 @@ def show_study_window(parent=None, end_ts=None):
                         and web_stack.get_visible_child_name() == tab["name"]):
                     if tab["url"] and not tab["url"].startswith("about:"):
                         address_entry.set_text(tab["url"])
+                top_progress.show()
+                top_progress.set_fraction(0.1)
                 _show_loading()
+                _update_nav_buttons()
             elif event == WebKit2.LoadEvent.FINISHED:
                 tab["loading"] = False
                 tab["url"] = tab["view"].get_uri() or tab["url"]
@@ -8424,10 +8655,13 @@ def show_study_window(parent=None, end_ts=None):
                 title = tab["view"].get_title()
                 if title:
                     tab["title"] = title
+                top_progress.set_fraction(1.0)
+                GLib.timeout_add(300, lambda: (top_progress.hide(), False)[1])
                 if not _has_loading_web_tabs():
                     _hide_loading()
                 _record_recent_website(tab["url"], title)
                 _render_dock()
+                _update_nav_buttons()
         except Exception as e:
             print(f"tab load event error: {e}", flush=True)
 
@@ -8617,46 +8851,64 @@ def show_study_window(parent=None, end_ts=None):
             _toast(f"⛔ Blocked explicit keyword: {hit}")
             return
 
-        # 2. Check if input is a YouTube video link or 11-char video ID
+        # 2. Check if search query was attempted (spaces in input)
+        if " " in raw:
+            _toast("Search engines are disabled in Study Mode. Enter a website address (e.g. en.wikipedia.org).")
+            return
+
+        # 3. Check YouTube video link or 11-char video ID
         vid = _youtube_video_id(raw)
-        if not vid and re.fullmatch(r"[A-Za-z0-9_-]{11}", raw):
+        if not vid and re.fullmatch(r"[A-Za-z0-9_-]{11}", raw) and "." not in raw:
             vid = raw
+
+        if vid and ("youtube" in raw or "youtu.be" in raw or "." not in raw):
+            _play_youtube_native(vid, raw)
+            return
 
         target_url = raw if "://" in raw else "https://" + raw
         parsed = urlparse(target_url)
         host = (parsed.hostname or "").lower()
 
+        # 4. Check for full YouTube browsing attempt
         if _is_youtube_host(host):
             if vid:
                 _play_youtube_native(vid, raw)
                 return
             else:
-                _toast("Blocked: Full YouTube browsing is disabled. Only specific video links work.")
+                _toast("Blocked: Full YouTube browsing is disabled. Only specific video links or IDs work.")
                 return
 
-        if vid and ("youtube" in raw or "youtu.be" in raw):
-            _play_youtube_native(vid, raw)
-            return
+        # 5. Check if domain name is missing or single word
+        if not host or "." not in host:
+            shortcuts = {
+                "wikipedia": "https://en.wikipedia.org",
+                "anki": "https://ankiweb.net",
+                "quran": "https://quran.com",
+                "hadith": "https://ihadis.com",
+                "pubmed": "https://pubmed.ncbi.nlm.nih.gov",
+                "medbullets": "https://medbullets.com",
+            }
+            if host in shortcuts:
+                target_url = shortcuts[host]
+                parsed = urlparse(target_url)
+                host = (parsed.hostname or "").lower()
+            else:
+                _toast(f"Please enter a complete website address with a domain (e.g. {host or 'site'}.org or .com)")
+                return
 
-        # 3. Check website scheme
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        # 6. Check scheme
+        if parsed.scheme not in ("http", "https"):
             _toast("Enter a website address starting with http:// or https://")
             return
 
-        # 4. Check blocked categories: search engines, social media, adult domains
+        # 7. Check blocked categories (search engines, social media, adult domains)
         if _host_blocked(host):
-            _toast("Blocked: Search engines, social media, and adult sites are disabled")
+            _toast(f"Blocked: {host} — search engines, social media, and adult sites are disabled.")
             return
 
-        # 5. Open allowed website inside Study Mode web stack
+        # 8. Open allowed website inside Study Mode web stack
         entry.set_text(target_url)
-        active_tab = None
-        if stack.get_visible_child_name() == "web":
-            active_name = web_stack.get_visible_child_name()
-            for t in web_tabs:
-                if t["name"] == active_name:
-                    active_tab = t
-                    break
+        active_tab = _get_active_tab()
         if active_tab is not None:
             active_tab["url"] = target_url
             active_tab["title"] = host
@@ -8666,6 +8918,7 @@ def show_study_window(parent=None, end_ts=None):
             except Exception as e:
                 print(f"tab load error: {e}", flush=True)
             _render_dock()
+            _update_nav_buttons()
         else:
             _open_web_url(target_url, force_new=False, title=host)
 
@@ -8740,9 +8993,10 @@ def show_study_window(parent=None, end_ts=None):
         except Exception as e:
             print(f"tab load error: {e}", flush=True)
         _render_dock()
+        _update_nav_buttons()
         return tab
 
-    def _load_link(url):
+    def _load_link(url, title=""):
         url_clean = str(url or "").strip().lower()
         if (url_clean in ("tg-materials", "pdf-materials", "pdf materials (cloud)", "pdf materials cloud")
                 or "telegram-materials" in url_clean
@@ -8756,9 +9010,9 @@ def show_study_window(parent=None, end_ts=None):
             _open_web_url(b_target, title="Biprova 20")
             return
         if url.startswith("file://"):
-            _open_web_url(url)
+            _open_web_url(url, title=title)
             return
-        _open_web_url(url)
+        _open_web_url(url, title=title)
 
     def _make_side_btn(icon_text, tooltip, on_click):
         btn = Gtk.Button()
@@ -8779,7 +9033,7 @@ def show_study_window(parent=None, end_ts=None):
     for item in cfg.get("links", []):
         t = str(item.get("title", "Link"))
         u = str(item.get("url", ""))
-        b = _make_side_btn(f"↗  {t}", f"{t}\n{u}", lambda _b, target=u: _load_link(target))
+        b = _make_side_btn(f"↗  {t}", f"{t}\n{u}", lambda _b, target=u, title=t: _load_link(target, title=title))
         links_box.pack_start(b, False, False, 0)
 
 
@@ -8922,6 +9176,7 @@ def show_study_window(parent=None, end_ts=None):
     side.pack_start(back_btn, False, False, 2)
 
     right.pack_start(bar, False, False, 0)
+    right.pack_start(top_progress, False, False, 0)
     right.pack_start(telegram_header, False, False, 0)
     right.pack_start(stack_wrap, True, True, 0)
     outer.pack_start(side, False, False, 0)
@@ -9193,6 +9448,56 @@ def show_study_window(parent=None, end_ts=None):
                 pass
         win.destroy()
 
+    def _on_exit_study_clicked(*_):
+        is_lockout = (_study_parent is not None) or _is_lockout_active() or (_load_suspend_state() > time.time())
+        if is_lockout:
+            dlg = Gtk.Dialog(title="Exit Study Mode", transient_for=win, flags=Gtk.DialogFlags.MODAL)
+            dlg.set_keep_above(True)
+            box = dlg.get_content_area()
+            box.set_spacing(12)
+            box.set_margin_top(16); box.set_margin_bottom(16)
+            box.set_margin_start(20); box.set_margin_end(20)
+
+            t = Gtk.Label(label="<b>Focus Lockout In Progress</b>")
+            t.set_use_markup(True)
+            t.set_halign(Gtk.Align.START)
+            m = Gtk.Label(label="A scheduled lockout is currently active.\nChoose an action:")
+            m.set_halign(Gtk.Align.START)
+            box.pack_start(t, False, False, 0)
+            box.pack_start(m, False, False, 0)
+
+            dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            dlg.add_button("Return to Lockout Screen", Gtk.ResponseType.OK)
+            btn_admin = dlg.add_button("Admin Emergency Unlock", Gtk.ResponseType.APPLY)
+            btn_admin.get_style_context().add_class("btn-danger")
+            dlg.show_all()
+
+            resp = dlg.run()
+            dlg.destroy()
+
+            if resp == Gtk.ResponseType.OK:
+                _on_back_clicked()
+            elif resp == Gtk.ResponseType.APPLY:
+                if confirm_dialog(win, "Admin Emergency Unlock", "Emergency Administrator Exit",
+                                  "Enter system (sudo) password to abort the lockout and return to desktop:",
+                                  "Unlock & Exit", danger=True, passcode="verify"):
+                    _clear_suspend_state()
+                    _clear_lockout_schedule()
+                    if _study_parent is not None:
+                        try:
+                            _study_parent.destroy()
+                        except Exception:
+                            pass
+                    win.destroy()
+        else:
+            if end_ts and time.time() >= end_ts:
+                _on_back_clicked()
+            else:
+                if confirm_dialog(win, "Exit Study Mode", "Exit Study Mode?",
+                                  "Are you sure you want to exit Study Mode and return to your desktop?",
+                                  "🚪 Exit", danger=False):
+                    _on_back_clicked()
+
     def _handle_key(kv, state_mask):
         try:
             st = state_mask
@@ -9202,7 +9507,9 @@ def show_study_window(parent=None, end_ts=None):
                 if stack.get_visible_child_name() == "player":
                     _close_player()
                     return True
-                _on_back_clicked()
+                if recent_panel and recent_panel.get_visible():
+                    _hide_recent_panel()
+                    return True
                 return True
             if (ctrl and kv in (Gdk.KEY_b, Gdk.KEY_B)) or kv == Gdk.KEY_F9:
                 _toggle_sidebar()
@@ -9277,7 +9584,8 @@ def show_study_window(parent=None, end_ts=None):
     for _kw in [canvas, img_scroll, floatbar, *floatbar.get_children()]:
         _kw.connect("key-press-event", _on_key)
 
-    back_btn.connect("clicked", _on_back_clicked)
+    exit_btn.connect("clicked", _on_exit_study_clicked)
+    back_btn.connect("clicked", _on_exit_study_clicked)
 
     def _get_current_lockout_info():
         nonlocal end_ts
@@ -9493,6 +9801,12 @@ def show_study_window(parent=None, end_ts=None):
         auto = _study_auto_closing
         if state.get("path") and str(state["path"]).lower().endswith(".pdf"):
             _save_reading_page(state["path"], state["page"])
+        if _study_shell_saved and _study_parent is None and not _is_lockout_active():
+            try:
+                _gnome_restore(_study_shell_saved)
+            except Exception as _e:
+                print(f"study desktop restore: {_e}", flush=True)
+            _study_shell_saved = None
         _study_win = None
         if not auto and _study_parent is not None:
             try:
@@ -9510,6 +9824,7 @@ def show_study_window(parent=None, end_ts=None):
     def _on_study_mapped(*_a):
         _touch_study_active()
         _clear_study_starting()
+        _update_nav_buttons()
         return False
     win.connect("map-event", _on_study_mapped)
     win.show_all()
