@@ -780,7 +780,10 @@ export default class FocusLockoutExtension extends Extension {
                 return false;
             const ts = Number(new TextDecoder().decode(bytes).trim());
             const age = Date.now() / 1000 - ts;
-            return Number.isFinite(ts) && age >= 0 && age < 6;
+            // GTK/WebKit can briefly stall its main loop while a page starts.
+            // Allow missed heartbeat ticks so the lockout overlay does not
+            // flash over a still-open Study window.
+            return Number.isFinite(ts) && age >= 0 && age < 30;
         } catch (_) {
             return false;
         }
@@ -801,7 +804,9 @@ export default class FocusLockoutExtension extends Extension {
                 return false;
             const ts = Number(new TextDecoder().decode(bytes).trim());
             const age = Date.now() / 1000 - ts;
-            return Number.isFinite(ts) && age >= 0 && age < 30;
+            // Study startup includes GTK/WebKit initialization and may exceed
+            // 30 seconds on slower systems. Keep the overlay until map/failure.
+            return Number.isFinite(ts) && age >= 0 && age < 120;
         } catch (_) {
             return false;
         }

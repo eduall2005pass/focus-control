@@ -49,7 +49,7 @@ try:
 except Exception:  # WebKit not available -> study view disabled, app still runs
     WebKit2 = None
 
-FOCUS_VERSION = "2.0.42"
+FOCUS_VERSION = "2.0.43"
 
 FOCUS_MINUTES = 10
 SUSPEND_MINUTES = 30
@@ -5433,13 +5433,17 @@ def show_study_window(parent=None, end_ts=None):
     side.set_halign(Gtk.Align.START)
     side.get_style_context().add_class("sidebar")
 
+    sidebar_state = {"visible": True}
+
     def _toggle_sidebar(*_):
         if side.get_visible():
             side.hide()
+            sidebar_state["visible"] = False
             sidebar_toggle_btn.set_label("☰")
             sidebar_toggle_btn.set_tooltip_text("Show Sidebar (Ctrl+B)")
         else:
             side.show_all()
+            sidebar_state["visible"] = True
             sidebar_toggle_btn.set_label("◧")
             sidebar_toggle_btn.set_tooltip_text("Hide Sidebar (Ctrl+B)")
 
@@ -5752,7 +5756,10 @@ def show_study_window(parent=None, end_ts=None):
         else:
             telegram_header.hide()
             telegram_header.set_no_show_all(True)
-            side.show_all()
+            if sidebar_state.get("visible", True):
+                side.show_all()
+            else:
+                side.hide()
             bar.show_all()
 
     def _leave_group_view(*_):
@@ -8063,7 +8070,7 @@ def show_study_window(parent=None, end_ts=None):
                 if tab["view"].get_title():
                     tab["title"] = tab["view"].get_title()
                 row = _new_dock_row(
-                    _tab_icon(url, tab.get("title", "")),
+                    "⏳" if tab.get("loading") else _tab_icon(url, tab.get("title", "")),
                     _tab_label(tab),
                     bool(active_web == tab["name"]),
                     lambda t=tab: _show_tab(t),
@@ -8307,6 +8314,20 @@ def show_study_window(parent=None, end_ts=None):
         _popup_seen[uri] = now
         _open_web_url(uri, force_new=True, allow_special=True)
 
+    def _has_loading_web_tabs(exclude=None):
+        return any(t is not exclude and t.get("loading") for t in web_tabs)
+
+    def _on_tab_load_failed(tab, _view, _event, failing_uri, error):
+        tab["loading"] = False
+        if not _has_loading_web_tabs():
+            _hide_loading()
+        print(f"website load failed: {failing_uri}: {error}", flush=True)
+        if (stack.get_visible_child_name() == "web"
+                and web_stack.get_visible_child_name() == tab["name"]):
+            _toast("Website could not load. Check the address or internet connection, then retry.")
+        _render_dock()
+        return False
+
     def _create_web_tab(url, main=False):
         if main:
             name = "web-main"
@@ -8367,14 +8388,26 @@ def show_study_window(parent=None, end_ts=None):
             view.connect("create", lambda _v, nav_a: _tab_create(view, nav_a))
             view.connect("load-changed",
                          lambda _v, ev: _on_tab_load(tab, ev))
+            view.connect("load-failed",
+                         lambda v, ev, uri, err: _on_tab_load_failed(
+                             tab, v, ev, uri, err))
         tab = {"id": name, "name": name, "view": view, "wrap": wrap,
-               "url": url, "title": "", "minimized": False, "main": main}
+               "url": url, "title": "", "minimized": False, "main": main,
+               "loading": False}
+        if main:
+            try:
+                view.connect("load-changed", lambda _v, ev: _on_tab_load(tab, ev))
+                view.connect("load-failed", lambda v, ev, uri, err: _on_tab_load_failed(
+                    tab, v, ev, uri, err))
+            except Exception:
+                pass
         web_tabs.append(tab)
         return tab
 
     def _on_tab_load(tab, event):
         try:
             if event == WebKit2.LoadEvent.STARTED:
+                tab["loading"] = True
                 tab["url"] = tab["view"].get_uri() or tab["url"]
                 if (stack.get_visible_child_name() == "web"
                         and web_stack.get_visible_child_name() == tab["name"]):
@@ -8382,6 +8415,7 @@ def show_study_window(parent=None, end_ts=None):
                         address_entry.set_text(tab["url"])
                 _show_loading()
             elif event == WebKit2.LoadEvent.FINISHED:
+                tab["loading"] = False
                 tab["url"] = tab["view"].get_uri() or tab["url"]
                 if (stack.get_visible_child_name() == "web"
                         and web_stack.get_visible_child_name() == tab["name"]):
@@ -8390,7 +8424,8 @@ def show_study_window(parent=None, end_ts=None):
                 title = tab["view"].get_title()
                 if title:
                     tab["title"] = title
-                _hide_loading()
+                if not _has_loading_web_tabs():
+                    _hide_loading()
                 _record_recent_website(tab["url"], title)
                 _render_dock()
         except Exception as e:
@@ -8572,7 +8607,6 @@ def show_study_window(parent=None, end_ts=None):
         raw = (entry.get_text() or "").strip()
         if not raw:
             return
-        entry.set_text("")
 
         # 1. Check explicit keyword filter
         hit = _explicit_hit(raw)
@@ -8615,7 +8649,25 @@ def show_study_window(parent=None, end_ts=None):
             return
 
         # 5. Open allowed website inside Study Mode web stack
-        _open_web_url(target_url, force_new=False, title=host)
+        entry.set_text(target_url)
+        active_tab = None
+        if stack.get_visible_child_name() == "web":
+            active_name = web_stack.get_visible_child_name()
+            for t in web_tabs:
+                if t["name"] == active_name:
+                    active_tab = t
+                    break
+        if active_tab is not None:
+            active_tab["url"] = target_url
+            active_tab["title"] = host
+            _show_loading()
+            try:
+                active_tab["view"].load_uri(target_url)
+            except Exception as e:
+                print(f"tab load error: {e}", flush=True)
+            _render_dock()
+        else:
+            _open_web_url(target_url, force_new=False, title=host)
 
     address_entry.connect("activate", _open_address_entry)
 
@@ -8756,10 +8808,12 @@ def show_study_window(parent=None, end_ts=None):
                     pass
 
         all_filter = Gtk.FileFilter()
-        all_filter.set_name("PDF and Images (*.pdf, *.png, *.jpg…)")
+        all_filter.set_name("Study Media (*.pdf, *.png, *.mp4…)")
         all_filter.add_mime_type("application/pdf")
         for ext_p in ("*.pdf", "*.PDF", "*.jpg", "*.jpeg", "*.png", "*.webp", "*.gif", "*.bmp",
-                      "*.JPG", "*.JPEG", "*.PNG", "*.WEBP", "*.GIF", "*.BMP"):
+                      "*.JPG", "*.JPEG", "*.PNG", "*.WEBP", "*.GIF", "*.BMP",
+                      "*.mp4", "*.mkv", "*.webm", "*.avi", "*.mov",
+                      "*.MP4", "*.MKV", "*.WEBM", "*.AVI", "*.MOV"):
             all_filter.add_pattern(ext_p)
         chooser.add_filter(all_filter)
 
@@ -8768,24 +8822,28 @@ def show_study_window(parent=None, end_ts=None):
         chooser.destroy()
         if not uris:
             return
-        opened = None
+        opened_media = None
+        opened_video = None
         rejected = 0
+        video_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov"}
         for uri in uris:
             if not uri.startswith("file://"):
                 rejected += 1
                 continue
             path = os.path.realpath(urllib.parse.unquote(uri[7:]))
-            if (os.path.isfile(path)
-                    and os.path.splitext(path)[1].lower() in MEDIA_EXTS):
-                opened = path
+            ext = os.path.splitext(path)[1].lower()
+            if os.path.isfile(path) and ext in video_exts:
+                opened_video = path
+            elif os.path.isfile(path) and ext in MEDIA_EXTS:
+                opened_media = path
             else:
                 rejected += 1
-        if opened:
-            _open_media(opened)
-            if rejected:
-                _toast(f"Opened last file; {rejected} not supported")
+        if opened_video:
+            _play_local_video_native(opened_video)
+        elif opened_media:
+            _open_media(opened_media)
         else:
-            _toast("Only PDF/image files can be opened")
+            _toast("Only PDF, image, or video files can be opened")
 
     usb_import_btn.connect("clicked", _open_files)
 
@@ -9056,7 +9114,9 @@ def show_study_window(parent=None, end_ts=None):
                 pass
 
         def _on_load_failed(*_a):
-            _hide_loading()
+            if not _has_loading_web_tabs():
+                _hide_loading()
+            _toast("Website could not load. Check the address or internet connection, then retry.")
 
         web.connect("load-changed", _on_load_changed)
         web.connect("load-failed", _on_load_failed)
