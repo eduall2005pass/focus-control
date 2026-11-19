@@ -49,7 +49,7 @@ try:
 except Exception:  # WebKit not available -> study view disabled, app still runs
     WebKit2 = None
 
-FOCUS_VERSION = "2.0.27"
+FOCUS_VERSION = "2.0.42"
 
 FOCUS_MINUTES = 10
 SUSPEND_MINUTES = 30
@@ -3830,6 +3830,68 @@ TELEGRAM_KIOSK_JS = r"""
   window.open = function () { return null; };
 })();
 """
+EDGE_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+)
+
+EDGE_CLIENT_HINTS_JS = r"""
+(function() {
+    try {
+        var brandsList = [
+            { brand: "Chromium", version: "131" },
+            { brand: "Microsoft Edge", version: "131" },
+            { brand: "Not_A Brand", version: "24" }
+        ];
+        if (!navigator.userAgentData) {
+            Object.defineProperty(navigator, 'userAgentData', {
+                get: function() {
+                    return {
+                        brands: brandsList,
+                        mobile: false,
+                        platform: "Linux",
+                        getHighEntropyValues: function(hints) {
+                            return Promise.resolve({
+                                brands: brandsList,
+                                mobile: false,
+                                platform: "Linux",
+                                platformVersion: "6.8.0",
+                                architecture: "x86",
+                                bitness: "64",
+                                model: "",
+                                uaFullVersion: "131.0.2903.86",
+                                fullVersionList: [
+                                    { brand: "Chromium", version: "131.0.2903.86" },
+                                    { brand: "Microsoft Edge", version: "131.0.2903.86" },
+                                    { brand: "Not_A Brand", version: "24.0.0.0" }
+                                ]
+                            });
+                        },
+                        toJSON: function() {
+                            return {
+                                brands: brandsList,
+                                mobile: false,
+                                platform: "Linux"
+                            };
+                        }
+                    };
+                },
+                configurable: true,
+                enumerable: true
+            });
+        }
+        Object.defineProperty(navigator, 'vendor', {
+            get: function() { return 'Google Inc.'; },
+            configurable: true
+        });
+        Object.defineProperty(navigator, 'appVersion', {
+            get: function() { return '5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0'; },
+            configurable: true
+        });
+    } catch(e) {}
+})();
+"""
+
 _study_ucm = None
 
 UPLOAD_PASSWORD_PATH = os.path.join(LEDGER_DIR, "phone-upload-password")
@@ -4701,54 +4763,76 @@ def _focus_input_blocked_message(_manager, result):
         print(f"focusInputBlocked handler error: {e}", flush=True)
 
 
-def _page_allowed(uri, patterns):
-    """Host allowlist plus a Telegram Web entry point pinned to one group."""
-    try:
-        if not uri:
-            return False
-        uri_lower = uri.strip().lower()
-        if uri_lower == "about:blank":
-            return True
-        if uri_lower in ("tg-materials", "pdf-materials", "telegram-materials"):
-            return True
-        if uri_lower.startswith("blob:"):
-            inner = uri[5:]
-            inner_host = (urlparse(inner).hostname or "").lower()
-            if inner_host:
-                return _host_allowed(inner_host, patterns)
-            return False
-        parsed = urlparse(uri)
-        if parsed.scheme not in ("http", "https"):
-            return False
-        host = (parsed.hostname or "").lower()
-        if _host_blocked(host):
-            return False
-        if host == TELEGRAM_WEB_HOST:
-            peer = _load_telegram_target_peer()
-            biprova_peer = _load_telegram_biprova_peer()
-            fragment = parsed.fragment.lower()
-            allowed_fragments = {
-                TELEGRAM_GROUP_HASH.lower(),
-                "-1004415493319", "4415493319", "pdf258upload",
-                "biprova", "biprov", "biprova20", "biprova_20"
-            }
-            if peer:
-                allowed_fragments.add(peer.lower())
-                allowed_fragments.add(peer.replace("-100", "").lower())
-            if biprova_peer:
-                allowed_fragments.add(biprova_peer.lower())
-                allowed_fragments.add(biprova_peer.replace("-100", "").lower())
-            return ((parsed.path or "/").rstrip("/").lower() in TELEGRAM_WEB_PATHS
-                    and (fragment in allowed_fragments or not fragment)
-                    and _host_allowed(host, patterns))
-        telegram_domains = ("telegram.org", "telegram.me", "telegram.dog",
-                            "cdn-telegram.org", "telesco.pe", "t.me")
-        if any(host == domain or host.endswith("." + domain)
-               for domain in telegram_domains):
-            return False
-        if not _host_allowed(host, patterns):
-            return False
+def _is_nav_permitted(uri):
+    """Check if URI is permitted for navigation in Study Mode.
+    Permits any general website, but strictly blocks:
+    - Search engines (Google, Bing, DuckDuckGo, Yahoo, Yandex, etc.)
+    - Social media (Facebook, Twitter/X, Instagram, TikTok, Reddit, etc.)
+    - Adult & explicit domains and explicit keywords in input/URL
+    - Full YouTube browsing (only specific video links/IDs are permitted)
+    - Pinned Telegram Web only
+    """
+    if not uri:
+        return False
+    u = str(uri).strip()
+    u_lower = u.lower()
+    if u_lower in ("about:blank", "about:srcdoc"):
         return True
+    if u_lower in ("tg-materials", "pdf-materials", "telegram-materials"):
+        return True
+    if u_lower.startswith(("data:", "blob:")):
+        return True
+    if u_lower.startswith("file://"):
+        return True
+    parsed = urlparse(u)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+
+    hit = _explicit_hit(u)
+    if hit:
+        _record_input_violation()
+        return False
+
+    if host == TELEGRAM_WEB_HOST:
+        peer = _load_telegram_target_peer()
+        biprova_peer = _load_telegram_biprova_peer()
+        fragment = (parsed.fragment or "").lower()
+        allowed_fragments = {
+            TELEGRAM_GROUP_HASH.lower(),
+            "-1004415493319", "4415493319", "pdf258upload",
+            "biprova", "biprov", "biprova20", "biprova_20"
+        }
+        if peer:
+            allowed_fragments.add(peer.lower())
+            allowed_fragments.add(peer.replace("-100", "").lower())
+        if biprova_peer:
+            allowed_fragments.add(biprova_peer.lower())
+            allowed_fragments.add(biprova_peer.replace("-100", "").lower())
+        return ((parsed.path or "/").rstrip("/").lower() in TELEGRAM_WEB_PATHS
+                and (fragment in allowed_fragments or not fragment))
+
+    if _is_youtube_host(host):
+        return bool(_youtube_video_id(u))
+
+    if _host_blocked(host):
+        return False
+
+    telegram_domains = ("telegram.org", "telegram.me", "telegram.dog",
+                        "cdn-telegram.org", "telesco.pe", "t.me")
+    if any(host == domain or host.endswith("." + domain) for domain in telegram_domains):
+        return False
+
+    return True
+
+
+def _page_allowed(uri, patterns=None):
+    """Host allowlist plus a Telegram Web entry point pinned to one group.
+    In open study mode, any website not in blocked categories is allowed."""
+    try:
+        return _is_nav_permitted(uri)
     except Exception:
         return False
 
@@ -4929,6 +5013,10 @@ def _render_pdf_page(path, page, zoom=1.0, cancel=None):
 def _configure_study_settings(st):
     if st is None:
         return
+    try:
+        st.set_user_agent(EDGE_USER_AGENT)
+    except Exception:
+        pass
     try:
         st.set_enable_developer_extras(False)
         st.set_enable_html5_local_storage(True)
@@ -5276,11 +5364,17 @@ def show_study_window(parent=None, end_ts=None):
     address_entry = Gtk.Entry()
     address_entry.set_width_chars(16)
     address_entry.set_hexpand(True)
-    address_entry.set_placeholder_text("🌐 Visit any website (opens in Edge) or YouTube link/ID…")
+    address_entry.set_placeholder_text("🌐 Enter website address or YouTube video URL/ID…")
     address_entry.set_tooltip_text(
-        "Enter any website to open in restricted Edge, or a YouTube video link to play natively. Search engines, social media and explicit keywords are blocked.")
+        "Enter any website to open inside Study Mode, or a YouTube video link to play natively. Search engines, social media and explicit keywords are blocked.")
     address_entry.set_activates_default(True)
     bar.pack_start(address_entry, True, True, 2)
+
+    open_edge_btn = Gtk.Button(label="↗ Edge")
+    open_edge_btn.get_style_context().add_class("topbar-btn")
+    open_edge_btn.set_size_request(62, 26)
+    open_edge_btn.set_tooltip_text("Open current website in external Microsoft Edge")
+    bar.pack_start(open_edge_btn, False, False, 0)
 
     usb_import_btn = Gtk.Button(label="📂 Open")
     usb_import_btn.get_style_context().add_class("topbar-btn")
@@ -5515,6 +5609,11 @@ def show_study_window(parent=None, end_ts=None):
         try:
             _study_ucm = WebKit2.UserContentManager()
             _study_ucm.add_script(WebKit2.UserScript.new(
+                EDGE_CLIENT_HINTS_JS,
+                WebKit2.UserContentInjectedFrames.ALL_FRAMES,
+                WebKit2.UserScriptInjectionTime.START,
+                None, None))
+            _study_ucm.add_script(WebKit2.UserScript.new(
                 INPUT_FILTER_JS,
                 WebKit2.UserContentInjectedFrames.ALL_FRAMES,
                 WebKit2.UserScriptInjectionTime.START,
@@ -5662,7 +5761,7 @@ def show_study_window(parent=None, end_ts=None):
 
     def _return_to_group(*_):
         _set_group_ui(False)
-        _launch_study_edge(TELEGRAM_GROUP_URL, title="PDF Materials")
+        _open_web_url(TELEGRAM_GROUP_URL, title="PDF Materials")
 
     tg_back.connect("clicked", _leave_group_view)
     tg_reload.connect("clicked", _return_to_group)
@@ -5712,8 +5811,10 @@ def show_study_window(parent=None, end_ts=None):
         if host == TELEGRAM_WEB_HOST or host.endswith((".telegram.org", ".t.me")):
             _toast("Telegram is only available in the single-group view")
             return
-        # Websites open in Edge app mode; WebKit here is only for local PDFs.
-        _launch_study_edge(uri)
+        if not _is_nav_permitted(uri):
+            _toast("Blocked: search engines, social media and adult sites are disabled")
+            return
+        view.load_uri(uri)
 
     def _build_split_pane(caption):
         pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -5840,7 +5941,7 @@ def show_study_window(parent=None, end_ts=None):
                         return False
                     if parsed.scheme in ("http", "https"):
                         decision.ignore()
-                        GLib.idle_add(_launch_study_edge, uri)
+                        GLib.idle_add(_open_web_url, uri)
                         return True
                     decision.ignore()
                     _toast(f"Blocked: {parsed.hostname or uri} — not in study list")
@@ -8014,8 +8115,10 @@ def show_study_window(parent=None, end_ts=None):
             tab["minimized"] = False
             stack.set_visible_child_name("web")
             web_stack.set_visible_child_name(tab["name"])
-            host = (urlparse(tab["view"].get_uri() or tab.get("url") or "")
-                    .hostname or "").lower()
+            u = tab.get("url") or tab["view"].get_uri() or ""
+            if u and not u.startswith("about:"):
+                address_entry.set_text(u)
+            host = (urlparse(u).hostname or "").lower()
             _set_group_ui(host == TELEGRAM_WEB_HOST)
             _render_dock()
         except Exception as e:
@@ -8273,9 +8376,17 @@ def show_study_window(parent=None, end_ts=None):
         try:
             if event == WebKit2.LoadEvent.STARTED:
                 tab["url"] = tab["view"].get_uri() or tab["url"]
+                if (stack.get_visible_child_name() == "web"
+                        and web_stack.get_visible_child_name() == tab["name"]):
+                    if tab["url"] and not tab["url"].startswith("about:"):
+                        address_entry.set_text(tab["url"])
                 _show_loading()
             elif event == WebKit2.LoadEvent.FINISHED:
                 tab["url"] = tab["view"].get_uri() or tab["url"]
+                if (stack.get_visible_child_name() == "web"
+                        and web_stack.get_visible_child_name() == tab["name"]):
+                    if tab["url"] and not tab["url"].startswith("about:"):
+                        address_entry.set_text(tab["url"])
                 title = tab["view"].get_title()
                 if title:
                     tab["title"] = title
@@ -8503,10 +8614,27 @@ def show_study_window(parent=None, end_ts=None):
             _toast("Blocked: Search engines, social media, and adult sites are disabled")
             return
 
-        # 5. Open allowed website in restricted Edge (never WebKit)
-        _launch_study_edge(target_url)
+        # 5. Open allowed website inside Study Mode web stack
+        _open_web_url(target_url, force_new=False, title=host)
 
     address_entry.connect("activate", _open_address_entry)
+
+    def _on_open_edge_clicked(_btn):
+        target = (address_entry.get_text() or "").strip()
+        if not target:
+            vis = stack.get_visible_child_name()
+            if vis == "web":
+                active_tab_name = web_stack.get_visible_child_name()
+                for tab in web_tabs:
+                    if tab["name"] == active_tab_name:
+                        target = tab.get("url") or tab["view"].get_uri() or ""
+                        break
+        if not target or target.startswith(("about:", "file:")):
+            _toast("No active website to open in Edge")
+            return
+        _launch_study_edge(target)
+
+    open_edge_btn.connect("clicked", _on_open_edge_clicked)
 
     def _open_web_url(url, force_new=False, allow_special=False, title=""):
         raw = str(url or "").strip()
@@ -8518,8 +8646,27 @@ def show_study_window(parent=None, end_ts=None):
         elif raw.startswith("file:"):
             pass
         else:
-            _launch_study_edge(raw, title=title)
-            return None
+            if "://" not in raw:
+                raw = "https://" + raw
+            parsed = urlparse(raw)
+            host = (parsed.hostname or "").lower()
+            if _host_blocked(host):
+                _toast(f"Blocked: {host} — search engines, social media and adult sites are disabled")
+                return None
+            hit = _explicit_hit(raw)
+            if hit:
+                _record_input_violation()
+                _toast(f"⛔ Blocked explicit keyword: {hit}")
+                return None
+            if _is_youtube_host(host):
+                vid = _youtube_video_id(raw)
+                if vid:
+                    _play_youtube_native(vid, raw)
+                    return None
+                else:
+                    _toast("Blocked: Full YouTube browsing is disabled. Only specific video links work.")
+                    return None
+
         if not force_new:
             for tab in web_tabs:
                 current = tab.get("url") or tab["view"].get_uri() or ""
@@ -8549,17 +8696,17 @@ def show_study_window(parent=None, end_ts=None):
                 or "telegram-materials" in url_clean
                 or (urlparse(url or "").hostname or "").lower() == TELEGRAM_WEB_HOST
                 or str(url).strip() == TELEGRAM_GROUP_URL):
-            _launch_study_edge(TELEGRAM_GROUP_URL, title="PDF Materials")
+            _open_web_url(TELEGRAM_GROUP_URL, title="PDF Materials")
             return
         if url_clean in ("tg-biprova", "biprova", "biprova 20", "biprov", "biprova (cloud)", "biprova 20 (cloud)"):
             b_peer = _load_telegram_biprova_peer()
             b_target = f"https://{TELEGRAM_WEB_HOST}{TELEGRAM_WEB_PATH}/#{b_peer}" if b_peer else f"https://{TELEGRAM_WEB_HOST}{TELEGRAM_WEB_PATH}/#biprova"
-            _launch_study_edge(b_target, title="Biprova 20")
+            _open_web_url(b_target, title="Biprova 20")
             return
         if url.startswith("file://"):
             _open_web_url(url)
             return
-        _launch_study_edge(url)
+        _open_web_url(url)
 
     def _make_side_btn(icon_text, tooltip, on_click):
         btn = Gtk.Button()
@@ -8822,7 +8969,7 @@ def show_study_window(parent=None, end_ts=None):
             if (urlparse(url).hostname or "").lower() == TELEGRAM_WEB_HOST:
                 url = TELEGRAM_GROUP_URL
             if url:
-                _launch_study_edge(url, title=str(item.get("title") or ""))
+                _open_web_url(url, title=str(item.get("title") or ""))
             else:
                 _toast("This recent website is no longer available")
         _hide_recent_panel()
