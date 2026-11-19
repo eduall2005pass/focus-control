@@ -263,11 +263,7 @@ for dev in ("/dev/console", "/dev/tty0", "/dev/tty1"):
 
         # 2. Stop getty/agetty services on text virtual terminals
         systemctl stop getty.target >/dev/null 2>&1 || true
-        systemctl stop "getty@tty*.service" >/dev/null 2>&1 || true
-        pkill -9 -f "agetty" >/dev/null 2>&1 || true
-        pkill -9 -x "login" >/dev/null 2>&1 || true
-
-        # 3. Detect graphical session VT and force switch back to GUI if on text console
+        # Detect graphical session VT first, then stop gettys on other VTs.
         gui_vt=$(loginctl list-sessions --no-legend 2>/dev/null | while read -r sess uid user rest; do
             type=$(loginctl show-session "$sess" -p Type --value 2>/dev/null || true)
             if [ "$type" = "wayland" ] || [ "$type" = "x11" ]; then
@@ -278,15 +274,27 @@ for dev in ("/dev/console", "/dev/tty0", "/dev/tty1"):
                 fi
             fi
         done)
-        gui_vt="${gui_vt:-2}"
+        gui_vt="${gui_vt:-}"
+        # Enumerate real text units; preserve the logind-selected graphical VT.
+        for getty_unit in $(systemctl list-units --all --plain --no-legend \
+                'getty@*.service' 2>/dev/null | awk '{print $1}'); do
+            getty_vt=$(printf '%s' "$getty_unit" | sed -n 's/^getty@\(tty[0-9][0-9]*\)\.service$/\1/p')
+            if [ -n "$getty_vt" ] && { [ -z "$gui_vt" ] || [ "$getty_vt" != "tty${gui_vt}" ]; }; then
+                systemctl stop "$getty_unit" >/dev/null 2>&1 || true
+            fi
+        done
+        pkill -9 -f "agetty" >/dev/null 2>&1 || true
+        pkill -9 -x "login" >/dev/null 2>&1 || true
+
+        # 3. Detect graphical session VT and force switch back to GUI if on text console
         cur_vt=$(cat /sys/class/tty/tty0/active 2>/dev/null || true)
-        if [ -n "$cur_vt" ] && [ "$cur_vt" != "tty${gui_vt}" ]; then
+        if [ -n "$gui_vt" ] && [ -n "$cur_vt" ] && [ "$cur_vt" != "tty${gui_vt}" ]; then
             chvt "$gui_vt" 2>/dev/null || true
         fi
 
         # 4. Terminate any user processes/shells on non-GUI TTYs
         for tty_idx in 1 3 4 5 6 7 8 9 10 11 12; do
-            if [ "$tty_idx" -ne "$gui_vt" ]; then
+            if [ -z "$gui_vt" ] || [ "$tty_idx" -ne "$gui_vt" ]; then
                 pkill -9 -t "tty${tty_idx}" 2>/dev/null || true
             fi
         done

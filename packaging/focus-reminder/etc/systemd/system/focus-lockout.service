@@ -1,0 +1,15 @@
+[Unit]
+Description=Focus Reminder Root Lockout State Service
+Before=display-manager.service
+After=systemd-tmpfiles.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/focus-lockout-service
+Restart=always
+RestartSec=1
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

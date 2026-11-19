@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+import json, os, pwd, grp, socket, stat, sys, time
+
+STATE_DIR = "/var/lib/focus-reminder"
+STATE_FILE = STATE_DIR + "/lockout.json"
+RUNTIME_DIR = "/run/focus-reminder"
+RUNTIME_FILE = RUNTIME_DIR + "/lockout.json"
+SOCKET = RUNTIME_DIR + "/lockout.sock"
+MAX_EXTEND_SECONDS = 7 * 86400
+
+
+def atomic_json(path, value):
+    os.makedirs(os.path.dirname(path), mode=0o750, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(value, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o640)
+    os.replace(tmp, path)
+
+
+def load():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def publish(state):
+    now = time.time()
+    deadline = float(state.get("deadline", 0))
+    if deadline and deadline <= now:
+        os.makedirs(STATE_DIR, mode=0o750, exist_ok=True)
+        try:
+            os.unlink(STATE_FILE)
+        except FileNotFoundError:
+            pass
+        state = {}
+    os.makedirs(RUNTIME_DIR, mode=0o750, exist_ok=True)
+    atomic_json(RUNTIME_FILE, {
+        "deadline": float(state.get("deadline", 0)),
+        "study_starting": bool(state.get("study_starting", False)),
+        "study_mapped": bool(state.get("study_mapped", False)),
+        "study_pid": int(state.get("study_pid", 0)),
+        "updated_at": now,
+    })
+    return state
+
+
+def valid_user(uid):
+    try:
+        pwd.getpwuid(uid)
+        return True
+    except KeyError:
+        return False
+
+
+def handle(uid, request):
+    action = request.get("action")
+    state = publish(load())
+    now = time.time()
+    if action == "status":
+        return {"ok": True, "deadline": float(state.get("deadline", 0)),
+                "study_starting": bool(state.get("study_starting", False)),
+                "study_mapped": bool(state.get("study_mapped", False))}
+    if action == "end":
+        if uid == 0 or float(state.get("deadline", 0)) <= now:
+            try:
+                os.unlink(STATE_FILE)
+            except FileNotFoundError:
+                pass
+            publish({})
+            return {"ok": True}
+        return {"ok": False, "error": "authorization failed"}
+    if action in ("start", "extend"):
+        try:
+            seconds = int(request["seconds"])
+        except (KeyError, TypeError, ValueError):
+            return {"ok": False, "error": "invalid seconds"}
+        if seconds <= 0 or seconds > MAX_EXTEND_SECONDS:
+            return {"ok": False, "error": "seconds outside allowed range"}
+        if not valid_user(uid):
+            return {"ok": False, "error": "authorization failed"}
+        now = time.time()
+        deadline = float(state.get("deadline", 0))
+        if action == "extend" and deadline > now:
+            new_deadline = deadline + seconds
+        else:
+            new_deadline = now + seconds
+        state = {"deadline": new_deadline, "started_at": state.get("started_at", now),
+                 "started_by_uid": uid, "study_starting": False, "study_mapped": False,
+                 "study_pid": 0}
+        os.makedirs(STATE_DIR, mode=0o750, exist_ok=True)
+        atomic_json(STATE_FILE, state)
+        publish(state)
+        return {"ok": True, "deadline": new_deadline}
+    if action in ("study_starting", "study_mapped", "study_clear"):
+        if not valid_user(uid):
+            return {"ok": False, "error": "authorization failed"}
+        if action == "study_starting":
+            pid = request.get("pid", 0)
+            try:
+                pid = int(pid)
+            except (TypeError, ValueError):
+                pid = 0
+            state["study_starting"] = True
+            state["study_mapped"] = False
+            state["study_pid"] = pid
+        elif action == "study_mapped":
+            pid = request.get("pid", 0)
+            try:
+                pid = int(pid)
+            except (TypeError, ValueError):
+                pid = 0
+            if pid and state.get("study_pid") not in (0, pid):
+                return {"ok": False, "error": "study PID mismatch"}
+            state["study_starting"] = False
+            state["study_mapped"] = bool(pid)
+        else:
+            state["study_starting"] = False
+            state["study_mapped"] = False
+            state["study_pid"] = 0
+        atomic_json(STATE_FILE, state)
+        publish(state)
+        return {"ok": True}
+    return {"ok": False, "error": "unknown action"}
+
+
+def main():
+    os.makedirs(RUNTIME_DIR, mode=0o750, exist_ok=True)
+    os.makedirs(STATE_DIR, mode=0o750, exist_ok=True)
+    try:
+        os.chown(RUNTIME_DIR, 0, grp.getgrnam("focus-control").gr_gid)
+        os.chown(STATE_DIR, 0, 0)
+    except KeyError:
+        pass
+    try:
+        os.unlink(SOCKET)
+    except FileNotFoundError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(SOCKET)
+    os.chmod(SOCKET, 0o660)
+    try:
+        os.chown(SOCKET, 0, grp.getgrnam("focus-control").gr_gid)
+    except KeyError:
+        pass
+    server.listen(20)
+    os.chmod(RUNTIME_FILE, 0o640)
+    while True:
+        conn, _ = server.accept()
+        with conn:
+            peer = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                   12)
+            uid = int.from_bytes(peer[:4], "little")
+            try:
+                raw = conn.recv(65536).decode("utf-8")
+                request = json.loads(raw)
+                if not isinstance(request, dict):
+                    raise ValueError("request must be an object")
+                response = handle(uid, request)
+            except Exception as exc:
+                response = {"ok": False, "error": str(exc)}
+            conn.sendall(json.dumps(response).encode("utf-8"))
+
+
+if __name__ == "__main__":
+    publish(load())
+    main()

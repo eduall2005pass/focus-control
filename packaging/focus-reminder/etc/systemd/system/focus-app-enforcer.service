@@ -1,0 +1,15 @@
+[Unit]
+Description=Focus Reminder App and Lockout Enforcer
+After=focus-lockout.service
+Requires=focus-lockout.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/focus-app-enforcer
+Restart=always
+RestartSec=1
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

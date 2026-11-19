@@ -20,6 +20,17 @@ def parse_ts(val):
 
 def is_focus_control_locked():
     now = time.time()
+
+    runtime = "/run/focus-reminder/lockout.json"
+    if os.path.isfile(runtime):
+        try:
+            with open(runtime, "r") as f:
+                state = json.load(f)
+            deadline = float(state.get("deadline", 0))
+            if deadline > now:
+                return True
+        except Exception:
+            pass
     
     # 1. System-wide run flag
     run_flag = "/run/focus-reminder-lock.flag"

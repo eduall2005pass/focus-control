@@ -130,7 +130,7 @@ export default class FocusLockoutExtension extends Extension {
     }
 
     _setupFileMonitors() {
-        const paths = [this._statePath, this._studyActivePath, this._studyStartingPath,
+        const paths = ['/run/focus-reminder/lockout.json', this._statePath, this._studyActivePath, this._studyStartingPath,
             this._wifiActivePath, this._gtkReadyPath, this._studySuspendPath];
         for (const p of paths) {
             try {
@@ -733,14 +733,16 @@ export default class FocusLockoutExtension extends Extension {
 
     _readDeadline() {
         try {
-            const [ok, bytes] = GLib.file_get_contents(this._statePath);
-            if (!ok)
-                return 0;
-            const value = Number(new TextDecoder().decode(bytes).trim());
-            return Number.isFinite(value) ? value : 0;
+            const [runtimeOk, runtimeBytes] = GLib.file_get_contents('/run/focus-reminder/lockout.json');
+            if (runtimeOk) {
+                const runtime = JSON.parse(new TextDecoder().decode(runtimeBytes));
+                const value = Number(runtime.deadline);
+                if (Number.isFinite(value) && value > 0)
+                    return value;
+            }
         } catch (_) {
-            return 0;
         }
+        return 0;
     }
 
     _isGtkReady() {
@@ -757,6 +759,22 @@ export default class FocusLockoutExtension extends Extension {
 
     _isStudyActive() {
         try {
+            const [runtimeOk, runtimeBytes] = GLib.file_get_contents('/run/focus-reminder/lockout.json');
+            if (runtimeOk) {
+                const runtime = JSON.parse(new TextDecoder().decode(runtimeBytes));
+                if (runtime.study_mapped === true) {
+                    const pid = Number(runtime.study_pid);
+                    if (pid > 0) {
+                        const [pidOk, pidBytes] = GLib.file_get_contents(`/proc/${pid}/cmdline`);
+                        if (pidOk) {
+                            const cmdline = new TextDecoder().decode(pidBytes).toLowerCase();
+                            if (cmdline.includes('focus-reminder') || cmdline.includes('python'))
+                                return true;
+                        }
+                    }
+                    return false;
+                }
+            }
             const [ok, bytes] = GLib.file_get_contents(this._studyActivePath);
             if (!ok)
                 return false;
@@ -770,6 +788,14 @@ export default class FocusLockoutExtension extends Extension {
 
     _isStudyStarting() {
         try {
+            const [runtimeOk, runtimeBytes] = GLib.file_get_contents('/run/focus-reminder/lockout.json');
+            if (runtimeOk) {
+                const runtime = JSON.parse(new TextDecoder().decode(runtimeBytes));
+                if (runtime.study_starting === true)
+                    return true;
+                if (runtime.study_mapped === true)
+                    return false;
+            }
             const [ok, bytes] = GLib.file_get_contents(this._studyStartingPath);
             if (!ok)
                 return false;

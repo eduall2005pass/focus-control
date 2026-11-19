@@ -50,8 +50,16 @@ install -Dm755 "$SRC_DIR/packaging/focus-reminder/usr/local/bin/focus-lockout-ch
   /usr/local/bin/focus-lockout-check
 install -Dm755 "$SRC_DIR/packaging/focus-reminder/usr/local/bin/focus-app-enforcer" \
   /usr/local/bin/focus-app-enforcer
+install -Dm755 "$SRC_DIR/packaging/focus-reminder/usr/local/bin/focus-lockout-control" \
+  /usr/local/bin/focus-lockout-control
+install -Dm755 "$SRC_DIR/packaging/focus-reminder/usr/local/sbin/focus-lockout-service" \
+  /usr/local/sbin/focus-lockout-service
 install -Dm644 "$SRC_DIR/packaging/focus-reminder/etc/systemd/system/focus-boot-enforce.service" \
   /etc/systemd/system/focus-boot-enforce.service
+install -Dm644 "$SRC_DIR/packaging/focus-reminder/etc/systemd/system/focus-lockout.service" \
+  /etc/systemd/system/focus-lockout.service
+install -Dm644 "$SRC_DIR/packaging/focus-reminder/etc/systemd/system/focus-app-enforcer.service" \
+  /etc/systemd/system/focus-app-enforcer.service
 PAM_LINE="session optional pam_exec.so seteuid /usr/local/bin/focus-pam-lock.sh"
 if [ -f /etc/pam.d/common-session ] \
    && ! grep -qF "focus-pam-lock.sh" /etc/pam.d/common-session; then
@@ -62,13 +70,18 @@ if [ -f /etc/pam.d/login ] \
   sed -i '\|^@include common-auth|i auth [success=ok default=bad] pam_exec.so quiet seteuid /usr/local/bin/focus-tty-auth-check.sh\naccount [success=ok default=bad] pam_exec.so quiet seteuid /usr/local/bin/focus-tty-auth-check.sh' /etc/pam.d/login 2>/dev/null || true
 fi
 systemctl daemon-reload
-systemctl enable --now focus-boot-enforce.service
+getent group focus-control >/dev/null || groupadd --system focus-control
+for user_home in /home/*; do
+  user=$(basename "$user_home")
+  getent passwd "$user" >/dev/null 2>&1 && usermod -a -G focus-control "$user" 2>/dev/null || true
+done
+systemctl enable --now focus-lockout.service focus-boot-enforce.service focus-app-enforcer.service
 
 echo "[3/6] Installing app icon system-wide"
 install -Dm644 "$SRC_DIR/assets/focus-reminder.png" /usr/share/icons/hicolor/48x48/apps/focus-reminder.png
 gtk-update-icon-cache -f -q /usr/share/icons/hicolor 2>/dev/null || true
 
-echo "[4/6] Installing user units for ALL users"
+echo "[4/6] Installing root and user units"
 cat > /etc/systemd/user/xdg-desktop-focus-compliance-enforcer-8f2e1a9c.service <<'EOF'
 [Unit]
 Description=Focus Reminder - fullscreen alert (all users)
@@ -148,10 +161,8 @@ NoDisplay=true
 X-GNOME-Autostart-enabled=true
 EOF
 
-# Keep the application immutable after a legitimate systemwide update.
-chattr +i /opt/focus-reminder/focus-reminder.py 2>/dev/null || true
-chattr +i /etc/systemd/system/focus-boot-enforce.service 2>/dev/null || true
-chattr +i /usr/local/bin/focus-boot-enforce.sh /usr/local/bin/focus-pam-lock.sh /usr/local/bin/focus-tty-auth-check.sh /usr/local/bin/focus-lockout-check /usr/local/bin/focus-app-enforcer 2>/dev/null || true
+# Package-managed files remain upgradeable and removable.  A root/PAM backup
+# is retained by postinst before configuration changes.
 
 echo "[6/6] Installing app-menu entry + verifying"
 cat > /usr/share/applications/focus-reminder.desktop <<'EOF'

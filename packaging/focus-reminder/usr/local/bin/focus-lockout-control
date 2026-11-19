@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+import json, socket, sys
+
+SOCKET = "/run/focus-reminder/lockout.sock"
+
+
+def main():
+    if len(sys.argv) < 2:
+        return 2
+    action = sys.argv[1]
+    request = {"action": action}
+    if len(sys.argv) == 3:
+        if action in ("start", "extend"):
+            request["seconds"] = sys.argv[2]
+        elif action in ("study_starting", "study_mapped"):
+            request["pid"] = sys.argv[2]
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(3)
+    try:
+        sock.connect(SOCKET)
+        sock.sendall(json.dumps(request).encode("utf-8"))
+        response = json.loads(sock.recv(65536).decode("utf-8"))
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if action == "status":
+        print(json.dumps(response))
+    elif not response.get("ok"):
+        print(response.get("error", "request failed"), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
